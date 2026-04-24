@@ -1,0 +1,23 @@
+[project]
+name = "btviz"
+version = "0.0.1"
+description = "Bluetooth traffic visualizer and troubleshooting tool"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.7",
+    "pyshark>=0.6",
+]
+
+[project.scripts]
+btviz = "btviz.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["btviz*"]
+
+[tool.setuptools.package-data]
+btviz = ["db/*.sql", "data/*.json"]

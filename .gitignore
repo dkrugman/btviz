@@ -6,3 +6,8 @@ build/
 dist/
 .btviz/
 .DS_Store
+
+# Local-only secrets and fixtures (IRKs, LTKs, personal pcap captures, scratch notes).
+# Anything under /private/ is never committed. See tests/fixtures/example_keys.json
+# for the expected layout.
+/private/

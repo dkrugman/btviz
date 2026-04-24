@@ -1,0 +1,29 @@
+{
+  "_comment": "EXAMPLE fixture with dummy values. Copy this to /private/my_keys.json (gitignored) and replace with your real IRKs/LTKs for local testing. NEVER commit real keys.",
+
+  "irks": [
+    {
+      "label": "my-HA-left",
+      "key_hex": "000102030405060708090a0b0c0d0e0f",
+      "address": "aa:bb:cc:dd:ee:01",
+      "address_type": "random"
+    },
+    {
+      "label": "my-HA-right",
+      "key_hex": "101112131415161718191a1b1c1d1e1f",
+      "address": "aa:bb:cc:dd:ee:02",
+      "address_type": "random"
+    }
+  ],
+
+  "ltks": [
+    {
+      "label": "iPhone <-> HA-left",
+      "key_hex": "202122232425262728292a2b2c2d2e2f",
+      "ediv": 0,
+      "rand_hex": "0000000000000000",
+      "device_a_address": "aa:bb:cc:dd:ee:01",
+      "device_b_address": "11:22:33:44:55:66"
+    }
+  ]
+}

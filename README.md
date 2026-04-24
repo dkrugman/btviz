@@ -56,3 +56,4 @@ btviz/
   ui/
     app.py             # PySide6 main window (sniffer panel + device table)
 ```
+updated 4/24/26 2:54pm

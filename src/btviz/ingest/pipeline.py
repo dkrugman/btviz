@@ -26,9 +26,13 @@ from typing import Any
 
 from ..db.repos import Repos
 from ..db.store import Store
+from ..decode.appearance import appearance_to_class
+from ..decode.apple_continuity import classify as classify_apple, parse_continuity
 from ..vendors import company_vendor, oui_vendor
 from .normalize import normalize
 from .tshark import dissect_file
+
+APPLE_COMPANY_ID = 0x004C
 
 
 @dataclass
@@ -109,6 +113,19 @@ def _as_int(v: Any) -> int | None:
         return None
 
 
+def _hexstr_to_bytes(s: str) -> bytes | None:
+    """Parse tshark's colon-or-space-separated hex (e.g. ``'10:06:43'``).
+
+    Returns None on any parse failure. Defensive — never raises.
+    """
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        return bytes.fromhex(s.replace(":", "").replace(" ", ""))
+    except ValueError:
+        return None
+
+
 def _extract_ad_clues(layers: dict) -> dict[str, Any]:
     """Pull identity clues from AD entries.
 
@@ -117,8 +134,11 @@ def _extract_ad_clues(layers: dict) -> dict[str, Any]:
     layer. We check both the ``btle`` layer and any separate ``btcommon``
     layer for resilience across tshark versions.
 
-    Returns a dict with any of: local_name, vendor_id, appearance. Omits
-    keys whose field wasn't present.
+    Returns a dict with any of: local_name, vendor_id, appearance,
+    device_class, model. Apple-vendor packets get an extra Continuity
+    decode pass that may set device_class (airpods/airtag/apple_watch/…)
+    and model (e.g. "AirPods Pro (2nd gen)"). Continuity parsing failures
+    don't propagate — at worst we just don't add those clues.
     """
     if not isinstance(layers, dict):
         return {}
@@ -128,6 +148,7 @@ def _extract_ad_clues(layers: dict) -> dict[str, Any]:
     NAME_KEY = "btcommon_btcommon_eir_ad_entry_device_name"
     CID_KEY = "btcommon_btcommon_eir_ad_entry_company_id"
     APPEAR_KEY = "btcommon_btcommon_eir_ad_entry_appearance"
+    MFG_DATA_KEY = "btcommon_btcommon_eir_ad_entry_data"
 
     def _lookup(key: str) -> Any:
         for layer in ("btle", "btcommon"):
@@ -149,6 +170,17 @@ def _extract_ad_clues(layers: dict) -> dict[str, Any]:
     appearance = _as_int(_lookup(APPEAR_KEY))
     if appearance is not None:
         clues["appearance"] = appearance
+
+    # Apple Continuity: derive device_class / model from sub-type bytes.
+    if cid == APPLE_COMPANY_ID:
+        data_bytes = _hexstr_to_bytes(_first(_lookup(MFG_DATA_KEY)))
+        if data_bytes:
+            entries = parse_continuity(data_bytes)
+            device_class, model = classify_apple(entries)
+            if device_class:
+                clues["device_class"] = device_class
+            if model:
+                clues["model"] = model
 
     return clues
 
@@ -225,6 +257,8 @@ def ingest_file(
                     "vendor": device.vendor,
                     "oui_vendor": device.oui_vendor,
                     "appearance": device.appearance,
+                    "device_class": device.device_class,
+                    "model": device.model,
                 }
                 # One-shot OUI lookup per device (public MACs only).
                 if kind == "public_mac" and state["oui_vendor"] is None:
@@ -232,6 +266,20 @@ def ingest_file(
                     if ouiv:
                         clues.setdefault("oui_vendor", ouiv)
                 device_state[device.id] = state
+
+            # Appearance → device_class fallback. Fires only when the more
+            # specific Continuity classifier didn't already set a class on
+            # this packet AND the device has no class in the DB yet, so a
+            # narrow class (e.g. airpods) is never downgraded by a generic
+            # category (e.g. media_player) seen later.
+            if (
+                "device_class" not in clues
+                and clues.get("appearance") is not None
+                and not state.get("device_class")
+            ):
+                cls = appearance_to_class(clues["appearance"])
+                if cls:
+                    clues["device_class"] = cls
 
             updates: dict[str, Any] = {}
             for k, v in clues.items():

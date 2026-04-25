@@ -24,6 +24,7 @@ from PySide6.QtGui import (
     QPainter,
     QPen,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -44,6 +45,32 @@ from PySide6.QtWidgets import (
 from ..db.models import DeviceLayout
 from ..db.repos import Repos
 from ..db.store import Store, open_store
+
+# Bundled SVG icons (optional). Drop ``<device_class>.svg`` here and the
+# canvas renders it instead of the emoji fallback. See data/icons/README.md
+# for the file-naming convention.
+_ICONS_DIR = Path(__file__).resolve().parent.parent / "data" / "icons"
+_renderer_cache: dict[str, QSvgRenderer | None] = {}
+
+
+def _icon_renderer(device_class: str | None) -> QSvgRenderer | None:
+    """Return a cached ``QSvgRenderer`` for ``device_class``, or None.
+
+    Returns None when no SVG exists (or the file fails to parse), so the
+    caller can fall back to the emoji table. Renderers are cached per-class
+    for the life of the process — they're cheap once loaded.
+    """
+    if not device_class:
+        return None
+    if device_class in _renderer_cache:
+        return _renderer_cache[device_class]
+    path = _ICONS_DIR / f"{device_class}.svg"
+    if not path.exists():
+        _renderer_cache[device_class] = None
+        return None
+    r = QSvgRenderer(str(path))
+    _renderer_cache[device_class] = r if r.isValid() else None
+    return _renderer_cache[device_class]
 
 # Visual constants. Tuned for a ~1400×900 starting window.
 _BOX_W = 220
@@ -326,17 +353,32 @@ class DeviceItem(QGraphicsItem):
         # Square off the bottom of the header so it joins the body cleanly.
         painter.drawRect(QRectF(0, _BOX_RADIUS, _BOX_W, _HEADER_H - _BOX_RADIUS))
 
-        # Icon (left side).
-        icon = _DEVICE_CLASS_ICONS.get(self.device.device_class or "", _FALLBACK_ICON)
-        icon_font = QFont()
-        icon_font.setPointSize(_ICON_SIZE)
-        # Force a font that renders color emoji on macOS; on Linux Qt's
-        # cascade picks Noto Color Emoji or similar.
-        icon_font.setFamily("Apple Color Emoji")
-        painter.setFont(icon_font)
-        painter.setPen(QColor(30, 30, 30))
+        # Icon (left side). Prefer a bundled SVG if one exists for this
+        # device_class; otherwise fall back to the emoji table.
         icon_rect = QRectF(6, 0, 44, _HEADER_H)
-        painter.drawText(icon_rect, Qt.AlignVCenter | Qt.AlignHCenter, icon)
+        renderer = _icon_renderer(self.device.device_class)
+        if renderer is not None:
+            # Center a square SVG inside the icon area, with a few pixels
+            # of padding so it doesn't crowd the rounded corner.
+            svg_size = 36
+            cx = icon_rect.x() + icon_rect.width() / 2
+            cy = icon_rect.y() + icon_rect.height() / 2
+            renderer.render(
+                painter,
+                QRectF(cx - svg_size / 2, cy - svg_size / 2, svg_size, svg_size),
+            )
+        else:
+            icon = _DEVICE_CLASS_ICONS.get(
+                self.device.device_class or "", _FALLBACK_ICON
+            )
+            icon_font = QFont()
+            icon_font.setPointSize(_ICON_SIZE)
+            # Force a font that renders color emoji on macOS; on Linux Qt's
+            # cascade picks Noto Color Emoji or similar.
+            icon_font.setFamily("Apple Color Emoji")
+            painter.setFont(icon_font)
+            painter.setPen(QColor(30, 30, 30))
+            painter.drawText(icon_rect, Qt.AlignVCenter | Qt.AlignHCenter, icon)
 
         # Title text (right of icon, two-line region with word wrap).
         label_font = QFont()

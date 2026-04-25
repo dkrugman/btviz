@@ -22,4 +22,4 @@ where = ["src"]
 include = ["btviz*"]
 
 [tool.setuptools.package-data]
-btviz = ["db/*.sql", "data/*.json"]
+btviz = ["db/*.sql", "data/*.json", "data/icons/*.svg"]

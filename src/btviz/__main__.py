@@ -18,6 +18,17 @@ def main() -> int:
         sub.add_parser("ingest", help="Ingest a pcap/pcapng file into the DB")
     )
 
+    # subcommand: canvas (per-project device board)
+    canvas_p = sub.add_parser("canvas", help="Open the project canvas (GUI)")
+    canvas_p.add_argument(
+        "--project", default=None, metavar="NAME",
+        help="open this project directly; if omitted, show the picker",
+    )
+    canvas_p.add_argument(
+        "--db", default=None, metavar="PATH",
+        help="SQLite DB path (default: platform XDG/Application Support)",
+    )
+
     # top-level flags (kept for backward compat)
     p.add_argument(
         "--list-interfaces",
@@ -45,6 +56,14 @@ def main() -> int:
     if args.cmd == "ingest":
         from .cli.ingest import run as run_ingest
         return run_ingest(args)
+
+    if args.cmd == "canvas":
+        from pathlib import Path
+        from .ui.canvas import run_canvas
+        return run_canvas(
+            db_path=Path(args.db) if args.db else None,
+            project_name=args.project,
+        )
 
     # Default: launch GUI.
     from .ui.app import run_gui

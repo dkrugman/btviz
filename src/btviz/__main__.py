@@ -12,6 +12,12 @@ def main() -> int:
     # subcommand: sniffers (interactive role management)
     sub.add_parser("sniffers", help="Interactive sniffer management (list / pin / scan / follow / idle)")
 
+    # subcommand: ingest (pcap/pcapng → DB)
+    from .cli.ingest import build_parser as _build_ingest_parser
+    _build_ingest_parser(
+        sub.add_parser("ingest", help="Ingest a pcap/pcapng file into the DB")
+    )
+
     # top-level flags (kept for backward compat)
     p.add_argument(
         "--list-interfaces",
@@ -35,6 +41,10 @@ def main() -> int:
     if args.cmd == "sniffers":
         from .cli import run_sniffers_cli
         return run_sniffers_cli()
+
+    if args.cmd == "ingest":
+        from .cli.ingest import run as run_ingest
+        return run_ingest(args)
 
     # Default: launch GUI.
     from .ui.app import run_gui

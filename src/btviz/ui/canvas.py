@@ -46,13 +46,15 @@ from ..db.repos import Repos
 from ..db.store import Store, open_store
 
 # Visual constants. Tuned for a ~1400×900 starting window.
-_BOX_W = 200
-_BOX_H_COLLAPSED = 56
-_BOX_H_EXPANDED = 180
-_BOX_RADIUS = 8
+_BOX_W = 220
+_HEADER_H = 50
+_BOX_H_COLLAPSED = _HEADER_H + 30   # body holds one summary line
+_BOX_H_EXPANDED = _HEADER_H + 154   # body holds detailed info block
+_BOX_RADIUS = 10
+_ICON_SIZE = 32                      # pt; QFont sets this in points
 _GRID_COLS = 6
-_GRID_DX = _BOX_W + 30
-_GRID_DY = _BOX_H_COLLAPSED + 24
+_GRID_DX = _BOX_W + 24
+_GRID_DY = _BOX_H_COLLAPSED + 22
 
 # Colors by address kind. Muted so text stays readable.
 _KIND_FILL = {
@@ -63,6 +65,46 @@ _KIND_FILL = {
     "irk_identity": QColor(210, 235, 230),
     "unknown": QColor(235, 235, 235),
 }
+
+# device_class -> emoji icon. Apple-Continuity-derived classes are first;
+# GAP-appearance-derived classes second. Edit freely; everything else
+# falls back to ``_FALLBACK_ICON``. macOS renders these via Apple Color
+# Emoji; modern Linux distros via Noto Color Emoji.
+_DEVICE_CLASS_ICONS: dict[str, str] = {
+    # Apple Continuity
+    "airpods":        "\U0001F3A7",  # 🎧
+    "airtag":         "\U0001F4CD",  # 📍
+    "apple_watch":    "⌚",      # ⌚
+    "apple_device":   "\U0001F4F1",  # 📱  (most are iPhones)
+    "apple_airplay":  "\U0001F4FA",  # 📺
+    "homekit":        "\U0001F3E0",  # 🏠
+    "ibeacon":        "\U0001F4E1",  # 📡
+    # GAP appearance fallback
+    "phone":          "\U0001F4F1",  # 📱
+    "computer":       "\U0001F4BB",  # 💻
+    "watch":          "⌚",      # ⌚
+    "clock":          "\U0001F550",  # 🕐
+    "display":        "\U0001F5A5",  # 🖥️
+    "remote_control": "\U0001F39B",  # 🎛
+    "eyewear":        "\U0001F453",  # 👓
+    "tag":            "\U0001F3F7",  # 🏷
+    "keyring":        "\U0001F511",  # 🔑
+    "media_player":   "\U0001F3B5",  # 🎵
+    "barcode_scanner": "\U0001F4E6",  # 📦
+    "thermometer":    "\U0001F321",  # 🌡
+    "heart_rate_sensor": "❤",   # ❤
+    "blood_pressure_monitor": "\U0001FA7A",  # 🩺
+    "hid":            "⌨",      # ⌨
+    "glucose_meter":  "\U0001FA78",  # 🩸
+    "running_walking_sensor": "\U0001F3C3",  # 🏃
+    "cycling_sensor": "\U0001F6B4",  # 🚴
+    "pulse_oximeter": "\U0001FAC1",  # 🫁
+    "weight_scale":   "⚖",      # ⚖
+    "fitness_tracker": "\U0001F3CB",  # 🏋
+    "hearing_aid":    "\U0001F9BB",  # 🦻
+    "personal_mobility_device": "\U0001F9BD",  # 🦽
+}
+_FALLBACK_ICON = "\U0001F50C"        # 🔌  generic BLE-ish stand-in
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -276,22 +318,37 @@ class DeviceItem(QGraphicsItem):
         painter.setBrush(QBrush(fill))
         painter.drawRoundedRect(r, _BOX_RADIUS, _BOX_RADIUS)
 
-        # Header band
-        header_rect = QRectF(0, 0, _BOX_W, 22)
+        # Header band — taller, with an icon and a two-line text region.
+        header_rect = QRectF(0, 0, _BOX_W, _HEADER_H)
         painter.setBrush(QBrush(fill.darker(108)))
         painter.setPen(Qt.NoPen)
         painter.drawRoundedRect(header_rect, _BOX_RADIUS, _BOX_RADIUS)
-        # Square off bottom of header by overpainting a rect
-        painter.drawRect(QRectF(0, _BOX_RADIUS, _BOX_W, 22 - _BOX_RADIUS))
+        # Square off the bottom of the header so it joins the body cleanly.
+        painter.drawRect(QRectF(0, _BOX_RADIUS, _BOX_W, _HEADER_H - _BOX_RADIUS))
 
+        # Icon (left side).
+        icon = _DEVICE_CLASS_ICONS.get(self.device.device_class or "", _FALLBACK_ICON)
+        icon_font = QFont()
+        icon_font.setPointSize(_ICON_SIZE)
+        # Force a font that renders color emoji on macOS; on Linux Qt's
+        # cascade picks Noto Color Emoji or similar.
+        icon_font.setFamily("Apple Color Emoji")
+        painter.setFont(icon_font)
         painter.setPen(QColor(30, 30, 30))
+        icon_rect = QRectF(6, 0, 44, _HEADER_H)
+        painter.drawText(icon_rect, Qt.AlignVCenter | Qt.AlignHCenter, icon)
+
+        # Title text (right of icon, two-line region with word wrap).
         label_font = QFont()
         label_font.setBold(True)
-        label_font.setPointSize(10)
+        label_font.setPointSize(11)
         painter.setFont(label_font)
+        painter.setPen(QColor(30, 30, 30))
+        text_rect = QRectF(52, 4, _BOX_W - 58, _HEADER_H - 8)
         painter.drawText(
-            QRectF(8, 2, _BOX_W - 16, 20), Qt.AlignVCenter | Qt.AlignLeft,
-            self._truncate(self.device.label, 26),
+            text_rect,
+            Qt.AlignVCenter | Qt.AlignLeft | Qt.TextWordWrap,
+            self._truncate(self.device.label, 56),
         )
 
         # Body
@@ -310,23 +367,15 @@ class DeviceItem(QGraphicsItem):
         rssi = f"{d.rssi_avg:.0f}" if d.rssi_avg is not None else "—"
         top_chs = sorted(d.channels.items(), key=lambda kv: -kv[1])[:3]
         ch_str = "/".join(str(c) for c, _ in top_chs) if top_chs else "—"
-        line1 = f"{d.packet_count:,} pkts · {rssi} dBm · ch {ch_str}"
-        vendor = d.vendor or d.oui_vendor or ""
-        line2_parts = []
-        if vendor:
-            line2_parts.append(self._truncate(vendor, 18))
-        if d.appearance is not None:
-            line2_parts.append(f"ap 0x{d.appearance:04X}")
-        line2_parts.append(f"{len(d.addresses)} addr")
-        line2 = " · ".join(line2_parts)
-        painter.drawText(QRectF(8, 24, _BOX_W - 16, 14),
-                         Qt.AlignVCenter | Qt.AlignLeft, line1)
-        painter.drawText(QRectF(8, 40, _BOX_W - 16, 14),
-                         Qt.AlignVCenter | Qt.AlignLeft, line2)
+        line = f"{d.packet_count:,} pkts · {rssi} dBm · ch {ch_str}"
+        painter.drawText(
+            QRectF(8, _HEADER_H + 4, _BOX_W - 16, 16),
+            Qt.AlignVCenter | Qt.AlignLeft, line,
+        )
 
     def _paint_expanded_body(self, painter: QPainter) -> None:
         d = self.device
-        y = 26
+        y = _HEADER_H + 4
         lh = 13  # line height
 
         def line(txt: str) -> None:

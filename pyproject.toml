@@ -5,8 +5,10 @@ description = "Bluetooth traffic visualizer and troubleshooting tool"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.7",
-    "pyshark>=0.6",
 ]
+# Note: tshark (the Wireshark CLI dissector) is invoked as a subprocess and
+# is *not* a Python package dependency. It must be installed separately —
+# see README.md "System requirements".
 
 [project.scripts]
 btviz = "btviz.__main__:main"

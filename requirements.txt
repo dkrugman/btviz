@@ -1,0 +1,5 @@
+# Source of truth for dependencies is pyproject.toml. This file just runs
+# an editable install of the package, which pulls in everything declared
+# there. Lets `pip install -r requirements.txt` work for users who expect
+# that workflow.
+-e .

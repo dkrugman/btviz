@@ -54,9 +54,20 @@ _SHAPE_W = 54                  # silhouette width
 _DONGLE_H = int(_SHAPE_W / 3.0)        # = 18
 _DK_H = int(_SHAPE_W / 2.15)           # = 25
 
-# Text column starts after the silhouette + small gap.
+# X-delete button for inactive rows. Reserved on the right edge whether
+# the row is active or not, so text width is consistent across rows.
+_X_BTN_SIZE = 16
+_X_BTN_MARGIN = 6
+
+# Text column starts after the silhouette + small gap, and ends before
+# the reserved X-button column on the right.
 _TEXT_X = _SHAPE_X + _SHAPE_W + 10
-_TEXT_W = _PANEL_W - _TEXT_X - 8
+_TEXT_W = _PANEL_W - _TEXT_X - _X_BTN_SIZE - _X_BTN_MARGIN - 6
+
+_X_BTN_BG = QColor(200, 200, 210)
+_X_BTN_BG_HOVER = QColor(220, 80, 80)
+_X_BTN_FG = QColor(60, 60, 70)
+_X_BTN_FG_HOVER = QColor(255, 255, 255)
 
 # Hardware-silhouette palette
 _DONGLE_BODY = QColor(245, 245, 240)
@@ -112,6 +123,10 @@ class SnifferPanel(QWidget):
         # serial_number -> monotonic time of last packet seen.
         # Used to compute the flash decay; populated by notify_packet().
         self._last_packet_at: dict[str, float] = {}
+
+        # Hovered X-button index (sniffer row), if any. Used to render
+        # the destructive button in red on hover.
+        self._x_btn_hover_idx: int | None = None
 
         # Repaint timer — keeps the flash decay smooth without us having
         # to push frames from the bus thread. Runs only while the panel
@@ -254,6 +269,10 @@ class SnifferPanel(QWidget):
             if self._expanded:
                 self._paint_row_silhouette(p, s, cy)
                 self._paint_row_text(p, s, cy)
+                # X-delete button only on inactive rows. Active sniffers
+                # don't need to be hideable — they're really there.
+                if not s.is_active:
+                    self._paint_x_button(p, i, cy)
 
     def _paint_row_silhouette(self, p: QPainter, s: Sniffer, cy: int) -> None:
         """Render a small icon of the actual hardware (1:3 dongle or
@@ -319,6 +338,36 @@ class SnifferPanel(QWidget):
         p.setBrush(QBrush(soc))
         ch = h // 3
         p.drawRect(QRectF(x + w // 2 - ch, y + h // 2 - ch // 2, ch * 2, ch))
+
+    def _x_button_rect(self, idx: int) -> QRectF | None:
+        """Bounding rect of the X-delete button for row idx, or None when
+        the panel is collapsed (X button only renders in expanded mode)."""
+        if not self._expanded:
+            return None
+        cy = self._dot_center_y(idx)
+        x = self.width() - _X_BTN_SIZE - _X_BTN_MARGIN
+        y = cy - _X_BTN_SIZE // 2
+        return QRectF(x, y, _X_BTN_SIZE, _X_BTN_SIZE)
+
+    def _paint_x_button(self, p: QPainter, idx: int, cy: int) -> None:
+        rect = self._x_button_rect(idx)
+        if rect is None:
+            return
+        hovered = (self._x_btn_hover_idx == idx)
+        bg = _X_BTN_BG_HOVER if hovered else _X_BTN_BG
+        fg = _X_BTN_FG_HOVER if hovered else _X_BTN_FG
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(bg))
+        p.drawEllipse(rect)
+        # Draw the X — two short diagonal strokes
+        p.setPen(QPen(fg, 1.5))
+        m = 4  # margin from circle edge to X stroke
+        x0 = rect.left() + m
+        y0 = rect.top() + m
+        x1 = rect.right() - m
+        y1 = rect.bottom() - m
+        p.drawLine(int(x0), int(y0), int(x1), int(y1))
+        p.drawLine(int(x0), int(y1), int(x1), int(y0))
 
     def _paint_row_text(self, p: QPainter, s: Sniffer, cy: int) -> None:
         """Three lines of identity text to the right of the silhouette.
@@ -414,14 +463,45 @@ class SnifferPanel(QWidget):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:
             return super().mousePressEvent(event)
-        # Hit-test the chevron tab. Anywhere outside is currently a no-op
-        # in the collapsed state; expanded clicks on rows will be wired
-        # in Phase 3.
-        if self._chevron_hit(event.position().toPoint()):
+        pos = event.position().toPoint()
+        # X-delete button (inactive rows only) takes precedence over
+        # chevron / row hit-testing.
+        idx = self._x_button_hit(pos)
+        if idx is not None:
+            self._on_x_button_clicked(idx)
+            event.accept()
+            return
+        if self._chevron_hit(pos):
             self.toggle()
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def _x_button_hit(self, pos) -> int | None:
+        """Return the row index whose X button is under ``pos``, or None.
+
+        Active rows have no X button so they're skipped even if pos lies
+        inside the reserved column.
+        """
+        if not self._expanded:
+            return None
+        for i, s in enumerate(self._sniffers):
+            if s.is_active:
+                continue
+            rect = self._x_button_rect(i)
+            if rect is not None and rect.contains(pos):
+                return i
+        return None
+
+    def _on_x_button_clicked(self, idx: int) -> None:
+        s = self._sniffers[idx]
+        if s.id is None:
+            return
+        self.repos.sniffers.soft_delete(s.id)
+        # list_all() filters out removed=1 by default, so the row drops
+        # off the panel immediately. If the same serial is rediscovered
+        # later, record_discovered() un-removes it automatically.
+        self.refresh()
 
     def _chevron_hit(self, pos) -> bool:
         cy = self.height() // 2
@@ -448,8 +528,20 @@ class SnifferPanel(QWidget):
         return None
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        """Update the tooltip per-row so hover reveals full identity."""
-        s = self._row_at(event.position().toPoint())
+        """Update tooltip per-row, and X-button hover state, on cursor move."""
+        pos = event.position().toPoint()
+        # Update X-button hover state — triggers repaint when it changes.
+        new_x_hover = self._x_button_hit(pos)
+        if new_x_hover != self._x_btn_hover_idx:
+            self._x_btn_hover_idx = new_x_hover
+            self.update()
+            self.setCursor(
+                Qt.CursorShape.PointingHandCursor if new_x_hover is not None
+                else Qt.CursorShape.ArrowCursor
+            )
+
+        # Tooltip swaps as cursor enters / leaves rows.
+        s = self._row_at(pos)
         if s is not None:
             new_tt = _row_tooltip(s)
             if self.toolTip() != new_tt:
@@ -458,6 +550,14 @@ class SnifferPanel(QWidget):
             if self.toolTip():
                 self.setToolTip("")
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        """Clear hover state when the cursor leaves the panel."""
+        if self._x_btn_hover_idx is not None:
+            self._x_btn_hover_idx = None
+            self.update()
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().leaveEvent(event)
 
 
 # ──────────────────────────────────────────────────────────────────────────

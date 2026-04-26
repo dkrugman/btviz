@@ -231,3 +231,30 @@ class BroadcastReceiver:
     packets_received: int = 0
     packets_lost: int = 0
     rssi_avg: float | None = None
+
+
+# --- physical sniffers -----------------------------------------------------
+
+@dataclass
+class Sniffer:
+    """A capture dongle / DK known to btviz.
+
+    Persisted across launches so the canvas always shows the same fleet
+    even when hardware isn't currently plugged in. ``is_active`` tracks
+    whether discovery saw it most recently; ``removed`` is the user's
+    "hide this" flag.
+    """
+    id: int | None
+    serial_number: str
+    kind: str = "unknown"               # dongle | dk | unknown
+    name: str | None = None
+    usb_port_id: str | None = None      # /dev/cu.usbmodem... etc.
+    location_id_hex: str | None = None  # USB physical-port id (sort key)
+    interface_id: str | None = None     # extcap interface value
+    display: str | None = None          # extcap display string
+    usb_product: str | None = None      # USB Product Name descriptor
+    is_active: bool = False
+    removed: bool = False
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+    notes: str | None = None

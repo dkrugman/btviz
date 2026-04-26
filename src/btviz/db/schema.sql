@@ -232,6 +232,34 @@ CREATE TABLE broadcast_receivers (
 );
 
 -- --------------------------------------------------------------------------
+-- Sniffers: physical capture hardware (dongles, DKs). Identified by USB
+-- serial number; we track which port they're plugged into so a multi-port
+-- hub maps consistently into the canvas's vertical sort order.
+-- --------------------------------------------------------------------------
+-- "Active" = found in the most recent discovery sweep. "Removed" = user
+-- hid it via the X button (still in the table for re-appearance later).
+-- A sniffer's serial is unique across firmware modes (DFU bootloader vs
+-- application FW): we record the most recent one.
+CREATE TABLE sniffers (
+    id              INTEGER PRIMARY KEY,
+    serial_number   TEXT NOT NULL UNIQUE,
+    kind            TEXT NOT NULL DEFAULT 'unknown',  -- dongle | dk | unknown
+    name            TEXT,                              -- user-set or autogen
+    usb_port_id     TEXT,                              -- /dev/cu.usbmodem... etc.
+    location_id_hex TEXT,                              -- USB physical-port id
+    interface_id    TEXT,                              -- extcap interface value
+    display         TEXT,                              -- display from extcap
+    usb_product     TEXT,                              -- from USB descriptor
+    is_active       INTEGER NOT NULL DEFAULT 0,
+    removed         INTEGER NOT NULL DEFAULT 0,
+    first_seen      REAL NOT NULL,
+    last_seen       REAL NOT NULL,
+    notes           TEXT
+);
+CREATE INDEX idx_sniffers_active ON sniffers(is_active, removed);
+CREATE INDEX idx_sniffers_location ON sniffers(location_id_hex);
+
+-- --------------------------------------------------------------------------
 -- App-level meta (last active project, misc state)
 -- --------------------------------------------------------------------------
 

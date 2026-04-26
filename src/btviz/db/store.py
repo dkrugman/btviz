@@ -9,8 +9,32 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH_ENV = "BTVIZ_DB_PATH"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
+
+# Incremental migrations applied to existing DBs to bring them up to
+# ``SCHEMA_VERSION``. Fresh DBs get the full schema.sql (which already
+# contains everything through SCHEMA_VERSION) and skip these.
+_V1_TO_V2_SQL = """
+CREATE TABLE sniffers (
+    id              INTEGER PRIMARY KEY,
+    serial_number   TEXT NOT NULL UNIQUE,
+    kind            TEXT NOT NULL DEFAULT 'unknown',
+    name            TEXT,
+    usb_port_id     TEXT,
+    location_id_hex TEXT,
+    interface_id    TEXT,
+    display         TEXT,
+    usb_product     TEXT,
+    is_active       INTEGER NOT NULL DEFAULT 0,
+    removed         INTEGER NOT NULL DEFAULT 0,
+    first_seen      REAL NOT NULL,
+    last_seen       REAL NOT NULL,
+    notes           TEXT
+);
+CREATE INDEX idx_sniffers_active ON sniffers(is_active, removed);
+CREATE INDEX idx_sniffers_location ON sniffers(location_id_hex);
+"""
 
 
 def default_db_path() -> Path:
@@ -43,14 +67,21 @@ class Store:
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
             return
+        # Fresh DB: schema.sql is the source of truth and already includes
+        # everything through SCHEMA_VERSION. Skip the per-version steps.
         if version == 0:
-            # executescript manages its own transaction, so don't wrap it.
             self.conn.executescript(_SCHEMA_FILE.read_text())
             self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             return
-        raise RuntimeError(
-            f"Unknown db schema version {version}; app expects {SCHEMA_VERSION}"
-        )
+        # Existing DB at a prior version: apply incremental migrations.
+        if version == 1:
+            self.conn.executescript(_V1_TO_V2_SQL)
+            self.conn.execute("PRAGMA user_version = 2")
+            version = 2
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Unknown db schema version {version}; app expects {SCHEMA_VERSION}"
+            )
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:

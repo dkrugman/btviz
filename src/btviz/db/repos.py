@@ -34,6 +34,7 @@ from .models import (
     Observation,
     Project,
     Session,
+    Sniffer,
 )
 from .store import Store
 
@@ -896,6 +897,169 @@ class Broadcasts:
         ]
 
 
+def _row_to_sniffer(r) -> Sniffer:
+    return Sniffer(
+        id=r["id"],
+        serial_number=r["serial_number"],
+        kind=r["kind"],
+        name=r["name"],
+        usb_port_id=r["usb_port_id"],
+        location_id_hex=r["location_id_hex"],
+        interface_id=r["interface_id"],
+        display=r["display"],
+        usb_product=r["usb_product"],
+        is_active=bool(r["is_active"]),
+        removed=bool(r["removed"]),
+        first_seen=r["first_seen"],
+        last_seen=r["last_seen"],
+        notes=r["notes"],
+    )
+
+
+class Sniffers:
+    """Persistent registry of capture dongles / DKs.
+
+    Two operations dominate the API:
+
+      * ``record_discovered(seen)`` — atomic batch update for one discovery
+        sweep. Marks every input as active, refreshes its USB port info,
+        deactivates anything previously active that wasn't seen this sweep.
+        Auto-prune-on-move is part of this same flow: if a serial appears
+        at a new ``location_id_hex``, any older row for the same serial at
+        a different port is dropped before the upsert (since it is
+        unambiguously the same physical unit, just plugged in elsewhere).
+      * ``soft_delete(id)`` / ``undelete(serial)`` — user UX for the X
+        button. ``soft_delete`` sets ``removed=1`` so the canvas hides the
+        row; the next time the same serial is discovered, ``removed`` is
+        cleared automatically so the user doesn't have to "un-delete".
+    """
+
+    def __init__(self, store: Store) -> None:
+        self.s = store
+
+    def record_discovered(self, seen: list[dict]) -> list[Sniffer]:
+        """Apply one discovery sweep's worth of sniffers atomically.
+
+        ``seen`` is a list of dicts with keys: serial_number, kind,
+        usb_port_id, location_id_hex, interface_id, display, usb_product.
+        Returns the resulting Sniffer rows for every active row after
+        the update, sorted by location_id_hex then serial_number.
+        """
+        ts = _now()
+        seen_serials = {s["serial_number"] for s in seen if s.get("serial_number")}
+
+        # Mark previously-active rows that aren't in this sweep as inactive.
+        if seen_serials:
+            placeholders = ",".join("?" * len(seen_serials))
+            self.s.conn.execute(
+                f"""
+                UPDATE sniffers
+                   SET is_active = 0
+                 WHERE is_active = 1 AND serial_number NOT IN ({placeholders})
+                """,
+                tuple(seen_serials),
+            )
+        else:
+            # Nothing seen at all — deactivate everything.
+            self.s.conn.execute("UPDATE sniffers SET is_active = 0")
+
+        # Per-serial upsert. ON CONFLICT updates the port/location/interface
+        # so a moved sniffer's row picks up its new physical position. The
+        # `removed` flag clears automatically on rediscovery — user no longer
+        # has to undo a soft-delete to use the same unit.
+        for s in seen:
+            sn = s.get("serial_number")
+            if not sn:
+                continue
+            self.s.conn.execute(
+                """
+                INSERT INTO sniffers(
+                    serial_number, kind, name,
+                    usb_port_id, location_id_hex, interface_id,
+                    display, usb_product,
+                    is_active, removed, first_seen, last_seen
+                )
+                VALUES(?, ?, NULL, ?, ?, ?, ?, ?, 1, 0, ?, ?)
+                ON CONFLICT(serial_number) DO UPDATE SET
+                    kind            = excluded.kind,
+                    usb_port_id     = excluded.usb_port_id,
+                    location_id_hex = excluded.location_id_hex,
+                    interface_id    = excluded.interface_id,
+                    display         = excluded.display,
+                    usb_product     = excluded.usb_product,
+                    is_active       = 1,
+                    removed         = 0,
+                    last_seen       = excluded.last_seen
+                """,
+                (
+                    sn,
+                    s.get("kind", "unknown"),
+                    s.get("usb_port_id"),
+                    s.get("location_id_hex"),
+                    s.get("interface_id"),
+                    s.get("display"),
+                    s.get("usb_product"),
+                    ts,
+                    ts,
+                ),
+            )
+
+        return self.list_all(active_only=False, include_removed=True)
+
+    def list_all(
+        self, *, active_only: bool = False, include_removed: bool = True
+    ) -> list[Sniffer]:
+        """All registered sniffers in sort order (location, then serial).
+
+        active_only=True returns only currently-detected ones.
+        include_removed=False excludes user-soft-deleted rows.
+        """
+        where: list[str] = []
+        if active_only:
+            where.append("is_active = 1")
+        if not include_removed:
+            where.append("removed = 0")
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        rows = self.s.conn.execute(
+            f"""
+            SELECT * FROM sniffers
+            {clause}
+             ORDER BY
+                 -- NULL locations sort last; otherwise sort lexically by
+                 -- the hex string (USB Location ID encodes the path).
+                 (location_id_hex IS NULL),
+                 location_id_hex,
+                 serial_number
+            """
+        ).fetchall()
+        return [_row_to_sniffer(r) for r in rows]
+
+    def get_by_serial(self, serial_number: str) -> Sniffer | None:
+        row = self.s.conn.execute(
+            "SELECT * FROM sniffers WHERE serial_number = ?", (serial_number,)
+        ).fetchone()
+        return _row_to_sniffer(row) if row else None
+
+    def set_name(self, sniffer_id: int, name: str | None) -> None:
+        self.s.conn.execute(
+            "UPDATE sniffers SET name = ? WHERE id = ?", (name, sniffer_id)
+        )
+
+    def soft_delete(self, sniffer_id: int) -> None:
+        """User clicked X. Hide the row; doesn't forget the serial."""
+        self.s.conn.execute(
+            "UPDATE sniffers SET removed = 1, is_active = 0 WHERE id = ?",
+            (sniffer_id,),
+        )
+
+    def undelete(self, serial_number: str) -> None:
+        """Clear the removed flag — used when the same serial reappears."""
+        self.s.conn.execute(
+            "UPDATE sniffers SET removed = 0 WHERE serial_number = ?",
+            (serial_number,),
+        )
+
+
 class Meta:
     """App-level key/value state (e.g. last active project)."""
 
@@ -939,4 +1103,5 @@ class Repos:
         self.layouts = Layouts(store)
         self.keys = Keys(store)
         self.broadcasts = Broadcasts(store)
+        self.sniffers = Sniffers(store)
         self.meta = Meta(store)

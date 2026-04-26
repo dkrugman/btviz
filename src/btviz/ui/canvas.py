@@ -83,6 +83,14 @@ _GRID_COLS = 6
 _GRID_DX = _BOX_W + 24
 _GRID_DY = _BOX_H_COLLAPSED + 22
 
+# Z-stacking. Expanded boxes sit above collapsed ones so their detail
+# region isn't occluded by neighbors. The actively-dragged item rises
+# above everything during the drag, then settles back to its
+# state-appropriate level on release.
+_Z_NORMAL = 1
+_Z_EXPANDED = 10
+_Z_DRAGGING = 100
+
 # Colors by address kind. Muted so text stays readable.
 _KIND_FILL = {
     "public_mac": QColor(210, 235, 210),
@@ -337,7 +345,7 @@ class DeviceItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self.setPos(device.pos_x, device.pos_y)
-        self.setZValue(1)
+        self.setZValue(_Z_EXPANDED if not device.collapsed else _Z_NORMAL)
 
     # --- geometry -----------------------------------------------------
 
@@ -474,24 +482,111 @@ class DeviceItem(QGraphicsItem):
     def _truncate(s: str, n: int) -> str:
         return s if len(s) <= n else s[: n - 1] + "…"
 
+    def _state_z(self) -> int:
+        """Z value this item should have when not actively being dragged."""
+        return _Z_EXPANDED if not self.device.collapsed else _Z_NORMAL
+
     # --- interaction --------------------------------------------------
+
+    def mousePressEvent(self, event) -> None:
+        # Float to the top while the user is interacting with this box —
+        # ensures any drag movement (and the rubber-band selection halo)
+        # paints above neighbors, including expanded ones.
+        self.setZValue(_Z_DRAGGING)
+        super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.prepareGeometryChange()
         self.device.collapsed = not self.device.collapsed
+        self.setZValue(self._state_z())
         self.update()
         self._persist(self.device, save_pos=False)
         event.accept()
 
+    def _persist_moved_selection(self) -> None:
+        """Persist position for *every* selected item that actually moved.
+
+        Qt translates a multi-selection drag by repositioning all selected
+        items together, but only the grabbed item's release event fires —
+        so we walk the selection here and write each one whose position
+        drifted past a small dead-band. Also covers the (rare) case where
+        a drag happens on an unselected item.
+        """
+        scene = self.scene()
+        if scene is None:
+            return
+        moved: list[DeviceItem] = []
+        for item in scene.selectedItems():
+            if not isinstance(item, DeviceItem):
+                continue
+            p = item.pos()
+            if (abs(p.x() - item.device.pos_x) > 0.5
+                    or abs(p.y() - item.device.pos_y) > 0.5):
+                item.device.pos_x = float(p.x())
+                item.device.pos_y = float(p.y())
+                moved.append(item)
+        if not self.isSelected():
+            p = self.pos()
+            if (abs(p.x() - self.device.pos_x) > 0.5
+                    or abs(p.y() - self.device.pos_y) > 0.5):
+                self.device.pos_x = float(p.x())
+                self.device.pos_y = float(p.y())
+                moved.append(self)
+        for item in moved:
+            item._persist(item.device, save_pos=True)
+
     def mouseReleaseEvent(self, event) -> None:
         super().mouseReleaseEvent(event)
-        p = self.pos()
-        # Only persist if the position actually changed (avoids a write for
-        # plain clicks/selection).
-        if abs(p.x() - self.device.pos_x) > 0.5 or abs(p.y() - self.device.pos_y) > 0.5:
-            self.device.pos_x = float(p.x())
-            self.device.pos_y = float(p.y())
-            self._persist(self.device, save_pos=True)
+        # Settle the dragged item back into its state-appropriate stack.
+        self.setZValue(self._state_z())
+        self._persist_moved_selection()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Canvas view with directional rubber-band selection
+# ──────────────────────────────────────────────────────────────────────────
+
+class _CanvasView(QGraphicsView):
+    """Adobe / CAD-style directional rubber-band selection.
+
+    Drag from upper-left toward lower-right → only items *fully enclosed*
+    by the rubber band get selected (``ContainsItemShape``).
+    Drag in any other direction → items *intersecting* the rubber band
+    get selected (``IntersectsItemShape``).
+
+    Implementation: we don't replace Qt's rubber-band drag — we just
+    flip its selection mode mid-drag based on where the mouse is now
+    relative to where it pressed down. ``setRubberBandSelectionMode``
+    takes effect on the live rubber-band selection, so the user sees the
+    selection change as they reverse direction.
+    """
+
+    def __init__(self, scene: QGraphicsScene) -> None:
+        super().__init__(scene)
+        self.setDragMode(QGraphicsView.RubberBandDrag)
+        self.setRubberBandSelectionMode(Qt.IntersectsItemShape)
+        self._press_pos = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._press_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._press_pos is not None and event.buttons() & Qt.LeftButton:
+            cur = event.position().toPoint()
+            dx = cur.x() - self._press_pos.x()
+            dy = cur.y() - self._press_pos.y()
+            mode = (Qt.ContainsItemShape
+                    if dx > 0 and dy > 0
+                    else Qt.IntersectsItemShape)
+            if self.rubberBandSelectionMode() != mode:
+                self.setRubberBandSelectionMode(mode)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._press_pos = None
+        super().mouseReleaseEvent(event)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -577,11 +672,10 @@ class CanvasWindow(QMainWindow):
         self.resize(1400, 900)
 
         self.scene = QGraphicsScene()
-        self.view = QGraphicsView(self.scene)
+        self.view = _CanvasView(self.scene)
         self.view.setRenderHints(
             QPainter.Antialiasing | QPainter.TextAntialiasing
         )
-        self.view.setDragMode(QGraphicsView.RubberBandDrag)
         self.setCentralWidget(self.view)
 
         tb = QToolBar("main")

@@ -76,7 +76,7 @@ def _icon_renderer(device_class: str | None) -> QSvgRenderer | None:
 _BOX_W = 220
 _HEADER_H = 50
 _BOX_H_COLLAPSED = _HEADER_H + 30   # body holds one summary line
-_BOX_H_EXPANDED = _HEADER_H + 154   # body holds detailed info block
+_BOX_H_EXPANDED = _HEADER_H + 220   # body holds detailed info block
 _BOX_RADIUS = 10
 _ICON_SIZE = 32                      # pt; QFont sets this in points
 _GRID_COLS = 6
@@ -183,6 +183,12 @@ class CanvasDevice:
     appearance: int | None = None
     device_class: str | None = None
     local_name: str | None = None
+    gatt_device_name: str | None = None
+    user_name: str | None = None
+    model: str | None = None
+    # When this device is the source of an Auracast broadcast somewhere in
+    # the project, the most recent broadcast_name for that broadcast.
+    broadcast_name: str | None = None
     packet_count: int = 0
     adv_count: int = 0
     data_count: int = 0
@@ -244,6 +250,9 @@ def load_canvas_devices(store: Store, project_id: int) -> list[CanvasDevice]:
             appearance=r["appearance"],
             device_class=r["device_class"],
             local_name=r["local_name"],
+            gatt_device_name=r["gatt_device_name"],
+            user_name=r["user_name"],
+            model=r["model"],
             packet_count=r["packet_count"] or 0,
             adv_count=r["adv_count"] or 0,
             data_count=r["data_count"] or 0,
@@ -285,6 +294,27 @@ def load_canvas_devices(store: Store, project_id: int) -> list[CanvasDevice]:
     for r in addr_rows:
         devices[r["device_id"]].addresses.append((r["address"], r["address_type"]))
 
+    # Most recent broadcast_name per broadcaster (across all sessions in
+    # this project). Walk in last_seen DESC order and keep first per
+    # device_id so the freshest name wins. Devices that never broadcast
+    # stay with broadcast_name=None.
+    bcast_rows = conn.execute(
+        f"""
+        SELECT b.broadcaster_device_id AS did, b.broadcast_name
+          FROM broadcasts b
+          JOIN sessions s ON s.id = b.session_id
+         WHERE s.project_id = ?
+           AND b.broadcaster_device_id IN ({placeholders})
+           AND b.broadcast_name IS NOT NULL
+         ORDER BY b.last_seen DESC
+        """,
+        (project_id, *devices.keys()),
+    ).fetchall()
+    for r in bcast_rows:
+        cd = devices[r["did"]]
+        if cd.broadcast_name is None:
+            cd.broadcast_name = r["broadcast_name"]
+
     # Saved layout per project.
     layout_rows = conn.execute(
         f"SELECT * FROM device_layouts WHERE project_id = ? AND device_id IN ({placeholders})",
@@ -302,7 +332,13 @@ def load_canvas_devices(store: Store, project_id: int) -> list[CanvasDevice]:
 
 def _row_best_label(r: Any) -> str:
     """Compute a device best-label from a sqlite Row (avoids constructing a
-    full Device dataclass just for the string)."""
+    full Device dataclass just for the string).
+
+    Note: broadcast_name isn't on the devices row so it can't influence
+    this label directly. ``DeviceItem`` adjusts its display to prefer
+    broadcast_name when this device is a broadcaster (see
+    ``_pick_display_label``).
+    """
     if r["user_name"]:
         return r["user_name"]
     if r["gatt_device_name"]:
@@ -321,6 +357,87 @@ def _row_best_label(r: Any) -> str:
         if sk.startswith(p):
             return sk[len(p):]
     return sk
+
+
+def _pick_display_label(d: CanvasDevice) -> str:
+    """Choose the strongest identity string for the box header.
+
+    Same precedence as ``_row_best_label`` but includes broadcast_name
+    near the top — for a device whose primary identity in this project
+    is being an Auracast broadcaster, the broadcast name (e.g. "Avantree
+    Oasis Aura_65ac") is the most informative thing we can show.
+    """
+    if d.user_name:
+        return d.user_name
+    if d.gatt_device_name:
+        return d.gatt_device_name
+    if d.local_name:
+        return d.local_name
+    if d.broadcast_name:
+        return d.broadcast_name
+    return d.label  # already-computed fallback (vendor + model / class / key)
+
+
+def _build_tooltip(d: CanvasDevice) -> str:
+    """Comprehensive plain-text tooltip showing every full value the box
+    might be truncating in the visual.
+
+    Hover-target is the whole DeviceItem — we don't do per-line tooltips
+    yet, so this single tooltip lists everything notable. Plain text only
+    (Qt's tooltip handles ``\\n``); avoids HTML for cross-platform render
+    consistency.
+    """
+    lines: list[str] = []
+    lines.append(_pick_display_label(d))
+    lines.append("─" * 36)
+    lines.append(f"Stable key:    {d.stable_key}")
+    lines.append(f"Kind:          {d.kind}")
+    if d.device_class:
+        lines.append(f"Class:         {d.device_class}")
+    if d.user_name:
+        lines.append(f"User name:     {d.user_name}")
+    if d.gatt_device_name:
+        lines.append(f"GATT name:     {d.gatt_device_name}")
+    if d.local_name:
+        lines.append(f"Local name:    {d.local_name}")
+    if d.broadcast_name:
+        lines.append(f"Broadcast:     {d.broadcast_name}")
+    if d.model:
+        lines.append(f"Model:         {d.model}")
+    vendor_full = d.vendor or "(none)"
+    lines.append(f"Vendor:        {vendor_full}")
+    if d.vendor_id is not None:
+        lines.append(f"Vendor ID:     0x{d.vendor_id:04X}")
+    if d.oui_vendor:
+        lines.append(f"OUI vendor:    {d.oui_vendor}")
+    if d.appearance is not None:
+        lines.append(f"Appearance:    0x{d.appearance:04X}")
+    lines.append("")
+    lines.append(
+        f"Packets:       {d.packet_count:,} "
+        f"(adv {d.adv_count:,}, data {d.data_count:,})"
+    )
+    if d.rssi_avg is not None:
+        lines.append(
+            f"RSSI:          avg {d.rssi_avg:.0f} dBm "
+            f"(min {d.rssi_min}, max {d.rssi_max})"
+        )
+    if d.pdu_types:
+        lines.append("")
+        lines.append("PDU types:")
+        for pdu, n in sorted(d.pdu_types.items(), key=lambda kv: -kv[1]):
+            lines.append(f"  {pdu}: {n}")
+    if d.channels:
+        lines.append("")
+        lines.append("Channels:")
+        for ch, n in sorted(d.channels.items()):
+            lines.append(f"  {ch}: {n}")
+    if d.addresses:
+        lines.append("")
+        lines.append(f"Addresses ({len(d.addresses)}):")
+        for addr, atype in d.addresses:
+            lines.append(f"  {addr}  ({atype})")
+    return "\n".join(lines)
 
 
 def apply_grid_layout(devices: list[CanvasDevice]) -> None:
@@ -355,6 +472,11 @@ class DeviceItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self.setPos(device.pos_x, device.pos_y)
         self.setZValue(_Z_EXPANDED if not device.collapsed else _Z_NORMAL)
+        # Comprehensive tooltip — gives the full text of every value that
+        # might get truncated in the rendered box (vendor, model, name,
+        # broadcast name, addresses, etc.) so the user can mouse-over to
+        # see what doesn't fit on screen.
+        self.setToolTip(_build_tooltip(device))
 
     # --- geometry -----------------------------------------------------
 
@@ -417,6 +539,8 @@ class DeviceItem(QGraphicsItem):
             painter.drawText(icon_rect, Qt.AlignVCenter | Qt.AlignHCenter, icon)
 
         # Title text (right of icon, two-line region with word wrap).
+        # Prefer broadcast_name / GATT name / local name over the
+        # vendor-derived fallback when one of those is set.
         label_font = QFont()
         label_font.setBold(True)
         label_font.setPointSize(11)
@@ -426,7 +550,7 @@ class DeviceItem(QGraphicsItem):
         painter.drawText(
             text_rect,
             Qt.AlignVCenter | Qt.AlignLeft | Qt.TextWordWrap,
-            self._truncate(self.device.label, 56),
+            self._truncate(_pick_display_label(self.device), 56),
         )
 
         # Body
@@ -467,12 +591,31 @@ class DeviceItem(QGraphicsItem):
             if d.rssi_avg is not None else "—"
         )
         line(f"kind: {d.kind}")
-        line(f"pkts: {d.packet_count:,} (adv {d.adv_count:,}, data {d.data_count:,})")
-        line(f"rssi: {rssi}")
-        vendor = d.vendor or d.oui_vendor or "—"
-        line(f"vendor: {self._truncate(vendor, 26)}")
+        # Class is what determines the icon and most of the label fallback —
+        # users want to know where it came from. Show the class string and
+        # the appearance value (if any) that produced it.
+        if d.device_class:
+            line(f"class: {d.device_class}")
         if d.appearance is not None:
             line(f"appearance: 0x{d.appearance:04X}")
+        line(f"pkts: {d.packet_count:,} (adv {d.adv_count:,}, data {d.data_count:,})")
+        line(f"rssi: {rssi}")
+
+        # Identity strings — show every name source so it's obvious which
+        # one drove the label. Empty values stay unprinted to save vertical
+        # space; the tooltip lists them all regardless.
+        vendor = d.vendor or d.oui_vendor or "—"
+        line(f"vendor: {self._truncate(vendor, 26)}")
+        if d.model:
+            line(f"model: {self._truncate(d.model, 28)}")
+        if d.user_name:
+            line(f"user_name: {self._truncate(d.user_name, 24)}")
+        if d.gatt_device_name:
+            line(f"gatt_name: {self._truncate(d.gatt_device_name, 24)}")
+        if d.local_name:
+            line(f"local_name: {self._truncate(d.local_name, 22)}")
+        if d.broadcast_name:
+            line(f"broadcast: {self._truncate(d.broadcast_name, 23)}")
 
         # Top PDU types
         if d.pdu_types:

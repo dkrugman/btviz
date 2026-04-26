@@ -830,15 +830,33 @@ class CanvasWindow(QMainWindow):
         )
         self.setCentralWidget(self.view)
 
+        # Sniffer panel — overlay child of the view's viewport, hugging
+        # the left edge. Always visible; chevron toggles expansion.
+        from .sniffer_panel import SnifferPanel
+        self.sniffer_panel = SnifferPanel(self.view.viewport(), store)
+        self.sniffer_panel.show()
+        # Keep the panel hugging the viewport's left edge as the window
+        # resizes. We can't use a layout (the view is the central widget,
+        # the panel is an absolute-positioned overlay child of viewport),
+        # so we route resizeEvent through to the panel's reposition().
+        self._install_panel_reposition_filter()
+        self._reposition_panel()
+
         tb = QToolBar("main")
         self.addToolBar(tb)
         tb.addAction("Reload", self.reload)
         tb.addAction("Reset layout", self.reset_layout)
+        tb.addAction("Refresh sniffers", self._refresh_sniffers)
         tb.addSeparator()
         self.status = QLabel("")
         tb.addWidget(self.status)
 
         self.reload()
+        # Run an initial discovery sweep so the sniffer panel reflects
+        # what's currently plugged in. Errors (e.g. extcap not installed)
+        # don't block the canvas — the panel just shows whatever's in
+        # the DB from previous sessions.
+        self._refresh_sniffers()
         self.repos.meta.set(self.repos.meta.LAST_PROJECT, str(project_id))
 
     # --- data ---------------------------------------------------------
@@ -884,6 +902,47 @@ class CanvasWindow(QMainWindow):
         self.repos.layouts.upsert_device(layout)
         # Touch the project so most-recent-used ordering stays meaningful.
         self.repos.projects.touch(self.project_id)
+
+    # --- sniffer panel ------------------------------------------------
+
+    def _install_panel_reposition_filter(self) -> None:
+        """Forward viewport resizes to the SnifferPanel so it tracks the
+        left edge. We can't put it in a layout (it overlays the viewport),
+        so we drive its geometry from the viewport's resize event."""
+        viewport = self.view.viewport()
+        viewport.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt naming)
+        from PySide6.QtCore import QEvent
+        if obj is self.view.viewport() and event.type() == QEvent.Type.Resize:
+            self._reposition_panel()
+        return super().eventFilter(obj, event)
+
+    def _reposition_panel(self) -> None:
+        """Snap the sniffer panel to the viewport's left edge at full height."""
+        if not hasattr(self, "sniffer_panel"):
+            return
+        rect = self.view.viewport().rect()
+        self.sniffer_panel.reposition(QRectF(rect))
+        self.sniffer_panel.raise_()  # stay above scene content
+
+    def _refresh_sniffers(self) -> None:
+        """Re-run discovery, persist into the sniffers table, refresh panel.
+
+        Discovery failure (e.g. extcap binary missing) shouldn't crash the
+        canvas — log it via the status bar and keep what's already in the
+        DB on screen.
+        """
+        try:
+            from ..extcap.discovery import (
+                discovered_to_db_records, list_dongles,
+            )
+            dongles = list_dongles()
+            records = discovered_to_db_records(dongles)
+            self.repos.sniffers.record_discovered(records)
+        except Exception as e:  # noqa: BLE001
+            self.status.setText(f"  sniffer discovery failed: {e}")
+        self.sniffer_panel.refresh()
 
 
 # ──────────────────────────────────────────────────────────────────────────

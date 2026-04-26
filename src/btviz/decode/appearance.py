@@ -15,6 +15,19 @@ Source-of-truth: Bluetooth SIG Assigned Numbers.
 """
 from __future__ import annotations
 
+# HID subcategory (lower 6 bits of category 0x00F) -> device_class.
+# Lets keyboards / mice / joysticks / gamepads pick distinct icons even
+# though they share the top-level "hid" category.
+_HID_SUBCATEGORY_TO_CLASS: dict[int, str] = {
+    0x01: "hid_keyboard",
+    0x02: "hid_mouse",
+    0x03: "hid_joystick",
+    0x04: "hid_gamepad",
+    # 0x05: digitizer tablet, 0x06: card reader, 0x07: digital pen,
+    # 0x08: barcode scanner — fall through to generic "hid".
+}
+
+
 # Category id (upper 10 bits of the 16-bit appearance) -> device_class.
 # Limited to categories that turn up in BLE traffic; extend as needed.
 _CATEGORY_TO_CLASS: dict[int, str] = {
@@ -52,4 +65,7 @@ def appearance_to_class(appearance: int | None) -> str | None:
     if appearance is None:
         return None
     category = (appearance >> 6) & 0x3FF
+    if category == 0x00F:                 # HID — dispatch on subcategory
+        sub = appearance & 0x3F
+        return _HID_SUBCATEGORY_TO_CLASS.get(sub, "hid")
     return _CATEGORY_TO_CLASS.get(category)

@@ -130,8 +130,18 @@ _DEVICE_CLASS_ICONS: dict[str, str] = {
     "fitness_tracker": "\U0001F3CB",  # 🏋
     "hearing_aid":    "\U0001F9BB",  # 🦻
     "personal_mobility_device": "\U0001F9BD",  # 🦽
+    # New classes that came in with the iconscout drop. Emoji are emoji-
+    # only fallbacks; SVGs in data/icons/ supersede them automatically.
+    "camera":         "\U0001F4F7",  # 📷
+    "headphones":     "\U0001F3A7",  # 🎧 (same as airpods — generic non-Apple)
+    "windows_computer": "\U0001F5A5",  # 🖥
+    "hid_keyboard":   "⌨",       # ⌨
+    "hid_mouse":      "\U0001F5B1",  # 🖱
+    "hid_joystick":   "\U0001F579",  # 🕹
+    "hid_gamepad":    "\U0001F3AE",  # 🎮
 }
 _FALLBACK_ICON = "\U0001F50C"        # 🔌  generic BLE-ish stand-in
+_FALLBACK_SVG_NAME = "fallback_icon" # picked up from data/icons/<name>.svg
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -353,10 +363,19 @@ class DeviceItem(QGraphicsItem):
         # Square off the bottom of the header so it joins the body cleanly.
         painter.drawRect(QRectF(0, _BOX_RADIUS, _BOX_W, _HEADER_H - _BOX_RADIUS))
 
-        # Icon (left side). Prefer a bundled SVG if one exists for this
-        # device_class; otherwise fall back to the emoji table.
+        # Icon (left side). Cascade:
+        #   1. SVG matching device_class (data/icons/<class>.svg)
+        #   2. SVG fallback (data/icons/fallback_icon.svg) — covers any
+        #      class without a specific SVG, including unknown classes.
+        #   3. Class emoji from _DEVICE_CLASS_ICONS
+        #   4. _FALLBACK_ICON emoji
+        # Steps 1+2 are pure-SVG; 3+4 are pure-emoji. We commit to one path
+        # so the icon area's font/style is set up only once.
         icon_rect = QRectF(6, 0, 44, _HEADER_H)
-        renderer = _icon_renderer(self.device.device_class)
+        renderer = (
+            _icon_renderer(self.device.device_class)
+            or _icon_renderer(_FALLBACK_SVG_NAME)
+        )
         if renderer is not None:
             # Center a square SVG inside the icon area, with a few pixels
             # of padding so it doesn't crowd the rounded corner.

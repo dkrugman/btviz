@@ -9,20 +9,40 @@ in `src/btviz/ui/canvas.py`.
 ## Recognized classes
 
 These match the values populated by the ingest pipeline (Apple
-Continuity decoder + GAP appearance fallback):
+Continuity decoder + GAP appearance fallback). Drop one SVG per class.
 
 ```
+# Apple Continuity (manufacturer data)
 airpods             airtag              apple_watch
 apple_device        apple_airplay       homekit
-ibeacon             phone               computer
-watch               clock               display
-remote_control      eyewear             tag
-keyring             media_player        barcode_scanner
-thermometer         heart_rate_sensor   blood_pressure_monitor
-hid                 glucose_meter       running_walking_sensor
+ibeacon
+
+# GAP appearance (category-level)
+phone               computer            watch
+clock               display             remote_control
+eyewear             tag                 keyring
+media_player        barcode_scanner     thermometer
+heart_rate_sensor   blood_pressure_monitor
+glucose_meter       running_walking_sensor
 cycling_sensor      pulse_oximeter      weight_scale
 fitness_tracker     hearing_aid         personal_mobility_device
+
+# GAP appearance (HID subcategory)
+hid                 hid_keyboard        hid_mouse
+hid_joystick        hid_gamepad
+
+# Convenience / non-class (recognized but never emitted by the
+# ingest pipeline today — kept around for manual labelling and
+# future taxonomy growth):
+camera              headphones          windows_computer
 ```
+
+## Fallback icon
+
+`fallback_icon.svg` is special: it's used whenever a device's
+`device_class` has no specific SVG of its own. This means once
+`fallback_icon.svg` is present, *every* box renders an SVG (never an
+emoji) — emoji are used only when no SVGs exist at all.
 
 Add new classes by populating `device_class` from the ingest pipeline
 and dropping a matching SVG here.

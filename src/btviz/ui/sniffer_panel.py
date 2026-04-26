@@ -39,12 +39,35 @@ from ..db.store import Store
 # ──────────────────────────────────────────────────────────────────────────
 
 _STRIP_W = 22                  # collapsed-panel width (px)
-_PANEL_W = 260                 # expanded-panel width (px) — used in Phase 3
+_PANEL_W = 280                 # expanded-panel width (px)
 _DOT_SIZE = 12
-_ROW_H = 28                    # vertical pitch between sniffers in the strip
-_TOP_PAD = 12
+_ROW_H = 52                    # row pitch (same in both states so dots
+                               # don't jump vertically when expanding)
+_TOP_PAD = 14
 _CHEVRON_W = 14
 _CHEVRON_H = 28
+
+# Shape geometry (expanded mode). Dongles are 1:3, DKs ~1:2.15 — actual
+# aspect ratios of the hardware so the silhouettes read at a glance.
+_SHAPE_X = 26                  # left edge of the silhouette column
+_SHAPE_W = 54                  # silhouette width
+_DONGLE_H = int(_SHAPE_W / 3.0)        # = 18
+_DK_H = int(_SHAPE_W / 2.15)           # = 25
+
+# Text column starts after the silhouette + small gap.
+_TEXT_X = _SHAPE_X + _SHAPE_W + 10
+_TEXT_W = _PANEL_W - _TEXT_X - 8
+
+# Hardware-silhouette palette
+_DONGLE_BODY = QColor(245, 245, 240)
+_DONGLE_OUTLINE = QColor(60, 60, 70)
+_DONGLE_USB = QColor(180, 180, 190)     # USB connector tab
+_DONGLE_LED = QColor(220, 60, 60)       # status LED (red when capturing)
+
+_DK_BODY = QColor(40, 40, 60)           # darker PCB-ish body
+_DK_OUTLINE = QColor(20, 20, 30)
+_DK_HEADER = QColor(180, 160, 60)       # gold-ish pin headers
+_DK_SOC = QColor(80, 80, 100)           # SoC chip square
 
 _PANEL_BG = QColor(248, 248, 250)
 _STRIP_BG = QColor(232, 232, 238)
@@ -211,8 +234,13 @@ class SnifferPanel(QWidget):
         p.end()
 
     def _paint_dots(self, p: QPainter) -> None:
+        """Paint one row per sniffer. The activity dot column is identical
+        between collapsed and expanded modes — no vertical jump on toggle.
+        Expanded adds silhouette + text columns to the right.
+        """
         for i, s in enumerate(self._sniffers):
             cy = self._dot_center_y(i)
+            # Activity dot (same x in both states — matches collapsed strip)
             cx = _STRIP_W // 2
             color = self._dot_color_for(s)
             p.setPen(QPen(_DOT_OUTLINE, 1))
@@ -223,6 +251,119 @@ class SnifferPanel(QWidget):
                 _DOT_SIZE,
                 _DOT_SIZE,
             )
+            if self._expanded:
+                self._paint_row_silhouette(p, s, cy)
+                self._paint_row_text(p, s, cy)
+
+    def _paint_row_silhouette(self, p: QPainter, s: Sniffer, cy: int) -> None:
+        """Render a small icon of the actual hardware (1:3 dongle or
+        1:2.15 DK aspect). When the sniffer is inactive the silhouette
+        is dimmed via a lower alpha."""
+        is_dk = (s.kind == "dk")
+        sw = _SHAPE_W
+        sh = _DK_H if is_dk else _DONGLE_H
+        sx = _SHAPE_X
+        sy = cy - sh // 2
+
+        # Inactive sniffers paint dim so the column reads at a glance.
+        alpha = 255 if s.is_active and not s.removed else 110
+
+        if is_dk:
+            self._paint_dk(p, sx, sy, sw, sh, alpha)
+        else:
+            self._paint_dongle(p, sx, sy, sw, sh, alpha)
+
+    def _paint_dongle(self, p: QPainter, x: int, y: int, w: int, h: int,
+                      alpha: int) -> None:
+        """nRF52840 dongle silhouette — a thin pill with a USB tab on one
+        end and an LED on the other. Stylized, not pixel-perfect."""
+        body = QColor(_DONGLE_BODY); body.setAlpha(alpha)
+        outline = QColor(_DONGLE_OUTLINE); outline.setAlpha(alpha)
+        usb = QColor(_DONGLE_USB); usb.setAlpha(alpha)
+        led = QColor(_DONGLE_LED); led.setAlpha(alpha)
+
+        # Body — rounded rectangle
+        p.setPen(QPen(outline, 1))
+        p.setBrush(QBrush(body))
+        p.drawRoundedRect(QRectF(x, y, w, h), 3, 3)
+        # USB connector tab on the LEFT end (shorter, wider)
+        usb_w = h
+        p.setBrush(QBrush(usb))
+        p.drawRect(QRectF(x - usb_w // 2, y + 3, usb_w // 2 + 1, h - 6))
+        # LED dot on the right end
+        p.setBrush(QBrush(led))
+        led_d = max(3, h // 4)
+        p.drawEllipse(
+            int(x + w - led_d - 4), int(y + h // 2 - led_d // 2),
+            led_d, led_d,
+        )
+
+    def _paint_dk(self, p: QPainter, x: int, y: int, w: int, h: int,
+                  alpha: int) -> None:
+        """nRF5340 Audio DK silhouette — squarer, dark PCB body with a
+        gold pin-header strip across the top and an SoC chip square."""
+        body = QColor(_DK_BODY); body.setAlpha(alpha)
+        outline = QColor(_DK_OUTLINE); outline.setAlpha(alpha)
+        header = QColor(_DK_HEADER); header.setAlpha(alpha)
+        soc = QColor(_DK_SOC); soc.setAlpha(alpha)
+
+        # PCB body
+        p.setPen(QPen(outline, 1))
+        p.setBrush(QBrush(body))
+        p.drawRoundedRect(QRectF(x, y, w, h), 2, 2)
+        # Gold header strip across the top
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(header))
+        p.drawRect(QRectF(x + 4, y + 3, w - 8, 3))
+        # SoC chip square in the middle
+        p.setBrush(QBrush(soc))
+        ch = h // 3
+        p.drawRect(QRectF(x + w // 2 - ch, y + h // 2 - ch // 2, ch * 2, ch))
+
+    def _paint_row_text(self, p: QPainter, s: Sniffer, cy: int) -> None:
+        """Three lines of identity text to the right of the silhouette.
+
+        Line 1: bold display name (user_name OR autogen).
+        Line 2: kind · last 8 chars of serial.
+        Line 3: USB port (truncated). Tooltip shows full path.
+        """
+        x = _TEXT_X
+        # Vertical typography: 3 lines, total ~36px, centered on row.
+        line_h = 12
+        total_h = line_h * 3
+        top = cy - total_h // 2
+
+        # Inactive items render lighter so they read as "not currently here".
+        text_color = QColor(40, 40, 50) if s.is_active else QColor(110, 110, 120)
+        accent_color = QColor(110, 110, 120) if s.is_active else QColor(140, 140, 150)
+        p.setPen(QPen(text_color))
+
+        name = s.name or _autogen_name(s)
+        bold = QFont(); bold.setBold(True); bold.setPointSize(9)
+        regular = QFont(); regular.setPointSize(8)
+
+        p.setFont(bold)
+        p.drawText(QRectF(x, top, _TEXT_W, line_h),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   _truncate(name, 28))
+
+        p.setPen(QPen(accent_color))
+        p.setFont(regular)
+        kind_str = s.kind or "unknown"
+        sn_short = (s.serial_number or "")[-10:]
+        p.drawText(QRectF(x, top + line_h, _TEXT_W, line_h),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   _truncate(f"{kind_str} · …{sn_short}", 32))
+
+        port_str = s.usb_port_id or "(no port)"
+        # Strip the platform prefix to save room ("/dev/cu.usbmodem" → "")
+        for prefix in ("/dev/cu.usbmodem", "/dev/cu.", "/dev/"):
+            if port_str.startswith(prefix):
+                port_str = port_str[len(prefix):]
+                break
+        p.drawText(QRectF(x, top + 2 * line_h, _TEXT_W, line_h),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   _truncate(port_str, 32))
 
     def _paint_chevron(self, p: QPainter) -> None:
         """Acrobat-style chevron tab on the inner edge of the panel.
@@ -291,6 +432,33 @@ class SnifferPanel(QWidget):
             and cy - _CHEVRON_H // 2 <= y <= cy + _CHEVRON_H // 2
         )
 
+    def _row_at(self, pos) -> Sniffer | None:
+        """Map a mouse position to a Sniffer row, or None if not on a row.
+
+        Hit-testing is by vertical band — same range any row's content
+        occupies (dot, silhouette, text). Allows tooltips to update as
+        the cursor moves between rows.
+        """
+        y = pos.y()
+        if y < _TOP_PAD - _ROW_H // 2:
+            return None
+        idx = (y - _TOP_PAD + _ROW_H // 2) // _ROW_H
+        if 0 <= idx < len(self._sniffers):
+            return self._sniffers[int(idx)]
+        return None
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        """Update the tooltip per-row so hover reveals full identity."""
+        s = self._row_at(event.position().toPoint())
+        if s is not None:
+            new_tt = _row_tooltip(s)
+            if self.toolTip() != new_tt:
+                self.setToolTip(new_tt)
+        else:
+            if self.toolTip():
+                self.setToolTip("")
+        super().mouseMoveEvent(event)
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -305,3 +473,50 @@ def _interp(a: QColor, b: QColor, t: float) -> QColor:
         int(a.blue()  + (b.blue()  - a.blue())  * t),
         int(a.alpha() + (b.alpha() - a.alpha()) * t),
     )
+
+
+def _truncate(s: str, n: int) -> str:
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _autogen_name(s: Sniffer) -> str:
+    """Default label for a sniffer when the user hasn't named it.
+
+    Format: ``<kind>-<short serial>`` so the row is recognizable without
+    exposing the full 16-char chip serial. User can override via
+    Sniffers.set_name().
+    """
+    sn = (s.serial_number or "?")
+    short = sn[-6:] if len(sn) >= 6 else sn
+    kind = (s.kind or "unknown").replace("_", " ")
+    return f"{kind}-{short}"
+
+
+def _row_tooltip(s: Sniffer) -> str:
+    """Multi-line tooltip with the full identity for a sniffer row.
+
+    Shown on hover so any truncated value in the rendered row is
+    available in full.
+    """
+    lines: list[str] = []
+    lines.append(s.name or _autogen_name(s))
+    lines.append("─" * 32)
+    lines.append(f"Kind:        {s.kind or 'unknown'}")
+    lines.append(f"Serial:      {s.serial_number or '(none)'}")
+    lines.append(f"USB port:    {s.usb_port_id or '(none)'}")
+    lines.append(f"Location ID: {s.location_id_hex or '(none)'}")
+    if s.interface_id and s.interface_id != s.usb_port_id:
+        lines.append(f"Interface:   {s.interface_id}")
+    if s.display:
+        lines.append(f"Display:     {s.display}")
+    if s.usb_product:
+        lines.append(f"USB product: {s.usb_product}")
+    state = []
+    if s.is_active:
+        state.append("active")
+    else:
+        state.append("inactive")
+    if s.removed:
+        state.append("removed (hidden)")
+    lines.append(f"State:       {', '.join(state)}")
+    return "\n".join(lines)

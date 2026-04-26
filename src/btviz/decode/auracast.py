@@ -65,11 +65,15 @@ _TYPES_WITH_SERVICE_DATA = {
     0x21,                         # Service Data 128-bit
 }
 
-# BIGInfo PHY enumeration in tshark output (LE Audio spec values).
+# BIGInfo PHY enumeration. The PHY field inside the BIGInfo ACAD payload
+# is a 3-bit raw enum (Core Spec Vol 6 Part B §2.4.2.32), NOT the HCI
+# LE PHY bitmask (1=1M, 2=2M, 4=Coded) used in commands like LE Set PHY.
+# This matches the convention normalize.py uses for nordic_ble.phy /
+# btle_rf.phy, so PHY display strings stay consistent across paths.
 _PHY_NAMES = {
-    1: "1M",
-    2: "2M",
-    4: "Coded",
+    0: "1M",
+    1: "2M",
+    2: "Coded",
 }
 
 

@@ -28,6 +28,7 @@ from ..db.repos import Repos
 from ..db.store import Store
 from ..decode.appearance import appearance_to_class
 from ..decode.apple_continuity import classify as classify_apple, parse_continuity
+from ..decode.auracast import parse_auracast
 from ..vendors import company_vendor, oui_vendor
 from .normalize import normalize
 from .tshark import dissect_file
@@ -47,6 +48,7 @@ class IngestReport:
     devices_new: int
     devices_touched: int        # distinct devices contributed to this session
     addresses_new: int
+    broadcasts_seen: int        # distinct Auracast broadcasts in this session
     duration_s: float
 
     def format(self) -> str:
@@ -60,6 +62,7 @@ class IngestReport:
             f"  devices:        {self.devices_touched} touched "
             f"({self.devices_new} new)\n"
             f"  addresses new:  {self.addresses_new}\n"
+            f"  broadcasts:     {self.broadcasts_seen} Auracast\n"
             f"  duration:       {self.duration_s:.1f}s"
         )
 
@@ -204,6 +207,7 @@ def ingest_file(
     # State that tracks uniqueness / caches identity across packets.
     seen_device_ids: set[int] = set()
     seen_address_ids: set[int] = set()
+    seen_broadcast_ids: set[int] = set()
     # Cache {device_id -> current identity fields} so we only UPDATE when
     # a new clue actually changes something.
     device_state: dict[int, dict[str, Any]] = {}
@@ -295,6 +299,24 @@ def ingest_file(
                 repos.devices.merge_identity(device.id, **updates)
                 state.update(updates)
 
+            # Auracast: if this packet carries a Broadcast Audio Announcement
+            # (BAA service data), upsert a row in `broadcasts`. Only ADV_EXT_
+            # IND / AUX_ADV_IND packets carry BAA, so cheap reject for the
+            # non-extended-adv hot path.
+            if pkt.pdu_type == "ADV_EXT_IND":
+                ai = parse_auracast(pkt.extras.get("layers", {}))
+                if ai is not None:
+                    repos.broadcasts.upsert(
+                        sess.id, ai.broadcast_id,
+                        broadcaster_device_id=device.id,
+                        broadcast_name=ai.broadcast_name,
+                        bis_count=ai.bis_count,
+                        phy=ai.phy,
+                        encrypted=ai.encrypted,
+                        ts=pkt.ts,
+                    )
+                    seen_broadcast_ids.add(ai.broadcast_id)
+
             # Observation: per (session, device) aggregate.
             is_adv = (pkt.pdu_type in _ADV_PDU_TYPES) if pkt.pdu_type else True
             repos.observations.record_packet(
@@ -326,5 +348,6 @@ def ingest_file(
         devices_new=devices_after - devices_new_before,
         devices_touched=len(seen_device_ids),
         addresses_new=addresses_after - addresses_before,
+        broadcasts_seen=len(seen_broadcast_ids),
         duration_s=time.monotonic() - t0,
     )

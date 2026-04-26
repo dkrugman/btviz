@@ -11,8 +11,10 @@ from .apple_continuity import (
     classify as classify_apple,
     parse_continuity,
 )
+from .auracast import AuracastInfo, parse_auracast
 
 __all__ = [
+    "AuracastInfo",
     "ContinuityEntry",
     "DecodedAdv",
     "appearance_to_class",
@@ -20,5 +22,6 @@ __all__ = [
     "classify_apple",
     "decode_phdr_packet",
     "parse_ad_structures",
+    "parse_auracast",
     "parse_continuity",
 ]

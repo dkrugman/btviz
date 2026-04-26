@@ -787,6 +787,115 @@ class Keys:
         self.s.conn.execute("DELETE FROM ltks WHERE id = ?", (ltk_id,))
 
 
+class Broadcasts:
+    """Auracast broadcast records, keyed per-session by Broadcast_ID.
+
+    Each (session_id, broadcast_id) pair corresponds to one observed
+    Auracast stream. A broadcaster that streams across multiple sessions
+    yields one row per session — that's deliberate, since QoS / channel
+    activity per session is what we care about.
+
+    Schema lives in db/schema.sql under `broadcasts`. There's no UNIQUE
+    constraint on (session_id, broadcast_id) at the SQL level, so we
+    do the existence check in Python before inserting. For typical
+    captures (a handful of broadcasters), this is fine.
+    """
+
+    def __init__(self, store: Store) -> None:
+        self.s = store
+
+    def upsert(
+        self,
+        session_id: int,
+        broadcast_id: int,
+        *,
+        broadcaster_device_id: int | None = None,
+        broadcast_name: str | None = None,
+        bis_count: int | None = None,
+        phy: str | None = None,
+        encrypted: bool = False,
+        ts: float | None = None,
+    ) -> int:
+        """Insert or refresh a broadcast row. Returns the row id.
+
+        Only non-None fields are applied on update — so a stronger signal
+        from a later packet (e.g. BIGInfo finally arrived with bis_count)
+        replaces a weaker one, but a lone BAA-only packet won't clobber a
+        fully-populated row.
+        """
+        ts = ts if ts is not None else _now()
+        row = self.s.conn.execute(
+            """
+            SELECT id, broadcaster_device_id, broadcast_name,
+                   bis_count, phy, encrypted
+              FROM broadcasts
+             WHERE session_id = ? AND broadcast_id = ?
+            """,
+            (session_id, broadcast_id),
+        ).fetchone()
+
+        if row is None:
+            cur = self.s.conn.execute(
+                """
+                INSERT INTO broadcasts(
+                    session_id, broadcaster_device_id, broadcast_id,
+                    broadcast_name, bis_count, phy, encrypted,
+                    first_seen, last_seen
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, broadcaster_device_id, broadcast_id,
+                 broadcast_name, bis_count, phy, int(encrypted),
+                 ts, ts),
+            )
+            return cur.lastrowid
+
+        # Update — only override existing fields when we have a value, so
+        # we accumulate evidence rather than thrashing.
+        new_dev = broadcaster_device_id if broadcaster_device_id is not None else row["broadcaster_device_id"]
+        new_name = broadcast_name if broadcast_name is not None else row["broadcast_name"]
+        new_bis = bis_count if bis_count is not None else row["bis_count"]
+        new_phy = phy if phy is not None else row["phy"]
+        # encrypted is True-leaning: once True, stays True.
+        new_enc = int(encrypted or bool(row["encrypted"]))
+        self.s.conn.execute(
+            """
+            UPDATE broadcasts SET
+                broadcaster_device_id = ?,
+                broadcast_name = ?,
+                bis_count = ?,
+                phy = ?,
+                encrypted = ?,
+                last_seen = ?
+             WHERE id = ?
+            """,
+            (new_dev, new_name, new_bis, new_phy, new_enc, ts, row["id"]),
+        )
+        return row["id"]
+
+    def list_for_session(self, session_id: int) -> list[Broadcast]:
+        rows = self.s.conn.execute(
+            "SELECT * FROM broadcasts WHERE session_id = ? ORDER BY first_seen",
+            (session_id,),
+        ).fetchall()
+        return [
+            Broadcast(
+                id=r["id"],
+                session_id=r["session_id"],
+                broadcaster_device_id=r["broadcaster_device_id"],
+                broadcast_id=r["broadcast_id"],
+                broadcast_name=r["broadcast_name"],
+                big_handle=r["big_handle"],
+                bis_count=r["bis_count"],
+                phy=r["phy"],
+                encrypted=bool(r["encrypted"]),
+                first_seen=r["first_seen"],
+                last_seen=r["last_seen"],
+            )
+            for r in rows
+        ]
+
+
 class Meta:
     """App-level key/value state (e.g. last active project)."""
 
@@ -829,4 +938,5 @@ class Repos:
         self.groups = Groups(store)
         self.layouts = Layouts(store)
         self.keys = Keys(store)
+        self.broadcasts = Broadcasts(store)
         self.meta = Meta(store)

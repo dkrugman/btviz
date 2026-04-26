@@ -9,7 +9,10 @@ and drops into a prompt. Commands:
     list | ls                     show sniffers + roles + packet counts
     pin    <dongle> <chs>         Pinned(chs)   e.g. 'pin 0 37'  'pin 0 37,38'
     scan   <dongle>               ScanUnmonitored
-    follow <dongle> <addr> [r]    Follow(addr); append 'r' for random addr type
+    follow <dongle> <addr> [r] [--irk <32hex>]
+                                  Follow(addr); 'r' for random addr type;
+                                  --irk pins a 128-bit IRK so the sniffer
+                                  follows across RPA rotations
     idle   <dongle>               Idle
     refresh                       rediscover dongles
     help | ?                      this help
@@ -129,11 +132,27 @@ def _do_command(
             coord.set_role(did, ScanUnmonitored())
         elif cmd == "follow":
             if len(args) < 2:
-                print("usage: follow <dongle> <addr> [random]")
+                print("usage: follow <dongle> <addr> [random] [--irk <32-hex>]")
                 return True
             addr = args[1]
-            is_random = len(args) >= 3 and args[2].lower().startswith("r")
-            coord.set_role(did, Follow(addr, is_random))
+            is_random = False
+            irk_hex: str | None = None
+            i = 2
+            while i < len(args):
+                tok = args[i]
+                if tok.lower().startswith("r"):
+                    is_random = True
+                elif tok == "--irk":
+                    if i + 1 >= len(args):
+                        print("usage: --irk requires a 32-hex-char value")
+                        return True
+                    irk_hex = args[i + 1]
+                    i += 1
+                else:
+                    print(f"unrecognized follow arg: {tok!r}")
+                    return True
+                i += 1
+            coord.set_role(did, Follow(addr, is_random, irk_hex=irk_hex))
         elif cmd == "idle":
             coord.set_role(did, Idle())
         else:

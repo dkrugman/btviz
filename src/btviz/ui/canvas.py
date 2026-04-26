@@ -147,6 +147,15 @@ _DEVICE_CLASS_ICONS: dict[str, str] = {
     "hid_mouse":      "\U0001F5B1",  # 🖱
     "hid_joystick":   "\U0001F579",  # 🕹
     "hid_gamepad":    "\U0001F3AE",  # 🎮
+    # Apple-class refinements emitted by Continuity Nearby action_code
+    # heuristics (see decode/apple_continuity.classify). iPhone and iPad
+    # aren't reliably distinguishable from passive sniffing today, but
+    # the entries are registered so user-set labels and future heuristics
+    # can use them. apple_device.svg covers them as a fallback via the
+    # SVG cascade until we add iphone.svg / ipad.svg / mac.svg.
+    "iphone":         "\U0001F4F1",  # 📱 (same as apple_device for now)
+    "ipad":           "\U0001F4F1",  # 📱 (no distinct tablet emoji that's BLE-specific)
+    "mac":            "\U0001F4BB",  # 💻
 }
 _FALLBACK_ICON = "\U0001F50C"        # 🔌  generic BLE-ish stand-in
 _FALLBACK_SVG_NAME = "fallback_icon" # picked up from data/icons/<name>.svg

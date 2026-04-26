@@ -28,11 +28,43 @@ from ..db.repos import Repos
 from ..db.store import Store
 from ..decode.appearance import appearance_to_class
 from ..decode.apple_continuity import classify as classify_apple, parse_continuity
+from ..decode.auracast import parse_auracast
 from ..vendors import company_vendor, oui_vendor
 from .normalize import normalize
 from .tshark import dissect_file
 
 APPLE_COMPANY_ID = 0x004C
+
+# device_class precedence — used to decide whether an incoming class clue
+# from a single packet should override what we've already learned about a
+# device. Higher = more specific. Without this, a device whose first packet
+# revealed it's a Mac (Nearby action 0x0F) could later be re-labeled as
+# generic "apple_device" by the next Nearby packet that lacked the
+# distinguishing action code, ping-ponging the device_class column.
+_CLASS_PRECEDENCE: dict[str | None, int] = {
+    None: 0,
+    "unknown": 0,
+    "apple_device": 1,
+    "apple_airplay": 2,
+    "homekit": 2,
+    "ibeacon": 2,
+    "phone": 3,
+    "computer": 3,
+    "watch": 3,
+    # Specific identities (Apple Continuity-derived or appearance-confirmed)
+    "airpods": 5,
+    "airtag": 5,
+    "apple_watch": 5,
+    "iphone": 5,
+    "ipad": 5,
+    "mac": 5,
+    "hearing_aid": 5,
+}
+
+
+def _class_precedence(cls: str | None) -> int:
+    """Specificity score for a device_class. Higher = more specific."""
+    return _CLASS_PRECEDENCE.get(cls, 3)
 
 
 @dataclass
@@ -47,6 +79,7 @@ class IngestReport:
     devices_new: int
     devices_touched: int        # distinct devices contributed to this session
     addresses_new: int
+    broadcasts_seen: int        # distinct Auracast broadcasts in this session
     duration_s: float
 
     def format(self) -> str:
@@ -60,6 +93,7 @@ class IngestReport:
             f"  devices:        {self.devices_touched} touched "
             f"({self.devices_new} new)\n"
             f"  addresses new:  {self.addresses_new}\n"
+            f"  broadcasts:     {self.broadcasts_seen} Auracast\n"
             f"  duration:       {self.duration_s:.1f}s"
         )
 
@@ -204,6 +238,7 @@ def ingest_file(
     # State that tracks uniqueness / caches identity across packets.
     seen_device_ids: set[int] = set()
     seen_address_ids: set[int] = set()
+    seen_broadcast_ids: set[int] = set()
     # Cache {device_id -> current identity fields} so we only UPDATE when
     # a new clue actually changes something.
     device_state: dict[int, dict[str, Any]] = {}
@@ -281,6 +316,15 @@ def ingest_file(
                 if cls:
                     clues["device_class"] = cls
 
+            # Precedence guard: don't downgrade a more-specific device_class.
+            # E.g. once a packet reveals "mac" (Nearby action 0x0F), a later
+            # packet from the same device that only carries generic Nearby
+            # Info shouldn't overwrite it back to "apple_device".
+            new_class = clues.get("device_class")
+            if new_class is not None:
+                if _class_precedence(new_class) <= _class_precedence(state.get("device_class")):
+                    clues.pop("device_class", None)
+
             updates: dict[str, Any] = {}
             for k, v in clues.items():
                 if v is not None and v != state.get(k):
@@ -294,6 +338,24 @@ def ingest_file(
             if updates:
                 repos.devices.merge_identity(device.id, **updates)
                 state.update(updates)
+
+            # Auracast: if this packet carries a Broadcast Audio Announcement
+            # (BAA service data), upsert a row in `broadcasts`. Only ADV_EXT_
+            # IND / AUX_ADV_IND packets carry BAA, so cheap reject for the
+            # non-extended-adv hot path.
+            if pkt.pdu_type == "ADV_EXT_IND":
+                ai = parse_auracast(pkt.extras.get("layers", {}))
+                if ai is not None:
+                    repos.broadcasts.upsert(
+                        sess.id, ai.broadcast_id,
+                        broadcaster_device_id=device.id,
+                        broadcast_name=ai.broadcast_name,
+                        bis_count=ai.bis_count,
+                        phy=ai.phy,
+                        encrypted=ai.encrypted,
+                        ts=pkt.ts,
+                    )
+                    seen_broadcast_ids.add(ai.broadcast_id)
 
             # Observation: per (session, device) aggregate.
             is_adv = (pkt.pdu_type in _ADV_PDU_TYPES) if pkt.pdu_type else True
@@ -326,5 +388,6 @@ def ingest_file(
         devices_new=devices_after - devices_new_before,
         devices_touched=len(seen_device_ids),
         addresses_new=addresses_after - addresses_before,
+        broadcasts_seen=len(seen_broadcast_ids),
         duration_s=time.monotonic() - t0,
     )

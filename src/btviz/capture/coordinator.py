@@ -117,6 +117,13 @@ class CaptureCoordinator:
                 sp.follow_address(role.target_addr, role.is_random)
             else:
                 sp.start(follow_address=(role.target_addr, role.is_random))
+            # IRK feed for RPA resolution. Sent AFTER the follow_address
+            # call so the sniffer's key state is already on "Follow LE
+            # address"; add_irk overrides the key-type to IRK and writes
+            # the value. Stripping any 0x prefix to match add_irk's
+            # internal validator (which expects 32 raw hex chars).
+            if role.irk_hex:
+                sp.add_irk(role.irk_hex.lower().removeprefix("0x"))
             return
         # ScanUnmonitored: handled in _recompute_scan_unmonitored()
         return

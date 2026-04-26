@@ -52,12 +52,24 @@ class ScanUnmonitored:
 class Follow:
     target_addr: str                 # e.g. "aa:bb:cc:dd:ee:ff"
     is_random: bool = False
+    # Optional 128-bit Identity Resolving Key — 32 hex chars (16 bytes), no
+    # ``0x`` prefix. When set, the sniffer can resolve the device's RPA
+    # rotation and keep following across address changes. Wire-up to the
+    # extcap is done via Wireshark's control-pipe protocol (Key selector =
+    # IRK, Value = 0x<hex>) — see TODO in src/btviz/extcap/sniffer.py.
+    irk_hex: str | None = None
 
     def __post_init__(self) -> None:
         # Light validation; real formatting happens in sniffer.py _format_addr.
         parts = self.target_addr.split(":")
         if len(parts) != 6 or any(len(p) != 2 for p in parts):
             raise ValueError(f"expected aa:bb:cc:dd:ee:ff, got {self.target_addr!r}")
+        if self.irk_hex is not None:
+            stripped = self.irk_hex.lower().removeprefix("0x")
+            if len(stripped) != 32 or not all(c in "0123456789abcdef" for c in stripped):
+                raise ValueError(
+                    f"IRK must be 32 hex chars (128 bits), got {self.irk_hex!r}"
+                )
 
 
 SnifferRole = Idle | Pinned | ScanUnmonitored | Follow
@@ -73,7 +85,14 @@ def short_name(role: SnifferRole) -> str:
     if isinstance(role, ScanUnmonitored):
         return "scan-unmonitored"
     if isinstance(role, Follow):
-        return f"follow({role.target_addr}{' random' if role.is_random else ''})"
+        suffix = ""
+        if role.is_random:
+            suffix += " random"
+        if role.irk_hex:
+            # Show only first/last 4 chars so the key isn't echoed in full.
+            irk = role.irk_hex.lower().removeprefix("0x")
+            suffix += f" irk={irk[:4]}…{irk[-4:]}"
+        return f"follow({role.target_addr}{suffix})"
     return str(role)  # unreachable with correct types
 
 

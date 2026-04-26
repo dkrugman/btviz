@@ -2,7 +2,12 @@
 name = "btviz"
 version = "0.0.1"
 description = "Bluetooth traffic visualizer and troubleshooting tool"
-requires-python = ">=3.11"
+# Upper bound is defensive: PySide6 6.11 (and earlier) crashes on Python 3.14
+# during Qt metaobject construction (segfault in PyUnicode_InternFromString
+# called from PySide::SignalManager::retrieveMetaObject — repro: any
+# QMessageBox / QDialog / canvas window). Lift the cap once a PySide6
+# release with confirmed 3.14 compatibility ships (likely 6.12+).
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "PySide6>=6.7",
 ]

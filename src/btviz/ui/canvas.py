@@ -36,7 +36,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
-    QMessageBox,
     QPushButton,
     QToolBar,
     QVBoxLayout,
@@ -764,6 +763,14 @@ class ProjectPicker(QDialog):
         new_btn.clicked.connect(self._new_project)
         layout.addWidget(new_btn)
 
+        # Inline status label for transient messages (e.g. "name already
+        # exists"). Used instead of QMessageBox.warning, which crashes on
+        # macOS Tahoe + PySide6 6.11 in the Qt metaobject builder. Empty
+        # by default; rendered in red when populated.
+        self._status_label = QLabel("")
+        self._status_label.setStyleSheet("color: #b00; font-size: 11px;")
+        layout.addWidget(self._status_label)
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -794,12 +801,21 @@ class ProjectPicker(QDialog):
                     pass
 
     def _new_project(self) -> None:
+        # Clear any prior inline error before this attempt.
+        self._status_label.setText("")
         name, ok = QInputDialog.getText(self, "New project", "Name:")
         if not ok or not name.strip():
             return
         name = name.strip()
         if self.repos.projects.get_by_name(name):
-            QMessageBox.warning(self, "btviz", f"Project {name!r} already exists.")
+            # Inline message instead of QMessageBox.warning (see __init__
+            # for why). Selecting the existing entry in the combo is the
+            # natural follow-through.
+            self._status_label.setText(
+                f"Project {name!r} already exists — selected."
+            )
+            existing = self.repos.projects.get_by_name(name)
+            self._reload(select_id=existing.id if existing else None)
             return
         proj = self.repos.projects.create(name)
         self._reload(select_id=proj.id)
@@ -959,9 +975,18 @@ def run_canvas(db_path: Path | None = None, project_name: str | None = None) -> 
     if project_name:
         proj = repos.projects.get_by_name(project_name)
         if proj is None:
-            QMessageBox.critical(None, "btviz",
-                                 f"Project {project_name!r} not found. Ingest "
-                                 f"something first or create it from the picker.")
+            # NOTE: previously this used QMessageBox.critical(None, ...) but
+            # it segfaults on macOS Tahoe + PySide6 6.11 in the Qt
+            # metaobject builder (PyUnicode_InternFromString → bad ptr deref).
+            # Bug isn't ours; until Qt/PySide ship a fix, surface the error
+            # via stderr — it's better CLI UX anyway.
+            import sys
+            print(
+                f"error: project {project_name!r} not found. "
+                f"Ingest something first, or omit --project to use the "
+                f"picker dialog.",
+                file=sys.stderr,
+            )
             return 2
         project_id = proj.id
     else:

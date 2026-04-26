@@ -35,6 +35,37 @@ from .tshark import dissect_file
 
 APPLE_COMPANY_ID = 0x004C
 
+# device_class precedence — used to decide whether an incoming class clue
+# from a single packet should override what we've already learned about a
+# device. Higher = more specific. Without this, a device whose first packet
+# revealed it's a Mac (Nearby action 0x0F) could later be re-labeled as
+# generic "apple_device" by the next Nearby packet that lacked the
+# distinguishing action code, ping-ponging the device_class column.
+_CLASS_PRECEDENCE: dict[str | None, int] = {
+    None: 0,
+    "unknown": 0,
+    "apple_device": 1,
+    "apple_airplay": 2,
+    "homekit": 2,
+    "ibeacon": 2,
+    "phone": 3,
+    "computer": 3,
+    "watch": 3,
+    # Specific identities (Apple Continuity-derived or appearance-confirmed)
+    "airpods": 5,
+    "airtag": 5,
+    "apple_watch": 5,
+    "iphone": 5,
+    "ipad": 5,
+    "mac": 5,
+    "hearing_aid": 5,
+}
+
+
+def _class_precedence(cls: str | None) -> int:
+    """Specificity score for a device_class. Higher = more specific."""
+    return _CLASS_PRECEDENCE.get(cls, 3)
+
 
 @dataclass
 class IngestReport:
@@ -284,6 +315,15 @@ def ingest_file(
                 cls = appearance_to_class(clues["appearance"])
                 if cls:
                     clues["device_class"] = cls
+
+            # Precedence guard: don't downgrade a more-specific device_class.
+            # E.g. once a packet reveals "mac" (Nearby action 0x0F), a later
+            # packet from the same device that only carries generic Nearby
+            # Info shouldn't overwrite it back to "apple_device".
+            new_class = clues.get("device_class")
+            if new_class is not None:
+                if _class_precedence(new_class) <= _class_precedence(state.get("device_class")):
+                    clues.pop("device_class", None)
 
             updates: dict[str, Any] = {}
             for k, v in clues.items():

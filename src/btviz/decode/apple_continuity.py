@@ -178,8 +178,25 @@ def classify(entries: list[ContinuityEntry]) -> tuple[str | None, str | None]:
     """Pick a (device_class, model) from a set of seen Continuity entries.
 
     Priority: AirPods (most specific, includes a model code) > AirTag >
-    Apple Watch > Find My > Nearby Info (generic Apple device) > AirPlay >
-    HomeKit > everything else. Returns (None, None) if nothing classifies.
+    Apple Watch > Mac > Find My > Nearby Info (generic Apple device) >
+    AirPlay > HomeKit > everything else. Returns (None, None) if nothing
+    classifies.
+
+    The Nearby Info (sub-type 0x10) action_code is heuristic — Apple uses
+    different action ranges across iPhone / iPad / Mac / Watch but the
+    mapping isn't a clean spec, it's reverse-engineered. We only commit
+    to a refinement when the signal is strong enough to be confident:
+
+      * action 0x0D (watch_lock_screen) -> Watch-only
+      * action 0x0F (wake)              -> Mac-only
+
+    Everything else stays "apple_device" — iPhone vs iPad in particular
+    isn't reliably distinguishable from passive sniffing (both broadcast
+    similar Nearby action ranges; the strongest discriminators require
+    cellular-related sub-types we don't try to interpret).
+
+    Heuristic source: furiousMAC/continuity reverse-engineering writeups.
+    https://github.com/furiousMAC/continuity
     """
     by_type = {e.type_byte: e for e in entries}
 
@@ -192,18 +209,33 @@ def classify(entries: list[ContinuityEntry]) -> tuple[str | None, str | None]:
         return ("airtag", "AirTag")
 
     if 0x11 in by_type:
+        # Legacy Apple Watch sub-type. Modern watches use 0x10 but this
+        # still appears on older firmware.
         return ("apple_watch", "Apple Watch")
+
+    # Nearby Info action-code refinement: surface Watch / Mac when the
+    # action is class-specific. Otherwise drop to generic apple_device.
+    nearby = by_type.get(0x10)
+    if nearby and nearby.parsed:
+        action = nearby.parsed.get("action_code")
+        if action == 0x0D:
+            return ("apple_watch", "Apple Watch")
+        if action == 0x0F:
+            return ("mac", None)
 
     if 0x12 in by_type:
         # Find My beacon from a non-AirTag iOS device. Class is generic.
         return ("apple_device", None)
 
     if 0x10 in by_type:
-        # Nearby Info from a primary iOS / macOS device.
+        # Nearby Info from a primary iOS / macOS device, no class-specific
+        # action code seen. Generic Apple — could be iPhone, iPad, Mac.
         return ("apple_device", None)
 
     if 0x09 in by_type or 0x0A in by_type:
-        # AirPlay endpoint — Apple TV / HomePod / Mac.
+        # AirPlay endpoint — Apple TV / HomePod / Mac. 0x0A (Source) leans
+        # Mac, 0x09 (Target) leans HomePod/TV, but both cross paths so we
+        # leave it generic.
         return ("apple_airplay", None)
 
     if 0x06 in by_type:

@@ -11,7 +11,11 @@ broadcasts (Auracast) — across multiple captures over time.
 ## System requirements
 
 - macOS or Linux (Windows later)
-- **Python 3.11+**
+- **Python 3.11–3.13.** PySide6 6.11 segfaults on Python 3.14 during Qt
+  metaobject construction (any `QMessageBox` / `QDialog` triggers it).
+  3.13 is the safe ceiling until a PySide6 release with confirmed 3.14
+  support ships. On macOS: `brew install python@3.13`, then use that
+  interpreter to create the venv (`python3.13 -m venv .venv`).
 - **Wireshark with `tshark`** on the system path (or in the standard macOS
   install location). btviz invokes `tshark` as a subprocess for packet
   dissection — it is *not* a Python dependency. Verify with `tshark -v`.

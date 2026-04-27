@@ -100,12 +100,36 @@ def decode_nbe_packet(buf: bytes) -> DecodedAdv | None:
     return _decode_ll(buf[_NBE_HDR_LEN:], channel=rf_channel, rssi=rssi_dbm)
 
 
+# Extended-header field bit masks (Core Spec Vol 6 Part B §2.3.4.1).
+# Order matters — fields appear in this order whenever their bit is set.
+_EXT_HDR_FLAG_ADVA      = 0x01   # 6 bytes
+_EXT_HDR_FLAG_TARGETA   = 0x02   # 6 bytes
+_EXT_HDR_FLAG_CTE_INFO  = 0x04   # 1 byte
+_EXT_HDR_FLAG_ADI       = 0x08   # 2 bytes (AdvDataInfo: DID + SID)
+_EXT_HDR_FLAG_AUX_PTR   = 0x10   # 3 bytes
+_EXT_HDR_FLAG_SYNC_INFO = 0x20   # 18 bytes
+_EXT_HDR_FLAG_TX_POWER  = 0x40   # 1 byte
+# bit 7 is reserved.
+
+PDU_TYPE_ADV_EXT_IND = 0x7
+
+
 def _decode_ll(ll: bytes, *, channel: int, rssi: int) -> DecodedAdv | None:
     """Parse the BLE LL frame portion (after any pcap pseudo-header).
 
     Shared by both DLT 256 (10-byte PHDR) and DLT 272 (17-byte NBE header)
     decoders — once the per-DLT header is stripped, the LL layout is
     identical. Returns None for data-channel / non-adv / truncated input.
+
+    Two payload shapes depending on PDU type:
+
+      * Legacy adv (0x0..0x6): ``[AdvA(6)][AdvData(N)][CRC(3)]`` — AD
+        structures start immediately after AdvA.
+      * Extended adv (0x7 = ADV_EXT_IND / AUX_ADV_IND / etc.):
+        ``[ExtHdrLen+AdvMode(1)][HdrFlags(1)][optional fields…][ACAD]
+        [AdvData(N)][CRC(3)]``. AdvA is *optional* in the extended
+        header (continuation AUX packets often omit it; the AdvA was
+        in the primary on 37/38/39).
     """
     if len(ll) < 4 + 2 + 6 + 3:
         return None
@@ -118,11 +142,17 @@ def _decode_ll(ll: bytes, *, channel: int, rssi: int) -> DecodedAdv | None:
     rx_add = bool((hdr >> 7) & 0x1)
     length = (hdr >> 8) & 0xFF
     payload = ll[6:6 + length]
-    if len(payload) < 6:
-        return None
-    addr_le = payload[:6]
-    adv_addr = ":".join(f"{b:02x}" for b in reversed(addr_le))
-    adv_data = payload[6:]
+
+    if pdu_type == PDU_TYPE_ADV_EXT_IND:
+        adv_addr, adv_data = _split_extended_adv_payload(payload)
+    else:
+        # Legacy advertising layout.
+        if len(payload) < 6:
+            return None
+        addr_le = payload[:6]
+        adv_addr = ":".join(f"{b:02x}" for b in reversed(addr_le))
+        adv_data = bytes(payload[6:])
+
     return DecodedAdv(
         channel=channel,
         rssi=rssi,
@@ -130,9 +160,63 @@ def _decode_ll(ll: bytes, *, channel: int, rssi: int) -> DecodedAdv | None:
         tx_add_random=tx_add,
         rx_add_random=rx_add,
         adv_addr=adv_addr,
-        adv_data=bytes(adv_data),
+        adv_data=adv_data,
         raw_pdu_header=hdr,
     )
+
+
+def _split_extended_adv_payload(payload: bytes) -> tuple[str | None, bytes]:
+    """Walk the BLE 5.0 extended-adv payload to find AdvA (if present)
+    and the start of the AD-structure stream.
+
+    Returns ``(adv_addr, adv_data)``. ``adv_addr`` is None when the
+    extended header didn't include an AdvA — common for AUX_ADV_IND
+    continuation packets that pair with a primary ADV_EXT_IND on
+    37/38/39 by AdvDataInfo (DID). The caller will see no adv_addr but
+    can still parse adv_data for service data (e.g. BAA for Auracast).
+
+    Defensive — returns ``(None, b"")`` on any layout violation rather
+    than raising, so a malformed packet just produces an unattributed
+    empty ``DecodedAdv`` instead of crashing the reader thread.
+    """
+    if len(payload) < 1:
+        return None, b""
+    ext_hdr_len = payload[0] & 0x3F        # bits 0-5; bits 6-7 are AdvMode
+    # Extended header is [HdrFlags(1)] + optional fields, total ext_hdr_len bytes.
+    if ext_hdr_len == 0:
+        # No extended header — AdvData immediately follows the length byte.
+        return None, bytes(payload[1:])
+    if 1 + ext_hdr_len > len(payload):
+        return None, b""               # truncated header; bail
+    flags = payload[1]
+    cursor = 2                         # next byte after HdrFlags
+    end_of_ext_hdr = 1 + ext_hdr_len   # AdvData starts here
+
+    adv_addr: str | None = None
+    if flags & _EXT_HDR_FLAG_ADVA:
+        if cursor + 6 > end_of_ext_hdr:
+            return None, b""
+        addr_le = payload[cursor:cursor + 6]
+        adv_addr = ":".join(f"{b:02x}" for b in reversed(addr_le))
+        cursor += 6
+    if flags & _EXT_HDR_FLAG_TARGETA:
+        cursor += 6
+    if flags & _EXT_HDR_FLAG_CTE_INFO:
+        cursor += 1
+    if flags & _EXT_HDR_FLAG_ADI:
+        cursor += 2
+    if flags & _EXT_HDR_FLAG_AUX_PTR:
+        cursor += 3
+    if flags & _EXT_HDR_FLAG_SYNC_INFO:
+        cursor += 18
+    if flags & _EXT_HDR_FLAG_TX_POWER:
+        cursor += 1
+    # Bytes between cursor and end_of_ext_hdr are ACAD — skip them
+    # (BIGInfo and similar live there; we don't dissect them yet).
+    if cursor > end_of_ext_hdr:
+        return None, b""               # walked past header; malformed
+    adv_data = bytes(payload[end_of_ext_hdr:])
+    return adv_addr, adv_data
 
 
 def classify_address(addr_hex: str, random: bool) -> str:

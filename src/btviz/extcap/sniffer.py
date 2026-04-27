@@ -355,6 +355,7 @@ class SnifferProcess:
                         ts=ts_sec + ts_usec / 1_000_000.0,
                         data=payload,
                         source=self._dongle.short_id,
+                        meta={"dlt": dlt},
                     )
                     self._on_packet(self._dongle, pkt)
             except Exception as e:  # noqa: BLE001

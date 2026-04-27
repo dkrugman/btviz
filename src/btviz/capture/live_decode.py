@@ -47,10 +47,18 @@ from ..decode.adv import (
     AD_SERVICE_DATA_16,
     AD_SHORTENED_LOCAL_NAME,
     classify_address,
+    decode_nbe_packet,
     decode_phdr_packet,
     parse_ad_structures,
 )
 from .packet import Packet
+
+# Pcap link-types we know how to dispatch on. Anything else falls back
+# to the legacy LE_LL_WITH_PHDR layout — which historically produced
+# usable output for files we've ingested, so it's the safer default
+# than failing closed.
+_DLT_BLUETOOTH_LE_LL_WITH_PHDR = 256
+_DLT_NORDIC_BLE = 272
 
 # AD types we map into the synthesized tshark layers dict.
 _AD_APPEARANCE = 0x19
@@ -64,14 +72,30 @@ _DEFAULT_LIVE_PHY = "1M"
 
 
 def decode_live_packet(
-    raw_bytes: bytes, *, source: str, ts: float
+    raw_bytes: bytes, *, source: str, ts: float, dlt: int | None = None,
 ) -> Packet | None:
-    """Decode a Nordic-pseudo-header pcap record into a ``Packet``.
+    """Decode a Nordic pcap record into a ``Packet``.
+
+    ``dlt`` is the pcap link-type from the file's global header. Two
+    formats are in active use today:
+
+      * 256 = ``BLUETOOTH_LE_LL_WITH_PHDR`` — the classic 10-byte Nordic
+        header (older firmware, also what tshark dissects against).
+      * 272 = ``NORDIC_BLE`` — current Nordic Sniffer firmware, with a
+        17-byte v2 header (board id, packet/event counters, timestamp
+        delta) preceding the BLE LL frame. Channel and RSSI live at
+        offsets 9 and 10 instead of 0 and 1.
+
+    Falls back to the DLT-256 decoder when ``dlt`` is None (callers that
+    don't know — historically the only path).
 
     Returns None if the bytes aren't a recognizable BLE advertising
     packet (data-channel / non-adv / malformed). Caller can drop those.
     """
-    decoded = decode_phdr_packet(raw_bytes)
+    if dlt == _DLT_NORDIC_BLE:
+        decoded = decode_nbe_packet(raw_bytes)
+    else:
+        decoded = decode_phdr_packet(raw_bytes)
     if decoded is None:
         return None
 

@@ -142,7 +142,13 @@ class LiveIngest:
     def _on_packet(self, pkt: Packet) -> None:
         """Bus subscriber — runs on a reader thread. NO DB access."""
         self.stats.packets_received += 1
-        decoded = decode_live_packet(pkt.raw, source=pkt.source, ts=pkt.ts)
+        # The coordinator stamps pkt.extras["dlt"] from the pcap global
+        # header so the decoder can pick the right PHDR layout
+        # (256 = LE_LL_WITH_PHDR, 272 = NORDIC_BLE).
+        dlt = (pkt.extras or {}).get("dlt")
+        decoded = decode_live_packet(
+            pkt.raw, source=pkt.source, ts=pkt.ts, dlt=dlt,
+        )
         if decoded is None:
             # One-shot per-source hexdump so we can see what the decoder
             # rejected — distinguishes a DLT / PHDR mismatch (bytes don't

@@ -18,6 +18,7 @@ from typing import Any
 
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import (
+    QAction,
     QBrush,
     QColor,
     QFont,
@@ -42,7 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..bus import EventBus
-from ..capture.coordinator import CaptureCoordinator
+from ..capture.coordinator import CaptureCoordinator, FollowRequest
 from ..capture.live_ingest import LiveIngest
 from ..db.models import DeviceLayout
 from ..db.repos import Repos
@@ -465,10 +466,15 @@ class DeviceItem(QGraphicsItem):
     persists position (and collapsed state) via the owning scene's callback.
     """
 
-    def __init__(self, device: CanvasDevice, persist_cb) -> None:
+    def __init__(self, device: CanvasDevice, persist_cb,
+                 context_cb=None) -> None:
         super().__init__()
         self.device = device
         self._persist = persist_cb
+        # Optional callback the scene installs to populate the
+        # right-click menu. Signature: (device) -> list[QAction]. When
+        # None, no context menu is shown.
+        self._context_cb = context_cb
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
@@ -695,6 +701,20 @@ class DeviceItem(QGraphicsItem):
         self.setZValue(self._state_z())
         self._persist_moved_selection()
 
+    def contextMenuEvent(self, event) -> None:
+        """Right-click → menu of device actions, populated by the scene."""
+        if self._context_cb is None:
+            return
+        actions = self._context_cb(self.device)
+        if not actions:
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu()
+        for a in actions:
+            menu.addAction(a)
+        menu.exec(event.screenPos())
+        event.accept()
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Canvas view with directional rubber-band selection
@@ -904,7 +924,8 @@ class CanvasWindow(QMainWindow):
         for d in devs:
             if d.hidden:
                 continue
-            item = DeviceItem(d, self._persist_device)
+            item = DeviceItem(d, self._persist_device,
+                              context_cb=self._device_context_actions)
             self.scene.addItem(item)
         total_pkts = sum(d.packet_count for d in devs)
         self.status.setText(
@@ -1074,6 +1095,62 @@ class CanvasWindow(QMainWindow):
         if serial is None:
             return
         self.sniffer_panel.notify_packet(serial)
+
+    # --- device context menu / follow --------------------------------
+
+    def _device_context_actions(self, device: CanvasDevice) -> list[QAction]:
+        """Build the right-click menu actions for one DeviceItem.
+
+        ``Follow this device`` is the only entry today. It re-tasks one
+        sniffer to track the device's most-recent address — useful for
+        capturing post-CONNECT_IND data-channel traffic and (with an IRK
+        loaded) resolving its rotating RPAs back to a stable identity.
+
+        Disabled with a tooltip when prerequisites aren't met (live
+        capture not running, or the device has no recorded addresses).
+        """
+        action = QAction("Follow this device", self)
+        if self._coord is None or self._live is None or not self._live.running:
+            action.setEnabled(False)
+            action.setToolTip(
+                "Start live capture first (toolbar → Start live)."
+            )
+        elif not device.addresses:
+            action.setEnabled(False)
+            action.setToolTip("This device has no recorded addresses to follow.")
+        else:
+            addr, addr_type = device.addresses[0]
+            is_random = addr_type != "public"
+            action.setToolTip(
+                f"Re-task one sniffer to follow {addr} "
+                f"({addr_type or 'unknown'})."
+            )
+            action.triggered.connect(
+                lambda checked=False, a=addr, r=is_random:
+                    self._follow_device(a, r)
+            )
+        return [action]
+
+    def _follow_device(self, address: str, is_random: bool) -> None:
+        """Ask the coordinator to dedicate a sniffer to this address.
+
+        Called from the device context-menu handler. The coordinator
+        prefers an idle sniffer, falls back to a scan-unmonitored one,
+        and re-tasks any other dongle if neither is available.
+        """
+        if self._coord is None:
+            return
+        chosen = self._coord.follow(
+            FollowRequest(target_addr=address, is_random=is_random)
+        )
+        if chosen is None:
+            self.status.setText(
+                f"  follow: no sniffer available to retask for {address}"
+            )
+        else:
+            self.status.setText(
+                f"  follow: sniffer {chosen} now tracking {address}"
+            )
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         # Make sure live capture / subprocesses are torn down so we don't

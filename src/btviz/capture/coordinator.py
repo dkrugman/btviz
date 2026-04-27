@@ -176,7 +176,14 @@ class CaptureCoordinator:
     # --- internal callbacks ---------------------------------------------
 
     def _handle_raw(self, dongle: Dongle, raw: RawPacket) -> None:
-        pkt = Packet(ts=raw.ts, source=raw.source, raw=raw.data)
+        # Propagate the pcap link-type so live decode can pick the right
+        # PHDR layout (DLT 256 = BLUETOOTH_LE_LL_WITH_PHDR vs 272 =
+        # NORDIC_BLE — different header sizes).
+        extras: dict = {}
+        dlt = raw.meta.get("dlt") if raw.meta else None
+        if dlt is not None:
+            extras["dlt"] = dlt
+        pkt = Packet(ts=raw.ts, source=raw.source, raw=raw.data, extras=extras)
         self.bus.publish(TOPIC_PACKET, pkt)
 
     def _handle_state(self, state: SnifferState) -> None:

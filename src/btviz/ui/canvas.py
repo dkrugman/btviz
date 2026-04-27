@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -41,6 +41,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from ..bus import EventBus
+from ..capture.coordinator import CaptureCoordinator
+from ..capture.live_ingest import LiveIngest
 from ..db.models import DeviceLayout
 from ..db.repos import Repos
 from ..db.store import Store, open_store
@@ -858,11 +861,25 @@ class CanvasWindow(QMainWindow):
         self._install_panel_reposition_filter()
         self._reposition_panel()
 
+        # Live-capture state. Created on first Start; recycled across
+        # Start/Stop toggles within the same CanvasWindow instance.
+        self._bus: EventBus | None = None
+        self._coord: CaptureCoordinator | None = None
+        self._live: LiveIngest | None = None
+        self._live_timer: QTimer | None = None
+        self._reload_tick = 0       # increments per timer fire; reload() runs every Nth
+        # short_id (pkt.source) → serial_number, so the bus subscriber's
+        # per-source notifications can drive the panel's serial-keyed
+        # activity dot.
+        self._source_to_serial: dict[str, str] = {}
+
         tb = QToolBar("main")
         self.addToolBar(tb)
         tb.addAction("Reload", self.reload)
         tb.addAction("Reset layout", self.reset_layout)
         tb.addAction("Refresh sniffers", self._refresh_sniffers)
+        tb.addSeparator()
+        self._live_action = tb.addAction("Start live", self._toggle_live)
         tb.addSeparator()
         self.status = QLabel("")
         tb.addWidget(self.status)
@@ -944,6 +961,126 @@ class CanvasWindow(QMainWindow):
         rect = self.view.viewport().rect()
         self.sniffer_panel.reposition(QRectF(rect))
         self.sniffer_panel.raise_()  # stay above scene content
+
+    # --- live capture -------------------------------------------------
+
+    def _toggle_live(self) -> None:
+        """Toolbar action handler: start live capture if stopped, stop if running."""
+        if self._live is not None and self._live.running:
+            self._stop_live()
+        else:
+            self._start_live()
+
+    def _start_live(self) -> None:
+        """Begin a live capture session for this project.
+
+        Wires up: EventBus → CaptureCoordinator (which spawns SnifferProcess
+        per dongle) → bus.publish(TOPIC_PACKET) → LiveIngest (decodes and
+        queues) → QTimer flush + periodic reload.
+        """
+        if self._live is not None and self._live.running:
+            return
+        self._bus = EventBus()
+        self._coord = CaptureCoordinator(self._bus)
+
+        # Discovery: list_dongles() runs the slow extcap probe — acceptable
+        # at capture-start (the user pressed Start; they expect to wait).
+        try:
+            self._coord.refresh_dongles()
+        except Exception as e:  # noqa: BLE001
+            self.status.setText(f"  live: discovery failed: {e}")
+            self._bus = None
+            self._coord = None
+            return
+        if not self._coord.dongles:
+            self.status.setText("  live: no dongles discovered")
+            self._bus = None
+            self._coord = None
+            return
+
+        # Build short_id → serial_number map so the per-source notifier
+        # can drive the panel's serial-keyed activity dot.
+        self._source_to_serial = {
+            d.short_id: (d.serial_number or d.short_id)
+            for d in self._coord.dongles
+        }
+
+        self._live = LiveIngest(
+            self._bus, self.repos, self.project_id,
+            session_name=f"live-{int(time.time())}",
+        )
+        self._live.set_packet_callback(self._on_live_packet)
+        self._live.start()
+
+        # Spawn sniffers and apply default roles. Subprocess startup can
+        # take a beat — the action becomes "Stop" so a second click stops.
+        self._coord.start_discover()
+
+        self._live_timer = QTimer(self)
+        self._live_timer.timeout.connect(self._live_tick)
+        # 250ms flush cadence: low enough latency that the activity dot
+        # feels responsive, high enough that DB writes batch usefully
+        # under heavy adv traffic.
+        self._live_timer.start(250)
+
+        self._live_action.setText("Stop live")
+        self.status.setText(
+            f"  live: capturing on {len(self._coord.dongles)} devices…"
+        )
+
+    def _stop_live(self) -> None:
+        if self._live_timer is not None:
+            self._live_timer.stop()
+            self._live_timer = None
+        if self._coord is not None:
+            try:
+                self._coord.stop_all()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._live is not None:
+            self._live.stop()
+        self._live_action.setText("Start live")
+        self._live = None
+        self._coord = None
+        self._bus = None
+        self._source_to_serial = {}
+        # One last reload so the user sees the final state of the session.
+        self.reload()
+
+    def _live_tick(self) -> None:
+        """QTimer callback (main thread). Drains the queue; reloads every Nth."""
+        if self._live is None:
+            return
+        self._live.flush()
+        self._reload_tick += 1
+        # Reload the scene every ~2s (8 ticks * 250ms). Full rebuild is
+        # heavy (re-runs the project-aggregate query and rebuilds every
+        # DeviceItem) — incremental updates can replace this later.
+        if self._reload_tick % 8 == 0:
+            self.reload()
+            stats = self._live.stats
+            self.status.setText(
+                f"  live: rx={stats.packets_received:,} "
+                f"dec={stats.packets_decoded:,} "
+                f"rec={stats.packets_recorded:,} "
+                f"drop={stats.packets_dropped} "
+                f"dev={stats.devices_touched} "
+                f"bcast={stats.broadcasts_seen}"
+            )
+
+    def _on_live_packet(self, source: str) -> None:
+        """LiveIngest per-source notifier. Drives the panel's activity dot."""
+        serial = self._source_to_serial.get(source)
+        if serial is None:
+            return
+        self.sniffer_panel.notify_packet(serial)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        # Make sure live capture / subprocesses are torn down so we don't
+        # leak FIFOs or extcap processes when the window closes.
+        if self._live is not None and self._live.running:
+            self._stop_live()
+        super().closeEvent(event)
 
     def _refresh_sniffers(self) -> None:
         """Re-run discovery, persist into the sniffers table, refresh panel.

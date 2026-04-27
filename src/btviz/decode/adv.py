@@ -56,13 +56,57 @@ class DecodedAdv:
 
 
 def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
-    """Decode a Nordic BLE LL+PHDR pcap payload. Returns None if not adv."""
+    """Decode a Nordic BLE LL+PHDR pcap payload (DLT 256). None if not adv."""
     if len(buf) < 10 + 4 + 2 + 6 + 3:
         return None
     rf_channel = buf[0]
     rssi_dbm = struct.unpack("b", buf[1:2])[0]
     # buf[2] noise, buf[3] aa offenses, buf[4:8] ref AA, buf[8:10] flags
-    ll = buf[10:]
+    return _decode_ll(buf[10:], channel=rf_channel, rssi=rssi_dbm)
+
+
+# Nordic BLE (DLT 272) header layout, version 2 — what current Nordic
+# Sniffer firmware emits. Total header is 17 bytes; fields we need are
+# channel and RSSI, the rest (board id, packet/event counters, timestamp
+# delta) are diagnostics we don't surface yet.
+#
+#   [0]      board id
+#   [1-2]    header length (u16 LE)
+#   [3]      header version (= 0x02)
+#   [4-5]    packet counter (u16 LE)
+#   [6]      protover marker (typically 0x06)
+#   [7]      flags
+#   [8]      <flag/reserved>
+#   [9]      RF channel
+#   [10]     RSSI magnitude (positive byte; actual value is negative)
+#   [11-12]  event counter (u16 LE)
+#   [13-16]  timestamp delta (u32 LE)
+#   [17..]   BLE LL frame (AA + PDU header + payload + CRC)
+_NBE_HDR_LEN = 17
+
+
+def decode_nbe_packet(buf: bytes) -> DecodedAdv | None:
+    """Decode a Nordic-BLE (DLT 272) pcap payload. None if not adv.
+
+    Same return shape as ``decode_phdr_packet`` so callers can swap
+    based on the pcap link-type. Channel comes from offset 9, RSSI from
+    offset 10 (stored as a positive magnitude — we negate). The BLE LL
+    frame begins at offset 17 and is identical in layout to DLT 256.
+    """
+    if len(buf) < _NBE_HDR_LEN + 4 + 2 + 6 + 3:
+        return None
+    rf_channel = buf[9]
+    rssi_dbm = -buf[10]
+    return _decode_ll(buf[_NBE_HDR_LEN:], channel=rf_channel, rssi=rssi_dbm)
+
+
+def _decode_ll(ll: bytes, *, channel: int, rssi: int) -> DecodedAdv | None:
+    """Parse the BLE LL frame portion (after any pcap pseudo-header).
+
+    Shared by both DLT 256 (10-byte PHDR) and DLT 272 (17-byte NBE header)
+    decoders — once the per-DLT header is stripped, the LL layout is
+    identical. Returns None for data-channel / non-adv / truncated input.
+    """
     if len(ll) < 4 + 2 + 6 + 3:
         return None
     aa = struct.unpack("<I", ll[:4])[0]
@@ -80,8 +124,8 @@ def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
     adv_addr = ":".join(f"{b:02x}" for b in reversed(addr_le))
     adv_data = payload[6:]
     return DecodedAdv(
-        channel=rf_channel,
-        rssi=rssi_dbm,
+        channel=channel,
+        rssi=rssi,
         pdu_type=PDU_TYPE_NAMES.get(pdu_type, f"0x{pdu_type:X}"),
         tx_add_random=tx_add,
         rx_add_random=rx_add,

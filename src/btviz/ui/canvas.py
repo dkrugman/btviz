@@ -1021,7 +1021,14 @@ class CanvasWindow(QMainWindow):
         self.status = QLabel("")
         tb.addWidget(self.status)
 
-        self.reload()
+        # Defer the initial reload until after the window is shown. At
+        # this point in __init__ the QGraphicsView's viewport hasn't
+        # been laid out yet — viewport().width() returns Qt's default
+        # (~300 px) which gives us a 2-column grid regardless of the
+        # actual window size. QTimer.singleShot(0) posts the reload to
+        # the event loop; by the time it fires, the show event has
+        # finished and the viewport has its final width.
+        QTimer.singleShot(0, self.reload)
         # The sniffer panel reads from the DB at startup so the window
         # appears immediately. Discovery happens on demand via the
         # "Refresh sniffers" toolbar action — calling the Nordic extcap
@@ -1049,15 +1056,22 @@ class CanvasWindow(QMainWindow):
             item = DeviceItem(d, self._persist_device,
                               context_cb=self._device_context_actions)
             self.scene.addItem(item)
-        total_pkts = sum(d.packet_count for d in devs)
+        # Status reflects what's actually on the canvas — `len(devs)` would
+        # include hidden devices (rows with hidden=1 in device_layouts) that
+        # we skipped above, leaving an off-by-one between the count and the
+        # visible grid (one column ends a row earlier than the other).
+        visible_devs = [d for d in devs if not d.hidden]
+        hidden_count = len(devs) - len(visible_devs)
+        total_pkts = sum(d.packet_count for d in visible_devs)
+        hidden_note = f" ({hidden_count} hidden)" if hidden_count else ""
         self.status.setText(
-            f"  {len(devs)} devices · {total_pkts:,} pkts · "
-            f"project id {self.project_id}"
+            f"  {len(visible_devs)} devices{hidden_note} · "
+            f"{total_pkts:,} pkts · project id {self.project_id}"
         )
         # Size the scene to contain all items with margin.
-        if devs:
-            max_x = max(d.pos_x for d in devs) + _BOX_W + 40
-            max_y = max(d.pos_y for d in devs) + _BOX_H_EXPANDED + 40
+        if visible_devs:
+            max_x = max(d.pos_x for d in visible_devs) + _BOX_W + 40
+            max_y = max(d.pos_y for d in visible_devs) + _BOX_H_EXPANDED + 40
             self.scene.setSceneRect(0, 0, max_x, max_y)
 
     def reset_layout(self) -> None:

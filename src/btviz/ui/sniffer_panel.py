@@ -515,14 +515,21 @@ class SnifferPanel(QWidget):
     def _row_at(self, pos) -> Sniffer | None:
         """Map a mouse position to a Sniffer row, or None if not on a row.
 
-        Hit-testing is by vertical band — same range any row's content
-        occupies (dot, silhouette, text). Allows tooltips to update as
-        the cursor moves between rows.
+        Each row occupies the y band ``[_TOP_PAD + idx*_ROW_H,
+        _TOP_PAD + (idx+1)*_ROW_H)`` — the same range its dot, silhouette,
+        and text are painted in (see ``_dot_center_y``). A simple
+        floor-divide gives the row index for any y in that band.
+
+        Why: a previous version added ``_ROW_H // 2`` to the dividend,
+        which shifted boundaries by half a row — hovering on the bottom
+        half of any row reported the *next* row, so tiny vertical mouse
+        jitter flipped the tooltip between adjacent rows (visible most
+        clearly when an active sniffer sat just above an inactive one).
         """
         y = pos.y()
-        if y < _TOP_PAD - _ROW_H // 2:
+        if y < _TOP_PAD:
             return None
-        idx = (y - _TOP_PAD + _ROW_H // 2) // _ROW_H
+        idx = (y - _TOP_PAD) // _ROW_H
         if 0 <= idx < len(self._sniffers):
             return self._sniffers[int(idx)]
         return None

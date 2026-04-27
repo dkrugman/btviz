@@ -56,12 +56,25 @@ class DecodedAdv:
 
 
 def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
-    """Decode a Nordic BLE LL+PHDR pcap payload (DLT 256). None if not adv."""
+    """Decode a Nordic BLE LL+PHDR pcap payload (DLT 256). None if not adv.
+
+    The 16-bit flags field at bytes 8-9 (LE) carries CRC validity:
+      bit 10 = CRC checked
+      bit 11 = CRC valid
+    If the firmware checked the CRC and it failed, drop the packet —
+    bit-error corruption produces "ghost" devices whose addresses are
+    1-4 bits away from a real one (see fix/decode-drop-crc-failed-packets
+    diagnostic). If the firmware didn't check (bit 10 unset) we have to
+    accept the packet on faith.
+    """
     if len(buf) < 10 + 4 + 2 + 6 + 3:
         return None
     rf_channel = buf[0]
     rssi_dbm = struct.unpack("b", buf[1:2])[0]
     # buf[2] noise, buf[3] aa offenses, buf[4:8] ref AA, buf[8:10] flags
+    flags = struct.unpack("<H", buf[8:10])[0]
+    if (flags >> 10) & 0x1 and not (flags >> 11) & 0x1:
+        return None
     return _decode_ll(buf[10:], channel=rf_channel, rssi=rssi_dbm)
 
 
@@ -75,7 +88,7 @@ def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
 #   [3]      header version (= 0x02)
 #   [4-5]    packet counter (u16 LE)
 #   [6]      protover marker (typically 0x06)
-#   [7]      flags
+#   [7]      flags         ← bit 0 = CRC OK (per Nordic SnifferAPI/Packet.py)
 #   [8]      <flag/reserved>
 #   [9]      RF channel
 #   [10]     RSSI magnitude (positive byte; actual value is negative)
@@ -83,17 +96,31 @@ def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
 #   [13-16]  timestamp delta (u32 LE)
 #   [17..]   BLE LL frame (AA + PDU header + payload + CRC)
 _NBE_HDR_LEN = 17
+_NBE_FLAGS_OFFSET = 7
+_NBE_FLAG_CRC_OK = 0x01
 
 
 def decode_nbe_packet(buf: bytes) -> DecodedAdv | None:
-    """Decode a Nordic-BLE (DLT 272) pcap payload. None if not adv.
+    """Decode a Nordic-BLE (DLT 272) pcap payload. None if not adv or
+    if the firmware-reported CRC failed.
 
     Same return shape as ``decode_phdr_packet`` so callers can swap
     based on the pcap link-type. Channel comes from offset 9, RSSI from
     offset 10 (stored as a positive magnitude — we negate). The BLE LL
     frame begins at offset 17 and is identical in layout to DLT 256.
+
+    Bit 0 of the flags byte at offset 7 is the firmware's CRC-OK flag
+    (per Nordic's SnifferAPI/Packet.py:421 — ``self.crcOK = self.flags
+    & 1``). The firmware does NOT filter CRC-failed packets at the
+    pcap-output stage; we have to drop them here, otherwise bit-error
+    corruption masquerades as new RPAs and balloons the device count
+    (see the fix/decode-drop-crc-failed-packets diagnostic — 72% of
+    random-kind device rows in the user's DB were ghost addresses 1-4
+    bits away from a real canonical, with 1-5 packets each).
     """
     if len(buf) < _NBE_HDR_LEN + 4 + 2 + 6 + 3:
+        return None
+    if not (buf[_NBE_FLAGS_OFFSET] & _NBE_FLAG_CRC_OK):
         return None
     rf_channel = buf[9]
     rssi_dbm = -buf[10]

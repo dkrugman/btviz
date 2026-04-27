@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -452,6 +453,31 @@ def _build_tooltip(d: CanvasDevice) -> str:
         for addr, atype in d.addresses:
             lines.append(f"  {addr}  ({atype})")
     return "\n".join(lines)
+
+
+# Sort keys for the canvas toolbar's two-level sort dropdowns. Each value
+# is a function that maps a CanvasDevice to a sort-comparable key. RSSI
+# and Packets are negated so the natural ascending sort surfaces the
+# loudest / most-active device first; missing values get a sentinel that
+# pushes them to the end. Same dict is the source of truth for both the
+# primary and secondary dropdowns; "_SORT_KEY_LABELS" preserves a stable
+# UI order distinct from the dict's iteration order.
+_SORT_KEY_LABELS: tuple[str, ...] = (
+    "Type",
+    "Name",
+    "Address kind",
+    "RSSI (avg)",
+    "Vendor",
+    "Packets",
+)
+_SORT_KEYS: dict[str, "Callable[[CanvasDevice], Any]"] = {
+    "Type":         lambda d: (d.device_class or "~"),
+    "Name":         lambda d: _pick_display_label(d).lower(),
+    "Address kind": lambda d: (d.kind or "~"),
+    "RSSI (avg)":   lambda d: -(d.rssi_avg if d.rssi_avg is not None else -200),
+    "Vendor":       lambda d: ((d.vendor or d.oui_vendor) or "~").lower(),
+    "Packets":      lambda d: -d.packet_count,
+}
 
 
 def cols_for_viewport(viewport_width: int | None) -> int:
@@ -1009,6 +1035,14 @@ class CanvasWindow(QMainWindow):
         # activity dot.
         self._source_to_serial: dict[str, str] = {}
 
+        # Active sort keys (None = honor saved per-device layouts). A
+        # transient view-mode toggle: changing either dropdown triggers
+        # an immediate re-flow without persisting to device_layouts, so
+        # sorts don't clobber positions the user has dragged. Reset
+        # layout / Clear all data go through their own paths.
+        self._current_sort_primary: str | None = None
+        self._current_sort_secondary: str | None = None
+
         tb = QToolBar("main")
         self.addToolBar(tb)
         tb.addAction("Reload", self.reload)
@@ -1016,6 +1050,25 @@ class CanvasWindow(QMainWindow):
         tb.addAction("Clear all data…", self.clear_all_data)
         tb.addAction("Refresh sniffers", self._refresh_sniffers)
         tb.addSeparator()
+
+        tb.addWidget(QLabel("  Sort by: "))
+        self._sort_combo_primary = QComboBox()
+        self._sort_combo_primary.addItem("(saved positions)")
+        for label in _SORT_KEY_LABELS:
+            self._sort_combo_primary.addItem(label)
+        self._sort_combo_primary.currentTextChanged.connect(self._on_sort_changed)
+        tb.addWidget(self._sort_combo_primary)
+
+        tb.addWidget(QLabel("  then by: "))
+        self._sort_combo_secondary = QComboBox()
+        self._sort_combo_secondary.addItem("(none)")
+        for label in _SORT_KEY_LABELS:
+            self._sort_combo_secondary.addItem(label)
+        self._sort_combo_secondary.setEnabled(False)  # disabled until primary picked
+        self._sort_combo_secondary.currentTextChanged.connect(self._on_sort_changed)
+        tb.addWidget(self._sort_combo_secondary)
+        tb.addSeparator()
+
         self._live_action = tb.addAction("Start live", self._toggle_live)
         tb.addSeparator()
         self.status = QLabel("")
@@ -1044,6 +1097,25 @@ class CanvasWindow(QMainWindow):
     def reload(self) -> None:
         self.scene.clear()
         devs = load_canvas_devices(self.store, self.project_id)
+        # Sort mode (toolbar dropdowns) overrides saved positions: zero
+        # out positions, sort the list, and re-grid. Saved layouts in
+        # the DB are untouched, so toggling back to "(saved positions)"
+        # restores them unmodified. Two-level: primary key first, then
+        # secondary as a tiebreaker.
+        if self._current_sort_primary:
+            p_fn = _SORT_KEYS.get(self._current_sort_primary)
+            if p_fn is not None:
+                s_fn = (
+                    _SORT_KEYS.get(self._current_sort_secondary)
+                    if self._current_sort_secondary else None
+                )
+                for d in devs:
+                    d.pos_x = 0.0
+                    d.pos_y = 0.0
+                if s_fn is not None:
+                    devs.sort(key=lambda d: (p_fn(d), s_fn(d)))
+                else:
+                    devs.sort(key=p_fn)
         # Lay out unplaced devices using a column count derived from the
         # current viewport so a wider window flows them across more
         # columns and a narrower one wraps sooner. Already-placed
@@ -1080,6 +1152,30 @@ class CanvasWindow(QMainWindow):
                 "DELETE FROM device_layouts WHERE project_id = ?",
                 (self.project_id,),
             )
+        # Going back to a fresh grid means the user no longer wants the
+        # transient sort view either — clear both dropdowns.
+        self._current_sort_primary = None
+        self._current_sort_secondary = None
+        self._sort_combo_primary.setCurrentIndex(0)
+        self._sort_combo_secondary.setCurrentIndex(0)
+        self._sort_combo_secondary.setEnabled(False)
+        self.reload()
+
+    def _on_sort_changed(self, _label: str) -> None:
+        """Toolbar sort-dropdown change → re-flow scene by chosen keys.
+
+        Reads both combos directly so we don't have to track which one
+        emitted the signal. Translates the combo's first sentinel item
+        ("(saved positions)" / "(none)") to None.
+        """
+        p = self._sort_combo_primary.currentText()
+        self._current_sort_primary = p if p in _SORT_KEYS else None
+        # Secondary is meaningless when there's no primary.
+        self._sort_combo_secondary.setEnabled(self._current_sort_primary is not None)
+        s = self._sort_combo_secondary.currentText()
+        self._current_sort_secondary = (
+            s if (self._current_sort_primary and s in _SORT_KEYS) else None
+        )
         self.reload()
 
     def clear_all_data(self) -> None:
@@ -1270,35 +1366,70 @@ class CanvasWindow(QMainWindow):
     def _device_context_actions(self, device: CanvasDevice) -> list[QAction]:
         """Build the right-click menu actions for one DeviceItem.
 
-        ``Follow this device`` is the only entry today. It re-tasks one
-        sniffer to track the device's most-recent address — useful for
-        capturing post-CONNECT_IND data-channel traffic and (with an IRK
-        loaded) resolving its rotating RPAs back to a stable identity.
-
-        Disabled with a tooltip when prerequisites aren't met (live
-        capture not running, or the device has no recorded addresses).
+        Two entries today:
+          * ``Rename device…`` — sets a per-device ``user_name`` that
+            wins over every automatic naming source (local_name,
+            gatt_device_name, broadcast_name, vendor+model fallback).
+          * ``Follow this device`` — re-tasks one sniffer to track the
+            device's most-recent address. Useful for capturing
+            post-CONNECT_IND data-channel traffic and (with an IRK
+            loaded) resolving its rotating RPAs back to a stable
+            identity. Disabled when prerequisites aren't met.
         """
-        action = QAction("Follow this device", self)
+        rename_action = QAction("Rename device…", self)
+        rename_action.setToolTip(
+            "Set a custom name for this device. Wins over every "
+            "automatic naming source (local name, GATT name, vendor)."
+        )
+        rename_action.triggered.connect(
+            lambda checked=False, d=device: self._rename_device(d)
+        )
+
+        follow_action = QAction("Follow this device", self)
         if self._coord is None or self._live is None or not self._live.running:
-            action.setEnabled(False)
-            action.setToolTip(
+            follow_action.setEnabled(False)
+            follow_action.setToolTip(
                 "Start live capture first (toolbar → Start live)."
             )
         elif not device.addresses:
-            action.setEnabled(False)
-            action.setToolTip("This device has no recorded addresses to follow.")
+            follow_action.setEnabled(False)
+            follow_action.setToolTip(
+                "This device has no recorded addresses to follow."
+            )
         else:
             addr, addr_type = device.addresses[0]
             is_random = addr_type != "public"
-            action.setToolTip(
+            follow_action.setToolTip(
                 f"Re-task one sniffer to follow {addr} "
                 f"({addr_type or 'unknown'})."
             )
-            action.triggered.connect(
+            follow_action.triggered.connect(
                 lambda checked=False, a=addr, r=is_random:
                     self._follow_device(a, r)
             )
-        return [action]
+        return [rename_action, follow_action]
+
+    def _rename_device(self, device: CanvasDevice) -> None:
+        """Prompt for a new ``user_name`` and persist via the devices repo.
+
+        Empty input clears the override. Reload after the change so the
+        new label propagates to the box title and tooltip.
+        """
+        current = device.user_name or ""
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename device",
+            f"Name for {_pick_display_label(device)}:",
+            text=current,
+        )
+        if not ok:
+            return
+        new_name = new_name.strip()
+        # Empty string clears the override; pass None to set_user_name.
+        self.repos.devices.set_user_name(
+            device.device_id, new_name if new_name else None,
+        )
+        self.reload()
 
     def _follow_device(self, address: str, is_random: bool) -> None:
         """Ask the coordinator to dedicate a sniffer to this address.

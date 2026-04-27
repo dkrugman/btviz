@@ -78,25 +78,26 @@ def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
     return _decode_ll(buf[10:], channel=rf_channel, rssi=rssi_dbm)
 
 
-# Nordic BLE (DLT 272) header layout, version 2 — what current Nordic
-# Sniffer firmware emits. Total header is 17 bytes; fields we need are
-# channel and RSSI, the rest (board id, packet/event counters, timestamp
-# delta) are diagnostics we don't surface yet.
+# Nordic BLE (DLT 272) header layout — what current Nordic Sniffer
+# firmware emits. Total header is 17 bytes. Field offsets follow the
+# Nordic SnifferAPI/Packet.py constants but shifted by +1 because the
+# pcap output prepends a `board_id` byte before the structure described
+# there.
 #
 #   [0]      board id
-#   [1-2]    header length (u16 LE)
+#   [1-2]    header length / payload_len (u16 LE)
 #   [3]      header version (= 0x02)
 #   [4-5]    packet counter (u16 LE)
-#   [6]      protover marker (typically 0x06)
-#   [7]      flags         ← bit 0 = CRC OK (per Nordic SnifferAPI/Packet.py)
-#   [8]      <flag/reserved>
+#   [6]      id
+#   [7]      ble_header_length (always 10 = 0x0a)
+#   [8]      flags         ← bit 0 = CRC OK (per Nordic SnifferAPI/Packet.py:421)
 #   [9]      RF channel
 #   [10]     RSSI magnitude (positive byte; actual value is negative)
 #   [11-12]  event counter (u16 LE)
 #   [13-16]  timestamp delta (u32 LE)
 #   [17..]   BLE LL frame (AA + PDU header + payload + CRC)
 _NBE_HDR_LEN = 17
-_NBE_FLAGS_OFFSET = 7
+_NBE_FLAGS_OFFSET = 8
 _NBE_FLAG_CRC_OK = 0x01
 
 
@@ -109,14 +110,20 @@ def decode_nbe_packet(buf: bytes) -> DecodedAdv | None:
     offset 10 (stored as a positive magnitude — we negate). The BLE LL
     frame begins at offset 17 and is identical in layout to DLT 256.
 
-    Bit 0 of the flags byte at offset 7 is the firmware's CRC-OK flag
+    Bit 0 of the flags byte at offset 8 is the firmware's CRC-OK flag
     (per Nordic's SnifferAPI/Packet.py:421 — ``self.crcOK = self.flags
-    & 1``). The firmware does NOT filter CRC-failed packets at the
-    pcap-output stage; we have to drop them here, otherwise bit-error
-    corruption masquerades as new RPAs and balloons the device count
-    (see the fix/decode-drop-crc-failed-packets diagnostic — 72% of
-    random-kind device rows in the user's DB were ghost addresses 1-4
-    bits away from a real canonical, with 1-5 packets each).
+    & 1``). Watch the offsets carefully: in the SnifferAPI source
+    FLAGS_POS = 7, but that's relative to the post-syncword UART
+    structure. The pcap-output format prepends a board_id byte, so on
+    the wire here flags is at byte 8. (Earlier we mistakenly read byte
+    7, which is always 0x0a = BLE_HEADER_LENGTH constant — bit 0 = 0
+    — and ended up rejecting every single packet.)
+
+    The firmware does NOT filter CRC-failed packets at the pcap-output
+    stage; we have to drop them here, otherwise bit-error corruption
+    masquerades as new RPAs and balloons the device count (the
+    diagnostic showed 72% of random-kind device rows in the user's DB
+    were ghost addresses 1-4 bits away from a real canonical).
     """
     if len(buf) < _NBE_HDR_LEN + 4 + 2 + 6 + 3:
         return None

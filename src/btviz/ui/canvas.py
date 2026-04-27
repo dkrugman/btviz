@@ -84,9 +84,18 @@ _BOX_H_COLLAPSED = _HEADER_H + 30   # body holds one summary line
 _BOX_H_EXPANDED = _HEADER_H + 220   # body holds detailed info block
 _BOX_RADIUS = 10
 _ICON_SIZE = 32                      # pt; QFont sets this in points
-_GRID_COLS = 6
-_GRID_DX = _BOX_W + 24
-_GRID_DY = _BOX_H_COLLAPSED + 22
+_GRID_DX = _BOX_W + 24               # column pitch (box + gutter)
+_GRID_DY = _BOX_H_COLLAPSED + 22     # row pitch (collapsed-box + gutter)
+_GRID_MARGIN_X = 20                  # left margin before the first column
+# Viewport-responsive column counts are clamped between these so a
+# pathologically narrow window still places one column per row, and a
+# wide one doesn't spread devices so far apart that they're tedious to
+# scan.
+_GRID_COLS_MIN = 1
+_GRID_COLS_MAX = 12
+# Fallback when no viewport width is available (headless / pre-show
+# initialization). Matches the previous fixed default.
+_GRID_COLS_DEFAULT = 6
 
 # Z-stacking. Expanded boxes sit above collapsed ones so their detail
 # region isn't occluded by neighbors. The actively-dragged item rises
@@ -445,16 +454,42 @@ def _build_tooltip(d: CanvasDevice) -> str:
     return "\n".join(lines)
 
 
-def apply_grid_layout(devices: list[CanvasDevice]) -> None:
+def cols_for_viewport(viewport_width: int | None) -> int:
+    """Pick a column count that fits the current viewport.
+
+    Returns ``_GRID_COLS_DEFAULT`` when ``viewport_width`` is None
+    (headless / pre-show). Otherwise divides the available width by the
+    column pitch (box + gutter) and clamps to ``[_GRID_COLS_MIN,
+    _GRID_COLS_MAX]`` so a pathologically narrow window still gives 1
+    column per row, and a very wide one doesn't spread boxes so far
+    apart that they're tedious to scan.
+    """
+    if viewport_width is None or viewport_width <= 0:
+        return _GRID_COLS_DEFAULT
+    usable = max(0, viewport_width - 2 * _GRID_MARGIN_X)
+    cols = max(1, usable // _GRID_DX)
+    return max(_GRID_COLS_MIN, min(_GRID_COLS_MAX, int(cols)))
+
+
+def apply_grid_layout(
+    devices: list[CanvasDevice],
+    *,
+    cols: int = _GRID_COLS_DEFAULT,
+) -> None:
     """Assign default grid positions to any device missing a layout (both
     pos_x and pos_y equal to 0 and no layout row in the DB). Keeps existing
-    positions intact."""
+    positions intact.
+
+    ``cols`` lets the caller respect the current viewport width so newly-
+    placed devices flow into the available area instead of being stuck
+    at the historical 6-column grid.
+    """
     unplaced = [d for d in devices if d.pos_x == 0.0 and d.pos_y == 0.0]
     for i, d in enumerate(unplaced):
-        col = i % _GRID_COLS
-        row = i // _GRID_COLS
-        d.pos_x = 20 + col * _GRID_DX
-        d.pos_y = 20 + row * _GRID_DY
+        col = i % cols
+        row = i // cols
+        d.pos_x = _GRID_MARGIN_X + col * _GRID_DX
+        d.pos_y = _GRID_MARGIN_X + row * _GRID_DY
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -769,13 +804,37 @@ class _CanvasView(QGraphicsView):
 # Project picker
 # ──────────────────────────────────────────────────────────────────────────
 
+class _ConfirmDialog(QDialog):
+    """Tiny modal Yes/No prompt — used in place of QMessageBox.question,
+    which segfaults on macOS Tahoe + PySide6 6.11 in the Qt metaobject
+    builder. Defaults focus to "No" so Enter doesn't confirm a destructive
+    action by accident.
+    """
+
+    def __init__(self, parent, title: str, message: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        layout = QVBoxLayout(self)
+        msg = QLabel(message)
+        msg.setWordWrap(True)
+        layout.addWidget(msg)
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Yes
+            | QDialogButtonBox.StandardButton.No
+        )
+        bb.button(QDialogButtonBox.StandardButton.No).setDefault(True)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+
 class ProjectPicker(QDialog):
-    """Dialog shown at launch to pick (or create) the active project."""
+    """Dialog shown at launch to pick / create / delete the active project."""
 
     def __init__(self, store: Store, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("btviz — Select Project")
-        self.resize(360, 150)
+        self.resize(380, 180)
         self.store = store
         self.repos = Repos(store)
 
@@ -784,9 +843,19 @@ class ProjectPicker(QDialog):
         self.combo = QComboBox()
         layout.addWidget(self.combo)
 
+        # Side-by-side row: New / Delete. Delete is disabled until a
+        # project is selected and turned red so the destructive action
+        # reads as such.
+        from PySide6.QtWidgets import QHBoxLayout
+        action_row = QHBoxLayout()
         new_btn = QPushButton("New project…")
         new_btn.clicked.connect(self._new_project)
-        layout.addWidget(new_btn)
+        action_row.addWidget(new_btn)
+        self._delete_btn = QPushButton("Delete project…")
+        self._delete_btn.setStyleSheet("color: #b00;")
+        self._delete_btn.clicked.connect(self._delete_project)
+        action_row.addWidget(self._delete_btn)
+        layout.addLayout(action_row)
 
         # Inline status label for transient messages (e.g. "name already
         # exists"). Used instead of QMessageBox.warning, which crashes on
@@ -801,7 +870,12 @@ class ProjectPicker(QDialog):
         bb.rejected.connect(self.reject)
         layout.addWidget(bb)
 
+        self.combo.currentIndexChanged.connect(self._update_delete_enabled)
         self._reload(select_last=True)
+        self._update_delete_enabled()
+
+    def _update_delete_enabled(self) -> None:
+        self._delete_btn.setEnabled(self.combo.count() > 0)
 
     def _reload(self, select_id: int | None = None, *, select_last: bool = False) -> None:
         self.combo.clear()
@@ -844,6 +918,44 @@ class ProjectPicker(QDialog):
             return
         proj = self.repos.projects.create(name)
         self._reload(select_id=proj.id)
+
+    def _delete_project(self) -> None:
+        """Delete the currently-selected project after confirmation.
+
+        FK cascades take care of sessions, observations, broadcasts,
+        device_layouts, groups, and per-project device meta. Devices
+        and addresses are global and stay (other projects may have
+        observed them too).
+        """
+        self._status_label.setText("")
+        i = self.combo.currentIndex()
+        if i < 0:
+            return
+        proj_id = self.combo.itemData(i)
+        proj_name = self.combo.itemText(i)
+        if proj_id is None:
+            return
+        confirm = _ConfirmDialog(
+            self,
+            "Delete project?",
+            f"Permanently delete project '{proj_name}' and all its "
+            "sessions, observations, broadcasts, and canvas layout?\n\n"
+            "Devices and addresses are global and will remain.",
+        )
+        if confirm.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.repos.projects.delete(int(proj_id))
+        except Exception as e:  # noqa: BLE001
+            self._status_label.setText(f"Delete failed: {e}")
+            return
+        # Clear LAST_PROJECT if it pointed at this one so the next
+        # picker open doesn't try to re-select a deleted id.
+        last = self.repos.meta.get(self.repos.meta.LAST_PROJECT)
+        if last and str(last) == str(proj_id):
+            self.repos.meta.set(self.repos.meta.LAST_PROJECT, "")
+        self._reload()
+        self._update_delete_enabled()
 
     def selected_project_id(self) -> int | None:
         i = self.combo.currentIndex()
@@ -901,6 +1013,7 @@ class CanvasWindow(QMainWindow):
         self.addToolBar(tb)
         tb.addAction("Reload", self.reload)
         tb.addAction("Reset layout", self.reset_layout)
+        tb.addAction("Clear all data…", self.clear_all_data)
         tb.addAction("Refresh sniffers", self._refresh_sniffers)
         tb.addSeparator()
         self._live_action = tb.addAction("Start live", self._toggle_live)
@@ -924,7 +1037,12 @@ class CanvasWindow(QMainWindow):
     def reload(self) -> None:
         self.scene.clear()
         devs = load_canvas_devices(self.store, self.project_id)
-        apply_grid_layout(devs)
+        # Lay out unplaced devices using a column count derived from the
+        # current viewport so a wider window flows them across more
+        # columns and a narrower one wraps sooner. Already-placed
+        # devices keep their saved positions regardless.
+        cols = cols_for_viewport(self.view.viewport().width())
+        apply_grid_layout(devs, cols=cols)
         for d in devs:
             if d.hidden:
                 continue
@@ -949,6 +1067,48 @@ class CanvasWindow(QMainWindow):
                 (self.project_id,),
             )
         self.reload()
+
+    def clear_all_data(self) -> None:
+        """Wipe all observations, sessions, broadcasts, and layout for
+        this project. Devices and addresses are global and stay
+        (other projects may have observed them too).
+
+        Confirmed via _ConfirmDialog because this is destructive and
+        irreversible without a backup.
+        """
+        # Refuse while live capture is running so we don't yank the DB
+        # out from under an active write loop.
+        if self._live is not None and self._live.running:
+            self.status.setText(
+                "  cannot clear: stop live capture first"
+            )
+            return
+        confirm = _ConfirmDialog(
+            self,
+            "Clear all project data?",
+            f"Permanently delete all sessions, observations, broadcasts, "
+            f"and canvas layout for project '{self.project.name}'?\n\n"
+            f"Devices and addresses are global and will remain — they may "
+            f"reappear if other projects have observed them, or as soon as "
+            f"a new live capture starts.",
+        )
+        if confirm.exec() != QDialog.DialogCode.Accepted:
+            return
+        # Sessions cascade to observations + broadcasts via FK ON DELETE
+        # CASCADE (see schema.sql). device_layouts cascades from project,
+        # but we don't want to nuke the project itself, so delete the
+        # layout rows explicitly.
+        with self.store.tx():
+            self.store.conn.execute(
+                "DELETE FROM sessions WHERE project_id = ?",
+                (self.project_id,),
+            )
+            self.store.conn.execute(
+                "DELETE FROM device_layouts WHERE project_id = ?",
+                (self.project_id,),
+            )
+        self.reload()
+        self.status.setText("  cleared all data for this project")
 
     def _persist_device(self, d: CanvasDevice, *, save_pos: bool) -> None:
         """Called from DeviceItem on drag-end or expand-toggle."""

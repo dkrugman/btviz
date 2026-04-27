@@ -1079,6 +1079,8 @@ class CanvasWindow(QMainWindow):
                 f"rec={stats.packets_recorded:,} "
                 f"drop={stats.packets_dropped} "
                 f"dev={stats.devices_touched} "
+                f"ext={stats.ext_adv_seen}"
+                f"({stats.ext_adv_with_baa} baa) "
                 f"bcast={stats.broadcasts_seen}"
             )
 

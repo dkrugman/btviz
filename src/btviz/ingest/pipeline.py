@@ -94,6 +94,15 @@ class IngestContext:
     # Cache {device_id -> current identity fields} so we only UPDATE when
     # a new clue actually changes something.
     device_state: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # Diagnostics for the Auracast detection path. ext_adv_count is
+    # every ADV_EXT_IND we saw (primary or AUX_ADV_IND — they share PDU
+    # type 0x7); ext_adv_with_baa counts those where parse_auracast
+    # found a Broadcast Audio Announcement Service entry. The gap
+    # between the two distinguishes "didn't capture the AUX" (PHY /
+    # firmware config issue) from "captured but parser didn't match"
+    # (genuine bug to investigate).
+    ext_adv_count: int = 0
+    ext_adv_with_baa: int = 0
 
 
 def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> bool:
@@ -182,8 +191,10 @@ def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> bool:
     # upsert a row in `broadcasts`. Only ADV_EXT_IND / AUX_ADV_IND packets
     # carry BAA, so cheap reject for the non-extended-adv hot path.
     if pkt.pdu_type == "ADV_EXT_IND":
+        ctx.ext_adv_count += 1
         ai = parse_auracast(pkt.extras.get("layers", {}))
         if ai is not None:
+            ctx.ext_adv_with_baa += 1
             repos.broadcasts.upsert(
                 ctx.session_id, ai.broadcast_id,
                 broadcaster_device_id=device.id,

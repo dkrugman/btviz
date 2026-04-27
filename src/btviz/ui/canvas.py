@@ -868,11 +868,14 @@ class CanvasWindow(QMainWindow):
         tb.addWidget(self.status)
 
         self.reload()
-        # Run an initial discovery sweep so the sniffer panel reflects
-        # what's currently plugged in. Errors (e.g. extcap not installed)
-        # don't block the canvas — the panel just shows whatever's in
-        # the DB from previous sessions.
-        self._refresh_sniffers()
+        # The sniffer panel reads from the DB at startup so the window
+        # appears immediately. Discovery happens on demand via the
+        # "Refresh sniffers" toolbar action — calling the Nordic extcap
+        # synchronously here would block UI launch by tens of seconds
+        # while the extcap probes every serial-class USB device looking
+        # for the sniffer protocol (slow when USB-to-UART bridges like
+        # the Adafruit Bluefruit LE Sniffer are connected).
+        self.sniffer_panel.refresh()
         self.repos.meta.set(self.repos.meta.LAST_PROJECT, str(project_id))
 
     # --- data ---------------------------------------------------------

@@ -75,10 +75,19 @@ def find_extcap_binary() -> Path:
 _INTERFACE_LINE = re.compile(r"interface\s*\{value=([^}]+)\}\{display=([^}]+)\}")
 
 
-def list_dongles(extcap: Path | None = None) -> list[Dongle]:
+def list_dongles(
+    extcap: Path | None = None,
+    *,
+    timeout: float = 60.0,
+) -> list[Dongle]:
     """Return all currently connected nRF Sniffer dongles.
 
     Filters out macOS `/dev/tty.*` duplicates of `/dev/cu.*` devices.
+
+    The Nordic extcap probes every serial-class USB device on the host
+    looking for the sniffer protocol. Pass-through devices like the
+    Silicon Labs CP2104 (used on the Adafruit Bluefruit LE Sniffer) can
+    push the probe over 10s, so the default timeout is conservative.
     """
     extcap = extcap or find_extcap_binary()
     out = subprocess.run(
@@ -86,7 +95,7 @@ def list_dongles(extcap: Path | None = None) -> list[Dongle]:
         check=True,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     ).stdout
 
     found: list[Dongle] = []

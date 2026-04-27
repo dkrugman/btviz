@@ -1025,10 +1025,22 @@ class CanvasWindow(QMainWindow):
         # under heavy adv traffic.
         self._live_timer.start(250)
 
-        self._live_action.setText("Stop live")
-        self.status.setText(
-            f"  live: capturing on {len(self._coord.dongles)} devices…"
+        # Count what actually started — with N dongles and 3 primary
+        # advertising channels, default_roles pins 3 and parks the rest
+        # as ScanUnmonitored, which only spin up if a primary frees
+        # (e.g. when one is re-tasked to Follow). Reserved sniffers are
+        # idle subprocesses that haven't been started yet.
+        running = sum(
+            1 for sp in self._coord.sniffers.values() if sp.state.running
         )
+        total = len(self._coord.dongles)
+        reserved = total - running
+        msg = f"  live: capturing on {running} of {total} devices"
+        if reserved > 0:
+            msg += f" ({reserved} reserved for follow)"
+        msg += "…"
+        self._live_action.setText("Stop live")
+        self.status.setText(msg)
 
     def _stop_live(self) -> None:
         if self._live_timer is not None:

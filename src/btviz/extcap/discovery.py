@@ -29,14 +29,22 @@ class ExtcapNotFound(RuntimeError):
 
 @dataclass(frozen=True)
 class Dongle:
-    """A discovered nRF Sniffer interface, optionally enriched with USB info."""
+    """A discovered nRF Sniffer interface, optionally enriched with USB info.
+
+    Defaults ``kind="dongle"`` because anything the extcap binary lists is
+    a sniffer of some sort. Specific overrides:
+      * SEGGER J-Link product → ``"dk"`` (nRF5340 Audio DK debug interface)
+      * Otherwise stays ``"dongle"`` (Nordic nRF52840, Taidacent clone,
+        Silicon Labs / FTDI / CH340-bridged BLE 4.x sniffers like the
+        Adafruit Bluefruit LE Sniffer)
+    """
     interface_id: str        # value passed to --extcap-interface
     display: str             # human-readable name from extcap
     serial_path: str         # /dev/cu.usbmodem... on macOS, /dev/ttyACM... on Linux
     serial_number: str | None = None    # USB serial (stable across replugs)
     location_id_hex: str | None = None  # USB physical-port id (sort key)
     usb_product: str | None = None      # USB Product Name descriptor
-    kind: str = "unknown"               # dongle | dk | unknown
+    kind: str = "dongle"
 
     @property
     def short_id(self) -> str:
@@ -67,10 +75,19 @@ def find_extcap_binary() -> Path:
 _INTERFACE_LINE = re.compile(r"interface\s*\{value=([^}]+)\}\{display=([^}]+)\}")
 
 
-def list_dongles(extcap: Path | None = None) -> list[Dongle]:
+def list_dongles(
+    extcap: Path | None = None,
+    *,
+    timeout: float = 60.0,
+) -> list[Dongle]:
     """Return all currently connected nRF Sniffer dongles.
 
     Filters out macOS `/dev/tty.*` duplicates of `/dev/cu.*` devices.
+
+    The Nordic extcap probes every serial-class USB device on the host
+    looking for the sniffer protocol. Pass-through devices like the
+    Silicon Labs CP2104 (used on the Adafruit Bluefruit LE Sniffer) can
+    push the probe over 10s, so the default timeout is conservative.
     """
     extcap = extcap or find_extcap_binary()
     out = subprocess.run(
@@ -78,7 +95,7 @@ def list_dongles(extcap: Path | None = None) -> list[Dongle]:
         check=True,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=timeout,
     ).stdout
 
     found: list[Dongle] = []
@@ -98,6 +115,16 @@ def list_dongles(extcap: Path | None = None) -> list[Dongle]:
             serial_path=serial_path,
         ))
 
+    # Drop SLAB_USBtoUART duplicates when an equivalent /dev/cu.usbserial-
+    # node exists for the same physical device. macOS exposes both names
+    # for Silicon Labs USB-to-UART chips (the Adafruit Bluefruit LE Sniffer
+    # uses one). Silicon Labs's driver creates /dev/cu.SLAB_USBtoUART as a
+    # convenience alias for the canonical /dev/cu.usbserial-XXXX node;
+    # both nodes point at the same chip and the extcap binary lists each
+    # one, so without this filter every Silicon-Labs-bridged sniffer
+    # double-counts in the panel.
+    found = _dedupe_slab_usbtouart_aliases(found)
+
     # Enrich with USB descriptors when we can — gets us the real serial
     # number and Location ID (stable physical-port sort key). On platforms
     # where usb_info isn't supported, the dongles stay at the base fields.
@@ -114,48 +141,192 @@ def list_dongles(extcap: Path | None = None) -> list[Dongle]:
     return found
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Fast discovery path — pure USB descriptor enumeration, no extcap probe.
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Why this exists: ``list_dongles()`` calls the Nordic extcap binary's
+# ``--extcap-interfaces`` mode, which probes every serial-class USB device
+# on the system looking for the sniffer protocol. Probes serialize, and
+# non-Nordic devices (USB-to-UART bridges, Thunderbolt audio, USB cameras
+# with serial endpoints) make the probe wait for replies that never come.
+# In practice the call hangs indefinitely on busy hubs.
+#
+# For *display* purposes — populating the sniffer panel so the user knows
+# what's plugged in — we don't need to validate sniffer-protocol response.
+# We just need the list of plugged-in USB devices that LOOK like sniffers.
+# ``ioreg`` answers that instantly.
+#
+# At capture time, when the user actually wants to start sniffing, we'd
+# still call the extcap (though that's a single-target invocation with
+# ``--extcap-interface <id>``, not the full enumerate-everything probe).
+
+# VID/product hints that identify a sniffer candidate at the USB level.
+# Order matters: more-specific hints first.
+_SNIFFER_VID_HINTS: tuple[tuple[int, str, str], ...] = (
+    # (vendor_id, kind, default_display)
+    (usb_info.SEGGER_VID,    "dk",     "SEGGER J-Link (nRF5340 DK)"),
+    (usb_info.NORDIC_VID,    "dongle", "Nordic nRF Sniffer dongle"),
+    (usb_info.SILABS_VID,    "dongle", "Silicon Labs USB-to-UART (Adafruit Bluefruit LE)"),
+    (usb_info.FTDI_VID,      "dongle", "FTDI USB-to-UART"),
+    (usb_info.PROLIFIC_VID,  "dongle", "Prolific USB-to-UART"),
+    (usb_info.CH340_VID,     "dongle", "CH340 USB-to-UART"),
+)
+
+
+def list_dongles_fast() -> list[Dongle]:
+    """Enumerate sniffer candidates from USB descriptors only (no extcap).
+
+    Fast path used by the canvas's panel refresh — completes in tens of
+    milliseconds and never hangs. Returns one ``Dongle`` per recognized
+    USB device (Nordic / SEGGER / common USB-to-UART bridges).
+
+    The ``serial_path`` field is set to the device-node path when we can
+    construct it (``/dev/cu.usbmodem<iSerial>1`` for iSerial-bearing
+    devices), or to a synthetic ``ioreg:loc=<location>`` token when not.
+    The extcap interface_id is left blank — only needed at capture time,
+    when the slow ``list_dongles()`` is used to resolve it via the real
+    extcap probe.
+
+    Sort order matches ``list_dongles()``: by Location ID, then serial.
+    """
+    usb_devices = usb_info.query()
+    if not usb_devices:
+        return []
+
+    found: list[Dongle] = []
+    for u in usb_devices:
+        kind, display = _hint_for_vid(u.vendor_id)
+        if kind is None:
+            continue
+        # Refine kind for SEGGER/Nordic via product name; classify_kind
+        # lifts "dk" out of the Nordic-VID bucket if needed (and vice versa).
+        kind = _classify_kind(u)
+        # Synthesize a device-node-like serial_path. Real extcap-derived
+        # paths look like /dev/cu.usbmodem<serial>1; we follow the same
+        # shape when we have an iSerial, and fall back to a deterministic
+        # ioreg-based identifier for serial-less devices so the row is
+        # still uniquely keyed.
+        if u.serial_number:
+            serial_path = f"/dev/cu.usbmodem{u.serial_number}1"
+        elif u.location_id_hex:
+            serial_path = f"ioreg:loc={u.location_id_hex}"
+        else:
+            serial_path = f"ioreg:vid={u.vendor_id:04x}:pid={u.product_id:04x}"
+        found.append(Dongle(
+            interface_id="",  # resolved at capture time
+            display=u.product_name or display,
+            serial_path=serial_path,
+            serial_number=u.serial_number or None,
+            location_id_hex=u.location_id_hex,
+            usb_product=u.product_name,
+            kind=kind,
+        ))
+
+    found.sort(key=lambda d: (
+        d.location_id_hex is None,
+        d.location_id_hex or "",
+        d.serial_path,
+    ))
+    return found
+
+
+def _hint_for_vid(vid: int) -> tuple[str | None, str | None]:
+    """Return (kind, display) hint for a recognized vendor, else (None, None)."""
+    for v, kind, display in _SNIFFER_VID_HINTS:
+        if vid == v:
+            return kind, display
+    return None, None
+
+
+def _dedupe_slab_usbtouart_aliases(dongles: list[Dongle]) -> list[Dongle]:
+    """Drop SLAB_USBtoUART aliases when an equivalent usbserial node exists.
+
+    Silicon Labs's macOS driver creates ``/dev/cu.SLAB_USBtoUART`` as a
+    duplicate alias of the canonical ``/dev/cu.usbserial-<serial>``. When
+    both nodes are active the extcap lists both, and we'd double-count.
+    Strategy: if there's any ``usbserial`` entry, drop every
+    ``SLAB_USBtoUART`` entry. Both names point at the same chip, and the
+    canonical name carries the iSerial.
+    """
+    has_usbserial = any("usbserial" in d.serial_path for d in dongles)
+    if not has_usbserial:
+        return dongles
+    return [d for d in dongles if "SLAB_USBtoUART" not in d.serial_path]
+
+
 def _enrich_with_usb(dongles: list[Dongle]) -> list[Dongle]:
     """Match each Dongle to a USB descriptor and copy in the descriptor info.
 
-    Pairing is done by substring: a USB device's serial often appears
-    embedded in the OS's device-node path (e.g. ``/dev/cu.usbmodem
-    461A0A45E94DB33B1`` ↔ serial ``461A0A45E94DB33B``). We try both
-    directions of substring containment to cover the various platform
-    transformations (truncation, hex-fold, suffix digits).
+    Pairing strategy, in priority order:
+      1. **Substring serial match.** When a USB device has an iSerial,
+         macOS embeds it in the device-node path
+         (``/dev/cu.usbmodem<iSerial>1``). The Nordic dongles + the DK's
+         J-Link interface follow this pattern.
+      2. **Location-ID-prefix match.** USB devices without an iSerial get
+         a path like ``/dev/cu.usbmodem<location_prefix>-<…>`` where the
+         prefix is the upper hex digits of the parent USB Location ID
+         (e.g. path ``usbmodem22330`` ↔ location ``0x22330000``). The
+         Adafruit Bluefruit LE Sniffer (Silicon Labs CP2104 bridge) and
+         other USB-to-UART sniffers fall through to this path.
 
-    Each USB device is matched at most once. Unmatched dongles are
-    returned unchanged — their serial / location_id stay None and the
-    DB will use ``serial_path`` as a fallback identifier.
+    Each USB device is matched at most once. Unmatched dongles keep their
+    base fields (kind="dongle" by default — see Dongle dataclass).
     """
     usb_devices = usb_info.query()
     if not usb_devices:
         return dongles
 
-    used: set[str] = set()
+    used_keys: set[str] = set()
     enriched: list[Dongle] = []
+
+    def _key(u: "usb_info.UsbDeviceInfo") -> str:
+        # Unique identity for deduplication. Serial first if present;
+        # otherwise the location ID is the next-most-stable identifier.
+        return u.serial_number or u.location_id_hex or f"{u.vendor_id:x}:{u.product_id:x}"
+
     for d in dongles:
         match: usb_info.UsbDeviceInfo | None = None
         path_lower = d.serial_path.lower()
+
+        # 1. Substring match on serial.
         for u in usb_devices:
-            if u.serial_number in used:
+            k = _key(u)
+            if k in used_keys or not u.serial_number:
                 continue
             sn = u.serial_number.lower()
-            # Either direction of substring containment counts as a match.
             if sn in path_lower or _serial_root_in_path(sn, path_lower):
                 match = u
                 break
+
+        # 2. Location-ID prefix match. The path's hex-ish run after
+        # "usbmodem" (and similar) is the location prefix when iSerial
+        # was empty.
+        if match is None:
+            for u in usb_devices:
+                k = _key(u)
+                if k in used_keys or not u.location_id_hex:
+                    continue
+                if _location_prefix_in_path(u.location_id_hex, path_lower):
+                    match = u
+                    break
+
         if match is None:
             enriched.append(d)
             continue
-        used.add(match.serial_number)
+        used_keys.add(_key(match))
+
+        # Override kind to "dk" only for SEGGER / J-Link interfaces;
+        # everything else extcap listed is some flavor of dongle.
+        kind = _classify_kind(match)
         enriched.append(Dongle(
             interface_id=d.interface_id,
             display=d.display,
             serial_path=d.serial_path,
-            serial_number=match.serial_number,
+            serial_number=match.serial_number or None,
             location_id_hex=match.location_id_hex,
             usb_product=match.product_name,
-            kind=_classify_kind(match),
+            kind=kind,
         ))
     return enriched
 
@@ -170,25 +341,44 @@ def _serial_root_in_path(sn_lower: str, path_lower: str) -> bool:
     return False
 
 
+def _location_prefix_in_path(location_hex: str, path_lower: str) -> bool:
+    """Match a USB Location ID prefix against an unserialized device path.
+
+    macOS encodes the parent hub's location into device-node names for
+    devices without an iSerial. The encoding drops trailing zeros and
+    interleaves digits — examples observed in the wild:
+
+      location 0x22330000  →  ``/dev/cu.usbmodem22330-...``
+      location 0x22320000  →  ``/dev/cu.usbmodem22320-...``
+
+    We strip the leading ``0x`` and trailing zero pairs from the location,
+    then check substring containment against the lowercased path. Tries a
+    couple of common truncations to cover both 4- and 5-digit forms.
+    """
+    h = location_hex.lower().removeprefix("0x").rstrip("0")
+    if not h:
+        return False
+    # Try the rstripped form, plus 4- and 5-digit truncations
+    candidates = {h, h[:5], h[:4]}
+    return any(c and c in path_lower for c in candidates)
+
+
 def _classify_kind(u: "usb_info.UsbDeviceInfo") -> str:
-    """Derive the broad sniffer ``kind`` (dongle | dk | unknown) from
-    USB descriptor strings. Heuristic — refine as we encounter more
-    hardware variants. Currently:
-      * "J-Link" / "J_Link" product → DK (the nRF5340 Audio DK exposes
+    """Derive the sniffer ``kind`` from USB descriptor strings.
+
+    Defaults to ``"dongle"`` — anything the extcap surfaced is a sniffer,
+    so unless we positively recognize it as a development kit we treat
+    it as a dongle. Specific overrides:
+
+      * SEGGER J-Link product or VID → DK (the nRF5340 Audio DK exposes
         its onboard SEGGER J-Link interface to the host)
-      * "nRF Sniffer for Bluetooth LE" product → dongle (covers official
-        Nordic PCA10059 and clones flashed with the Nordic Sniffer FW)
     """
     name = (u.product_name or "").lower()
     if "j-link" in name or "j_link" in name or "jlink" in name:
         return "dk"
-    if "nrf sniffer" in name or "nordic" in name:
-        return "dongle"
     if u.vendor_id == usb_info.SEGGER_VID:
         return "dk"
-    if u.vendor_id == usb_info.NORDIC_VID:
-        return "dongle"
-    return "unknown"
+    return "dongle"
 
 
 # ──────────────────────────────────────────────────────────────────────────

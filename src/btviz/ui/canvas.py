@@ -868,11 +868,14 @@ class CanvasWindow(QMainWindow):
         tb.addWidget(self.status)
 
         self.reload()
-        # Run an initial discovery sweep so the sniffer panel reflects
-        # what's currently plugged in. Errors (e.g. extcap not installed)
-        # don't block the canvas — the panel just shows whatever's in
-        # the DB from previous sessions.
-        self._refresh_sniffers()
+        # The sniffer panel reads from the DB at startup so the window
+        # appears immediately. Discovery happens on demand via the
+        # "Refresh sniffers" toolbar action — calling the Nordic extcap
+        # synchronously here would block UI launch by tens of seconds
+        # while the extcap probes every serial-class USB device looking
+        # for the sniffer protocol (slow when USB-to-UART bridges like
+        # the Adafruit Bluefruit LE Sniffer are connected).
+        self.sniffer_panel.refresh()
         self.repos.meta.set(self.repos.meta.LAST_PROJECT, str(project_id))
 
     # --- data ---------------------------------------------------------
@@ -945,15 +948,22 @@ class CanvasWindow(QMainWindow):
     def _refresh_sniffers(self) -> None:
         """Re-run discovery, persist into the sniffers table, refresh panel.
 
-        Discovery failure (e.g. extcap binary missing) shouldn't crash the
-        canvas — log it via the status bar and keep what's already in the
-        DB on screen.
+        Uses the fast ``list_dongles_fast()`` path which enumerates USB
+        descriptors via ioreg — instant, no subprocess hang. The slow
+        ``list_dongles()`` path that calls the Nordic extcap binary's
+        --extcap-interfaces probe is reserved for capture-time use, where
+        the user has explicitly asked to start a capture and expects to
+        wait. Discovery for the panel display doesn't need that probe.
+
+        Discovery failure (e.g. ioreg unavailable on a non-macOS host)
+        shouldn't crash the canvas — log it via the status bar and keep
+        what's already in the DB on screen.
         """
         try:
             from ..extcap.discovery import (
-                discovered_to_db_records, list_dongles,
+                discovered_to_db_records, list_dongles_fast,
             )
-            dongles = list_dongles()
+            dongles = list_dongles_fast()
             records = discovered_to_db_records(dongles)
             self.repos.sniffers.record_discovered(records)
         except Exception as e:  # noqa: BLE001

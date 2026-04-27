@@ -589,14 +589,43 @@ def _truncate(s: str, n: int) -> str:
 def _autogen_name(s: Sniffer) -> str:
     """Default label for a sniffer when the user hasn't named it.
 
-    Format: ``<kind>-<short serial>`` so the row is recognizable without
-    exposing the full 16-char chip serial. User can override via
-    Sniffers.set_name().
+    Format: ``<kind>-<short id>`` so the row is recognizable without
+    exposing the full 16-char chip serial.
     """
-    sn = (s.serial_number or "?")
-    short = sn[-6:] if len(sn) >= 6 else sn
     kind = (s.kind or "unknown").replace("_", " ")
-    return f"{kind}-{short}"
+    return f"{kind}-{_short_id(s.serial_number or '')}"
+
+
+def _short_id(sn: str) -> str:
+    """Compact identifier suffix for a sniffer label.
+
+    For real USB iSerials (Nordic / SEGGER) we just take the last 6
+    chars. For path-shaped fallback IDs (Silicon-Labs-bridged sniffers
+    that have no iSerial — Adafruit Bluefruit LE etc.) we strip the
+    macOS-side ``/dev/cu.…`` framing first so users see a meaningful tail
+    like the location-prefix instead of the literal ``-None`` suffix that
+    macOS appends.
+    """
+    if not sn:
+        return "?"
+    # Strip common macOS device-node prefixes when serial_path is being
+    # used as the fallback identifier.
+    for prefix in (
+        "/dev/cu.usbmodem",
+        "/dev/cu.usbserial-",
+        "/dev/cu.SLAB_USBtoUART",
+        "/dev/cu.",
+        "/dev/",
+    ):
+        if sn.startswith(prefix):
+            sn = sn[len(prefix):]
+            break
+    # Strip trailing macOS interface-index decorations.
+    for suffix in ("-None", "-1", "-2", "-3", "-4"):
+        if sn.endswith(suffix):
+            sn = sn[: -len(suffix)]
+            break
+    return sn[-6:] if len(sn) >= 6 else sn
 
 
 def _row_tooltip(s: Sniffer) -> str:

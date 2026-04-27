@@ -2,20 +2,30 @@
 
 Lets us pair an ``extcap`` interface (which only knows the OS-side device
 node like ``/dev/cu.usbmodem...``) with the physical USB unit's serial
-number and Location ID. The Location ID is the stable sort key the
-canvas uses to order sniffers top-to-bottom by physical hub position.
+number and Location ID. Location ID is the stable sort key the canvas
+uses to order sniffers top-to-bottom by physical hub position.
 
 Implementation notes:
   * macOS: parses ``ioreg -p IOUSB -l -w 0`` output. No external
-    dependencies. Same approach we used in this conversation when we
-    walked through detecting the Taidacent dongle.
+    dependencies.
   * Linux / Windows: not yet implemented; ``query()`` returns [] so
     callers degrade gracefully.
 
-Returns one ``UsbDeviceInfo`` per interesting USB descriptor — only
-those with a serial number, since that's what we key sniffer identity
-on. Filters by USB Vendor ID to keep the noise down (Nordic 0x1915,
-SEGGER 0x1366 for the J-Link in the nRF5340 DK).
+We return ALL USB devices we can introspect (any vendor), not just
+Nordic/SEGGER. The reason: BLE sniffers come in three flavors —
+
+  * Native USB on the chip itself (Nordic VID 0x1915 — official PCA10059
+    nRF52840 dongle, Taidacent clones, anything running the Open DFU
+    Bootloader)
+  * Behind an onboard J-Link (SEGGER VID 0x1366 — nRF5340 Audio DK
+    exposes its USB through its onboard SEGGER J-Link debug interface)
+  * Behind a USB-to-UART bridge (Silicon Labs 0x10C4 / FTDI 0x0403 / etc.
+    — the Adafruit Bluefruit LE Sniffer is in this third class: nRF51822
+    has no native USB, so a CP2104 sits between the host and the chip)
+
+Filtering out the third class meant the Adafruit sniffer was invisible
+to our pairing logic. The fix is to surface all devices and let the
+classification step decide what kind each one is.
 """
 from __future__ import annotations
 
@@ -25,11 +35,15 @@ import subprocess
 import sys
 from dataclasses import dataclass
 
-# Vendor IDs we care about. SEGGER appears for the nRF5340 Audio DK
-# (its onboard J-Link debug interface enumerates as a SEGGER device).
+# Vendor IDs we recognize at classification time. NOT used as a query
+# filter anymore — query() returns every device it can see. Listed here
+# so callers can identify what they got. Add more as we encounter them.
 NORDIC_VID = 0x1915
 SEGGER_VID = 0x1366
-_INTERESTING_VIDS = {NORDIC_VID, SEGGER_VID}
+SILABS_VID = 0x10C4   # Silicon Labs CP2102/2104 — Adafruit Bluefruit LE
+FTDI_VID = 0x0403
+PROLIFIC_VID = 0x067B
+CH340_VID = 0x1A86
 
 
 @dataclass(frozen=True)
@@ -83,19 +97,29 @@ def _query_macos() -> list[UsbDeviceInfo]:
     for blk in blocks:
         fields = _parse_ioreg_block(blk)
         vid = _maybe_int(fields.get("idVendor"))
-        if vid is None or vid not in _INTERESTING_VIDS:
+        if vid is None:
+            continue
+        # Skip USB hubs — they have idProduct but typically no useful
+        # iSerial and they're never sniffer endpoints. Recognized by USB
+        # class 0x09 (hub class) where available. Cheap to keep them
+        # filtered out so the device list is just leaf endpoints.
+        usb_class = _maybe_int(fields.get("bDeviceClass"))
+        if usb_class == 0x09:
             continue
         serial = _strip_quotes(fields.get("USB Serial Number")
                                or fields.get("kUSBSerialNumberString"))
-        if not serial:
-            continue
+        # No serial: device-node-name pairing falls back to Location ID.
+        # We still emit a row (empty serial) so the caller can pair by
+        # location_id_hex. This is exactly what makes Adafruit-style
+        # USB-to-UART sniffers show up — their CP2104 chips don't always
+        # publish a serial.
         pid = _maybe_int(fields.get("idProduct")) or 0
         product = _strip_quotes(fields.get("USB Product Name")
                                 or fields.get("kUSBProductString"))
         loc = _maybe_int(fields.get("locationID"))
         loc_hex = f"0x{loc:08x}" if loc is not None else None
         devices.append(UsbDeviceInfo(
-            serial_number=serial,
+            serial_number=serial or "",
             vendor_id=vid,
             product_id=pid,
             product_name=product,

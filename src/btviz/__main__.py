@@ -65,9 +65,14 @@ def main() -> int:
             project_name=args.project,
         )
 
-    # Default: launch GUI.
-    from .ui.app import run_gui
-    return run_gui()
+    # Default (no subcommand): open the canvas with the project picker.
+    # The legacy "Bluetooth Discovery" window (ui.app) was retired —
+    # the canvas does everything it did and more (device-class
+    # enrichment, Auracast extraction, persistent layout, right-click
+    # Follow), and running both at once meant two SnifferProcess pools
+    # fighting over the same FIFOs.
+    from .ui.canvas import run_canvas
+    return run_canvas()
 
 
 if __name__ == "__main__":

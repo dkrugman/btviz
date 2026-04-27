@@ -327,6 +327,19 @@ class SnifferProcess:
                     return
                 magic = struct.unpack("<I", header[:4])[0]
                 little = magic in (0xa1b2c3d4, 0xa1b23c4d)
+                # Log the link-layer type once per sniffer so we can
+                # confirm it's BLUETOOTH_LE_LL_WITH_PHDR (256) — a
+                # different DLT means decode_live_packet's PHDR
+                # assumptions don't apply.
+                dlt_fmt = "<I" if little else ">I"
+                dlt = struct.unpack(dlt_fmt, header[20:24])[0]
+                import sys
+                print(
+                    f"[sniffer] {self._dongle.short_id} pcap "
+                    f"magic=0x{magic:08x} dlt={dlt}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 while not self._stop.is_set():
                     rec_hdr = _read_exact(f, 16)
                     if not rec_hdr or len(rec_hdr) < 16:

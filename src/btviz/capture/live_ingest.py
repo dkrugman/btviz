@@ -81,6 +81,10 @@ class LiveIngest:
         self._session_id: int | None = None
         self._on_source_packet: Callable[[str], None] | None = None
         self._sources: dict[str, _SourceState] = {}
+        # One-shot diagnostic: log the first reject per source so we can
+        # see the byte layout when decode_live_packet returns None for
+        # everything (DLT mismatch, unexpected PHDR variant, etc.).
+        self._dumped_sources: set[str] = set()
         self.stats = LiveIngestStats()
 
     # ------------------------------------------------------------------ API
@@ -140,6 +144,21 @@ class LiveIngest:
         self.stats.packets_received += 1
         decoded = decode_live_packet(pkt.raw, source=pkt.source, ts=pkt.ts)
         if decoded is None:
+            # One-shot per-source hexdump so we can see what the decoder
+            # rejected — distinguishes a DLT / PHDR mismatch (bytes don't
+            # start with the Nordic phdr we expect) from a runtime error.
+            src = pkt.source or "?"
+            if src not in self._dumped_sources:
+                self._dumped_sources.add(src)
+                head = (pkt.raw or b"")[:32]
+                hex_str = " ".join(f"{b:02x}" for b in head)
+                import sys
+                print(
+                    f"[live-decode] reject src={src} "
+                    f"len={len(pkt.raw or b'')} first32={hex_str}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return
         self.stats.packets_decoded += 1
         with self._lock:

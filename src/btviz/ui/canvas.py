@@ -1025,7 +1025,7 @@ class CanvasWindow(QMainWindow):
 
         self._live_action.setText("Stop live")
         self.status.setText(
-            f"  live: capturing on {len(self._coord.dongles)} dongles…"
+            f"  live: capturing on {len(self._coord.dongles)} devices…"
         )
 
     def _stop_live(self) -> None:
@@ -1061,6 +1061,7 @@ class CanvasWindow(QMainWindow):
             stats = self._live.stats
             self.status.setText(
                 f"  live: rx={stats.packets_received:,} "
+                f"dec={stats.packets_decoded:,} "
                 f"rec={stats.packets_recorded:,} "
                 f"drop={stats.packets_dropped} "
                 f"dev={stats.devices_touched} "

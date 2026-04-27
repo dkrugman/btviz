@@ -1,8 +1,13 @@
-"""File ingest pipeline: pcap/pcapng → tshark → normalize → DB.
+"""Ingest pipeline: dissected packets → DB.
 
-Invoked by the ``btviz ingest`` CLI. Writes devices, addresses, session
-observations, and AD-structure-derived identity clues (name, vendor,
-appearance) into the configured store.
+The per-packet ``record_packet()`` function is reused by:
+  * file ingest (``ingest_file``) — drives packets via ``dissect_file()``
+    + ``normalize()`` and writes the whole capture in a single tx.
+  * live capture (``btviz.capture.live_ingest.LiveIngest``) — receives
+    packets from the bus and flushes batches periodically.
+
+Both paths share the same identity-enrichment, Auracast-extraction, and
+observation-aggregation behavior because they share the same helper.
 
 Design notes:
   * Every advertising address becomes a device row. Public / random-static
@@ -10,9 +15,9 @@ Design notes:
     (kind ``unresolved_rpa``); NRPAs key on their current address (kind
     ``nrpa``). IRK resolution later merges RPA-derived device rows into
     their true-identity rows.
-  * The whole ingest runs in a single transaction. WAL mode makes this
-    fine for 10k–100k packets; only revisit if we start ingesting hours
-    of live traffic in one pass.
+  * The file path runs the whole capture in one tx. The live path
+    batches per-flush. WAL mode makes either pattern fine for the
+    expected packet rates.
   * Enrichment (local_name, vendor_id, appearance, OUI vendor) only fires
     when the current packet carries the relevant AD entries, so most
     hot-path packets skip the identity-merge UPDATE entirely.
@@ -20,9 +25,11 @@ Design notes:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from ..capture.packet import Packet
 
 from ..db.repos import Repos
 from ..db.store import Store
@@ -65,6 +72,138 @@ _CLASS_PRECEDENCE: dict[str | None, int] = {
 def _class_precedence(cls: str | None) -> int:
     """Specificity score for a device_class. Higher = more specific."""
     return _CLASS_PRECEDENCE.get(cls, 3)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Reusable per-packet helper — shared by file and live ingest paths
+# ──────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class IngestContext:
+    """Per-session state that lives across packets within one ingest run.
+
+    Both file ingest (single-tx, drains a generator) and live ingest
+    (long-running, periodic flushes) instantiate one of these for the
+    session they're recording into. ``record_packet`` reads/writes the
+    device-state cache and the seen-id sets.
+    """
+    session_id: int
+    seen_device_ids: set[int] = field(default_factory=set)
+    seen_address_ids: set[int] = field(default_factory=set)
+    seen_broadcast_ids: set[int] = field(default_factory=set)
+    # Cache {device_id -> current identity fields} so we only UPDATE when
+    # a new clue actually changes something.
+    device_state: dict[int, dict[str, Any]] = field(default_factory=dict)
+
+
+def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> bool:
+    """Apply one packet's contribution to the DB.
+
+    Returns True if the packet was attributed to a device (observation
+    written), False if skipped (no advertising address, etc.). Does
+    NOT manage transactions — callers are responsible for tx scoping.
+
+    Side effects on ``ctx``:
+      * adds the device id to ``seen_device_ids``
+      * adds the address id to ``seen_address_ids``
+      * caches the device's current identity fields
+      * adds Auracast broadcast ids when an ADV_EXT_IND with BAA service
+        data is seen
+    """
+    if not pkt.adv_addr:
+        return False
+
+    stable_key, kind = _ingest_key(pkt.adv_addr, pkt.adv_addr_type)
+    device = repos.devices.upsert(stable_key, kind, now=pkt.ts)
+    ctx.seen_device_ids.add(device.id)
+
+    addr = repos.addresses.upsert(
+        pkt.adv_addr, pkt.adv_addr_type or "unknown",
+        device.id, now=pkt.ts,
+    )
+    ctx.seen_address_ids.add(addr.id)
+
+    # Identity enrichment: merge AD-derived clues, plus OUI vendor for
+    # public MACs. Skip if nothing changes.
+    clues = _extract_ad_clues(pkt.extras.get("layers", {}))
+    state = ctx.device_state.get(device.id)
+    if state is None:
+        state = {
+            "local_name": device.local_name,
+            "vendor_id": device.vendor_id,
+            "vendor": device.vendor,
+            "oui_vendor": device.oui_vendor,
+            "appearance": device.appearance,
+            "device_class": device.device_class,
+            "model": device.model,
+        }
+        # One-shot OUI lookup per device (public MACs only).
+        if kind == "public_mac" and state["oui_vendor"] is None:
+            ouiv = oui_vendor(pkt.adv_addr)
+            if ouiv:
+                clues.setdefault("oui_vendor", ouiv)
+        ctx.device_state[device.id] = state
+
+    # Appearance → device_class fallback. Fires only when the more
+    # specific Continuity classifier didn't already set a class on
+    # this packet AND the device has no class in the DB yet, so a
+    # narrow class (e.g. airpods) is never downgraded by a generic
+    # category (e.g. media_player) seen later.
+    if (
+        "device_class" not in clues
+        and clues.get("appearance") is not None
+        and not state.get("device_class")
+    ):
+        cls = appearance_to_class(clues["appearance"])
+        if cls:
+            clues["device_class"] = cls
+
+    # Precedence guard: don't downgrade a more-specific device_class.
+    new_class = clues.get("device_class")
+    if new_class is not None:
+        if _class_precedence(new_class) <= _class_precedence(state.get("device_class")):
+            clues.pop("device_class", None)
+
+    updates: dict[str, Any] = {}
+    for k, v in clues.items():
+        if v is not None and v != state.get(k):
+            updates[k] = v
+    # Derive vendor name from vendor_id if we just learned one.
+    if "vendor_id" in updates and state.get("vendor") is None:
+        vname = company_vendor(updates["vendor_id"])
+        if vname:
+            updates["vendor"] = vname
+
+    if updates:
+        repos.devices.merge_identity(device.id, **updates)
+        state.update(updates)
+
+    # Auracast: if this packet carries a Broadcast Audio Announcement,
+    # upsert a row in `broadcasts`. Only ADV_EXT_IND / AUX_ADV_IND packets
+    # carry BAA, so cheap reject for the non-extended-adv hot path.
+    if pkt.pdu_type == "ADV_EXT_IND":
+        ai = parse_auracast(pkt.extras.get("layers", {}))
+        if ai is not None:
+            repos.broadcasts.upsert(
+                ctx.session_id, ai.broadcast_id,
+                broadcaster_device_id=device.id,
+                broadcast_name=ai.broadcast_name,
+                bis_count=ai.bis_count,
+                phy=ai.phy,
+                encrypted=ai.encrypted,
+                ts=pkt.ts,
+            )
+            ctx.seen_broadcast_ids.add(ai.broadcast_id)
+
+    # Observation: per (session, device) aggregate.
+    is_adv = (pkt.pdu_type in _ADV_PDU_TYPES) if pkt.pdu_type else True
+    repos.observations.record_packet(
+        ctx.session_id, device.id,
+        ts=pkt.ts, is_adv=is_adv,
+        rssi=pkt.rssi, channel=pkt.channel, phy=pkt.phy,
+        pdu_type=pkt.pdu_type,
+    )
+    return True
 
 
 @dataclass
@@ -235,14 +374,6 @@ def ingest_file(
     repos = Repos(store)
     t0 = time.monotonic()
 
-    # State that tracks uniqueness / caches identity across packets.
-    seen_device_ids: set[int] = set()
-    seen_address_ids: set[int] = set()
-    seen_broadcast_ids: set[int] = set()
-    # Cache {device_id -> current identity fields} so we only UPDATE when
-    # a new clue actually changes something.
-    device_state: dict[int, dict[str, Any]] = {}
-
     packets_seen = 0
     packets_recorded = 0
     packets_no_addr = 0
@@ -262,6 +393,8 @@ def ingest_file(
             "SELECT COUNT(*) AS n FROM addresses"
         ).fetchone()["n"]
 
+        ctx = IngestContext(session_id=sess.id)
+
         for rec in dissect_file(path, keep_bad_crc=keep_bad_crc):
             packets_seen += 1
             pkt = normalize(rec, source=str(path))
@@ -270,102 +403,8 @@ def ingest_file(
             if not pkt.adv_addr:
                 packets_no_addr += 1
                 continue
-
-            stable_key, kind = _ingest_key(pkt.adv_addr, pkt.adv_addr_type)
-            device = repos.devices.upsert(stable_key, kind, now=pkt.ts)
-            seen_device_ids.add(device.id)
-
-            addr = repos.addresses.upsert(
-                pkt.adv_addr, pkt.adv_addr_type or "unknown",
-                device.id, now=pkt.ts,
-            )
-            seen_address_ids.add(addr.id)
-
-            # Identity enrichment: merge AD-derived clues, plus OUI vendor for
-            # public MACs. Skip if nothing changes.
-            clues = _extract_ad_clues(pkt.extras.get("layers", {}))
-            state = device_state.get(device.id)
-            if state is None:
-                state = {
-                    "local_name": device.local_name,
-                    "vendor_id": device.vendor_id,
-                    "vendor": device.vendor,
-                    "oui_vendor": device.oui_vendor,
-                    "appearance": device.appearance,
-                    "device_class": device.device_class,
-                    "model": device.model,
-                }
-                # One-shot OUI lookup per device (public MACs only).
-                if kind == "public_mac" and state["oui_vendor"] is None:
-                    ouiv = oui_vendor(pkt.adv_addr)
-                    if ouiv:
-                        clues.setdefault("oui_vendor", ouiv)
-                device_state[device.id] = state
-
-            # Appearance → device_class fallback. Fires only when the more
-            # specific Continuity classifier didn't already set a class on
-            # this packet AND the device has no class in the DB yet, so a
-            # narrow class (e.g. airpods) is never downgraded by a generic
-            # category (e.g. media_player) seen later.
-            if (
-                "device_class" not in clues
-                and clues.get("appearance") is not None
-                and not state.get("device_class")
-            ):
-                cls = appearance_to_class(clues["appearance"])
-                if cls:
-                    clues["device_class"] = cls
-
-            # Precedence guard: don't downgrade a more-specific device_class.
-            # E.g. once a packet reveals "mac" (Nearby action 0x0F), a later
-            # packet from the same device that only carries generic Nearby
-            # Info shouldn't overwrite it back to "apple_device".
-            new_class = clues.get("device_class")
-            if new_class is not None:
-                if _class_precedence(new_class) <= _class_precedence(state.get("device_class")):
-                    clues.pop("device_class", None)
-
-            updates: dict[str, Any] = {}
-            for k, v in clues.items():
-                if v is not None and v != state.get(k):
-                    updates[k] = v
-            # Derive vendor name from vendor_id if we just learned one.
-            if "vendor_id" in updates and state.get("vendor") is None:
-                vname = company_vendor(updates["vendor_id"])
-                if vname:
-                    updates["vendor"] = vname
-
-            if updates:
-                repos.devices.merge_identity(device.id, **updates)
-                state.update(updates)
-
-            # Auracast: if this packet carries a Broadcast Audio Announcement
-            # (BAA service data), upsert a row in `broadcasts`. Only ADV_EXT_
-            # IND / AUX_ADV_IND packets carry BAA, so cheap reject for the
-            # non-extended-adv hot path.
-            if pkt.pdu_type == "ADV_EXT_IND":
-                ai = parse_auracast(pkt.extras.get("layers", {}))
-                if ai is not None:
-                    repos.broadcasts.upsert(
-                        sess.id, ai.broadcast_id,
-                        broadcaster_device_id=device.id,
-                        broadcast_name=ai.broadcast_name,
-                        bis_count=ai.bis_count,
-                        phy=ai.phy,
-                        encrypted=ai.encrypted,
-                        ts=pkt.ts,
-                    )
-                    seen_broadcast_ids.add(ai.broadcast_id)
-
-            # Observation: per (session, device) aggregate.
-            is_adv = (pkt.pdu_type in _ADV_PDU_TYPES) if pkt.pdu_type else True
-            repos.observations.record_packet(
-                sess.id, device.id,
-                ts=pkt.ts, is_adv=is_adv,
-                rssi=pkt.rssi, channel=pkt.channel, phy=pkt.phy,
-                pdu_type=pkt.pdu_type,
-            )
-            packets_recorded += 1
+            if record_packet(repos, ctx, pkt):
+                packets_recorded += 1
 
         repos.sessions.end(sess.id)
         repos.projects.touch(proj.id)
@@ -386,8 +425,8 @@ def ingest_file(
         packets_recorded=packets_recorded,
         packets_no_addr=packets_no_addr,
         devices_new=devices_after - devices_new_before,
-        devices_touched=len(seen_device_ids),
+        devices_touched=len(ctx.seen_device_ids),
         addresses_new=addresses_after - addresses_before,
-        broadcasts_seen=len(seen_broadcast_ids),
+        broadcasts_seen=len(ctx.seen_broadcast_ids),
         duration_s=time.monotonic() - t0,
     )

@@ -34,12 +34,14 @@ from PySide6.QtWidgets import (
     QGraphicsItem,
     QGraphicsScene,
     QGraphicsView,
+    QHBoxLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
     QPushButton,
     QToolBar,
     QVBoxLayout,
+    QWidget,
 )
 
 from ..bus import EventBus
@@ -867,19 +869,21 @@ class CanvasWindow(QMainWindow):
         self.view.setRenderHints(
             QPainter.Antialiasing | QPainter.TextAntialiasing
         )
-        self.setCentralWidget(self.view)
 
-        # Sniffer panel — overlay child of the view's viewport, hugging
-        # the left edge. Always visible; chevron toggles expansion.
+        # Sniffer panel + canvas view live side by side in a HBoxLayout
+        # so expanding the panel pushes canvas content right rather than
+        # covering it. The panel reports its current width via sizeHint,
+        # the view takes the remaining space.
         from .sniffer_panel import SnifferPanel
-        self.sniffer_panel = SnifferPanel(self.view.viewport(), store)
-        self.sniffer_panel.show()
-        # Keep the panel hugging the viewport's left edge as the window
-        # resizes. We can't use a layout (the view is the central widget,
-        # the panel is an absolute-positioned overlay child of viewport),
-        # so we route resizeEvent through to the panel's reposition().
-        self._install_panel_reposition_filter()
-        self._reposition_panel()
+        self.sniffer_panel = SnifferPanel(store=store)
+
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.sniffer_panel)
+        layout.addWidget(self.view, 1)  # stretch factor 1 → view fills the rest
+        self.setCentralWidget(central)
 
         # Live-capture state. Created on first Start; recycled across
         # Start/Stop toggles within the same CanvasWindow instance.
@@ -960,29 +964,6 @@ class CanvasWindow(QMainWindow):
         # Touch the project so most-recent-used ordering stays meaningful.
         self.repos.projects.touch(self.project_id)
 
-    # --- sniffer panel ------------------------------------------------
-
-    def _install_panel_reposition_filter(self) -> None:
-        """Forward viewport resizes to the SnifferPanel so it tracks the
-        left edge. We can't put it in a layout (it overlays the viewport),
-        so we drive its geometry from the viewport's resize event."""
-        viewport = self.view.viewport()
-        viewport.installEventFilter(self)
-
-    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt naming)
-        from PySide6.QtCore import QEvent
-        if obj is self.view.viewport() and event.type() == QEvent.Type.Resize:
-            self._reposition_panel()
-        return super().eventFilter(obj, event)
-
-    def _reposition_panel(self) -> None:
-        """Snap the sniffer panel to the viewport's left edge at full height."""
-        if not hasattr(self, "sniffer_panel"):
-            return
-        rect = self.view.viewport().rect()
-        self.sniffer_panel.reposition(QRectF(rect))
-        self.sniffer_panel.raise_()  # stay above scene content
-
     # --- live capture -------------------------------------------------
 
     def _toggle_live(self) -> None:
@@ -1044,10 +1025,22 @@ class CanvasWindow(QMainWindow):
         # under heavy adv traffic.
         self._live_timer.start(250)
 
-        self._live_action.setText("Stop live")
-        self.status.setText(
-            f"  live: capturing on {len(self._coord.dongles)} devices…"
+        # Count what actually started — with N dongles and 3 primary
+        # advertising channels, default_roles pins 3 and parks the rest
+        # as ScanUnmonitored, which only spin up if a primary frees
+        # (e.g. when one is re-tasked to Follow). Reserved sniffers are
+        # idle subprocesses that haven't been started yet.
+        running = sum(
+            1 for sp in self._coord.sniffers.values() if sp.state.running
         )
+        total = len(self._coord.dongles)
+        reserved = total - running
+        msg = f"  live: capturing on {running} of {total} devices"
+        if reserved > 0:
+            msg += f" ({reserved} reserved for follow)"
+        msg += "…"
+        self._live_action.setText("Stop live")
+        self.status.setText(msg)
 
     def _stop_live(self) -> None:
         if self._live_timer is not None:
@@ -1086,6 +1079,8 @@ class CanvasWindow(QMainWindow):
                 f"rec={stats.packets_recorded:,} "
                 f"drop={stats.packets_dropped} "
                 f"dev={stats.devices_touched} "
+                f"ext={stats.ext_adv_seen}"
+                f"({stats.ext_adv_with_baa} baa) "
                 f"bcast={stats.broadcasts_seen}"
             )
 

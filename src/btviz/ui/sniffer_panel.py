@@ -26,9 +26,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from PySide6.QtCore import QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ..db.models import Sniffer
 from ..db.repos import Repos
@@ -49,7 +49,10 @@ _CHEVRON_H = 28
 
 # Shape geometry (expanded mode). Dongles are 1:3, DKs ~1:2.15 — actual
 # aspect ratios of the hardware so the silhouettes read at a glance.
-_SHAPE_X = 26                  # left edge of the silhouette column
+# _SHAPE_X is offset enough from the activity-dot column (centered at
+# _STRIP_W / 2) that the dot doesn't crowd the silhouette in expanded
+# mode.
+_SHAPE_X = 38                  # left edge of the silhouette column
 _SHAPE_W = 54                  # silhouette width
 _DONGLE_H = int(_SHAPE_W / 3.0)        # = 18
 _DK_H = int(_SHAPE_W / 2.15)           # = 25
@@ -100,20 +103,25 @@ _FLASH_DURATION_S = 0.6
 # ──────────────────────────────────────────────────────────────────────────
 
 class SnifferPanel(QWidget):
-    """Left-edge overlay on the canvas. Shows registered sniffers as a
-    vertical strip of activity dots, with a chevron to expand into a
-    detail view (Phase 3).
+    """Left-side panel showing registered sniffers as a vertical strip of
+    activity dots, with a chevron to expand into a detail view.
 
-    Owners must call ``reposition(viewport_rect)`` on canvas resize so
-    the panel hugs the left edge at the right height.
+    Designed to live in a QHBoxLayout next to the canvas view — its
+    width comes from ``sizeHint()`` (``_STRIP_W`` collapsed, ``_PANEL_W``
+    expanded). Toggling expansion calls ``updateGeometry()`` so the
+    parent layout re-asks for the new width and the canvas widget
+    flexes to fit the remaining space.
     """
 
     # Emitted when the user toggles expansion. The CanvasWindow can use
     # this to e.g. re-size the scene viewport, save state to DB, etc.
     expansionChanged = Signal(bool)
 
-    def __init__(self, parent: QWidget, store: Store) -> None:
+    def __init__(self, parent: QWidget | None = None,
+                 store: Store | None = None) -> None:
         super().__init__(parent)
+        if store is None:
+            raise ValueError("SnifferPanel requires a Store")
         self.store = store
         self.repos = Repos(store)
 
@@ -135,6 +143,10 @@ class SnifferPanel(QWidget):
         self._anim.setInterval(50)  # 20 Hz — plenty for fading dots
         self._anim.timeout.connect(self._tick)
 
+        # Width is owned by sizeHint(); height stretches with the
+        # parent layout. Fixed-horizontal so a HBoxLayout doesn't try
+        # to negotiate with us when the canvas window resizes.
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
@@ -147,7 +159,6 @@ class SnifferPanel(QWidget):
         self._sniffers = self.repos.sniffers.list_all(
             active_only=False, include_removed=False
         )
-        self._resize_to_state()
         self.update()
 
     def notify_packet(self, serial_number: str) -> None:
@@ -170,29 +181,30 @@ class SnifferPanel(QWidget):
         if self._expanded == expanded:
             return
         self._expanded = expanded
-        self._resize_to_state()
+        # updateGeometry() invalidates the cached sizeHint so the parent
+        # layout re-queries us at our new width. The canvas view (the
+        # other layout child) then flexes to fill the remaining space —
+        # which is the "push canvas content over" behavior, as opposed
+        # to the old overlay style that covered it.
+        self.updateGeometry()
         self.update()
         self.expansionChanged.emit(expanded)
 
     def toggle(self) -> None:
         self.set_expanded(not self._expanded)
 
-    def reposition(self, viewport_rect: QRectF) -> None:
-        """Hug the left edge at the parent viewport's full height."""
-        h = int(viewport_rect.height())
-        w = self._current_width()
-        self.setGeometry(0, 0, w, h)
+    # --- size negotiation --------------------------------------------
+
+    def sizeHint(self) -> QSize:
+        return QSize(self._current_width(), 0)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self._current_width(), 0)
 
     # --- internals ----------------------------------------------------
 
     def _current_width(self) -> int:
         return _PANEL_W if self._expanded else _STRIP_W
-
-    def _resize_to_state(self) -> None:
-        if self.parentWidget() is None:
-            return
-        h = self.parentWidget().height()
-        self.setGeometry(0, 0, self._current_width(), h)
 
     def _tick(self) -> None:
         """Animation tick. Stops itself when no flashes are still decaying."""

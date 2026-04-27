@@ -49,6 +49,8 @@ class LiveIngestStats:
     last_flush_size: int = 0
     devices_touched: int = 0      # distinct device ids over the session
     broadcasts_seen: int = 0
+    ext_adv_seen: int = 0         # ADV_EXT_IND / AUX_ADV_IND packets observed
+    ext_adv_with_baa: int = 0     # subset that carried BAA service data
 
 
 @dataclass
@@ -209,4 +211,6 @@ class LiveIngest:
         self.stats.last_flush_size = len(batch)
         self.stats.devices_touched = len(self._ctx.seen_device_ids)
         self.stats.broadcasts_seen = len(self._ctx.seen_broadcast_ids)
+        self.stats.ext_adv_seen = self._ctx.ext_adv_count
+        self.stats.ext_adv_with_baa = self._ctx.ext_adv_with_baa
         return recorded

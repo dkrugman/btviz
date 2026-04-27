@@ -948,15 +948,22 @@ class CanvasWindow(QMainWindow):
     def _refresh_sniffers(self) -> None:
         """Re-run discovery, persist into the sniffers table, refresh panel.
 
-        Discovery failure (e.g. extcap binary missing) shouldn't crash the
-        canvas — log it via the status bar and keep what's already in the
-        DB on screen.
+        Uses the fast ``list_dongles_fast()`` path which enumerates USB
+        descriptors via ioreg — instant, no subprocess hang. The slow
+        ``list_dongles()`` path that calls the Nordic extcap binary's
+        --extcap-interfaces probe is reserved for capture-time use, where
+        the user has explicitly asked to start a capture and expects to
+        wait. Discovery for the panel display doesn't need that probe.
+
+        Discovery failure (e.g. ioreg unavailable on a non-macOS host)
+        shouldn't crash the canvas — log it via the status bar and keep
+        what's already in the DB on screen.
         """
         try:
             from ..extcap.discovery import (
-                discovered_to_db_records, list_dongles,
+                discovered_to_db_records, list_dongles_fast,
             )
-            dongles = list_dongles()
+            dongles = list_dongles_fast()
             records = discovered_to_db_records(dongles)
             self.repos.sniffers.record_discovered(records)
         except Exception as e:  # noqa: BLE001

@@ -141,6 +141,104 @@ def list_dongles(
     return found
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Fast discovery path — pure USB descriptor enumeration, no extcap probe.
+# ──────────────────────────────────────────────────────────────────────────
+#
+# Why this exists: ``list_dongles()`` calls the Nordic extcap binary's
+# ``--extcap-interfaces`` mode, which probes every serial-class USB device
+# on the system looking for the sniffer protocol. Probes serialize, and
+# non-Nordic devices (USB-to-UART bridges, Thunderbolt audio, USB cameras
+# with serial endpoints) make the probe wait for replies that never come.
+# In practice the call hangs indefinitely on busy hubs.
+#
+# For *display* purposes — populating the sniffer panel so the user knows
+# what's plugged in — we don't need to validate sniffer-protocol response.
+# We just need the list of plugged-in USB devices that LOOK like sniffers.
+# ``ioreg`` answers that instantly.
+#
+# At capture time, when the user actually wants to start sniffing, we'd
+# still call the extcap (though that's a single-target invocation with
+# ``--extcap-interface <id>``, not the full enumerate-everything probe).
+
+# VID/product hints that identify a sniffer candidate at the USB level.
+# Order matters: more-specific hints first.
+_SNIFFER_VID_HINTS: tuple[tuple[int, str, str], ...] = (
+    # (vendor_id, kind, default_display)
+    (usb_info.SEGGER_VID,    "dk",     "SEGGER J-Link (nRF5340 DK)"),
+    (usb_info.NORDIC_VID,    "dongle", "Nordic nRF Sniffer dongle"),
+    (usb_info.SILABS_VID,    "dongle", "Silicon Labs USB-to-UART (Adafruit Bluefruit LE)"),
+    (usb_info.FTDI_VID,      "dongle", "FTDI USB-to-UART"),
+    (usb_info.PROLIFIC_VID,  "dongle", "Prolific USB-to-UART"),
+    (usb_info.CH340_VID,     "dongle", "CH340 USB-to-UART"),
+)
+
+
+def list_dongles_fast() -> list[Dongle]:
+    """Enumerate sniffer candidates from USB descriptors only (no extcap).
+
+    Fast path used by the canvas's panel refresh — completes in tens of
+    milliseconds and never hangs. Returns one ``Dongle`` per recognized
+    USB device (Nordic / SEGGER / common USB-to-UART bridges).
+
+    The ``serial_path`` field is set to the device-node path when we can
+    construct it (``/dev/cu.usbmodem<iSerial>1`` for iSerial-bearing
+    devices), or to a synthetic ``ioreg:loc=<location>`` token when not.
+    The extcap interface_id is left blank — only needed at capture time,
+    when the slow ``list_dongles()`` is used to resolve it via the real
+    extcap probe.
+
+    Sort order matches ``list_dongles()``: by Location ID, then serial.
+    """
+    usb_devices = usb_info.query()
+    if not usb_devices:
+        return []
+
+    found: list[Dongle] = []
+    for u in usb_devices:
+        kind, display = _hint_for_vid(u.vendor_id)
+        if kind is None:
+            continue
+        # Refine kind for SEGGER/Nordic via product name; classify_kind
+        # lifts "dk" out of the Nordic-VID bucket if needed (and vice versa).
+        kind = _classify_kind(u)
+        # Synthesize a device-node-like serial_path. Real extcap-derived
+        # paths look like /dev/cu.usbmodem<serial>1; we follow the same
+        # shape when we have an iSerial, and fall back to a deterministic
+        # ioreg-based identifier for serial-less devices so the row is
+        # still uniquely keyed.
+        if u.serial_number:
+            serial_path = f"/dev/cu.usbmodem{u.serial_number}1"
+        elif u.location_id_hex:
+            serial_path = f"ioreg:loc={u.location_id_hex}"
+        else:
+            serial_path = f"ioreg:vid={u.vendor_id:04x}:pid={u.product_id:04x}"
+        found.append(Dongle(
+            interface_id="",  # resolved at capture time
+            display=u.product_name or display,
+            serial_path=serial_path,
+            serial_number=u.serial_number or None,
+            location_id_hex=u.location_id_hex,
+            usb_product=u.product_name,
+            kind=kind,
+        ))
+
+    found.sort(key=lambda d: (
+        d.location_id_hex is None,
+        d.location_id_hex or "",
+        d.serial_path,
+    ))
+    return found
+
+
+def _hint_for_vid(vid: int) -> tuple[str | None, str | None]:
+    """Return (kind, display) hint for a recognized vendor, else (None, None)."""
+    for v, kind, display in _SNIFFER_VID_HINTS:
+        if vid == v:
+            return kind, display
+    return None, None
+
+
 def _dedupe_slab_usbtouart_aliases(dongles: list[Dongle]) -> list[Dongle]:
     """Drop SLAB_USBtoUART aliases when an equivalent usbserial node exists.
 

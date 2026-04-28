@@ -19,7 +19,6 @@ from typing import Any
 
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import (
-    QAction,
     QBrush,
     QColor,
     QFont,
@@ -39,6 +38,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QPushButton,
     QToolBar,
     QVBoxLayout,
@@ -765,16 +765,17 @@ class DeviceItem(QGraphicsItem):
         self._persist_moved_selection()
 
     def contextMenuEvent(self, event) -> None:
-        """Right-click → menu of device actions, populated by the scene."""
+        """Right-click → menu of device actions, built by the scene.
+
+        The callback returns a fully-assembled ``QMenu`` (rather than a
+        list of actions) so it can include submenus — the Copy submenu
+        is built that way.
+        """
         if self._context_cb is None:
             return
-        actions = self._context_cb(self.device)
-        if not actions:
+        menu = self._context_cb(self.device)
+        if menu is None:
             return
-        from PySide6.QtWidgets import QMenu
-        menu = QMenu()
-        for a in actions:
-            menu.addAction(a)
         menu.exec(event.screenPos())
         event.accept()
 
@@ -1126,7 +1127,7 @@ class CanvasWindow(QMainWindow):
             if d.hidden:
                 continue
             item = DeviceItem(d, self._persist_device,
-                              context_cb=self._device_context_actions)
+                              context_cb=self._device_context_menu)
             self.scene.addItem(item)
         # Status reflects what's actually on the canvas — `len(devs)` would
         # include hidden devices (rows with hidden=1 in device_layouts) that
@@ -1363,10 +1364,12 @@ class CanvasWindow(QMainWindow):
 
     # --- device context menu / follow --------------------------------
 
-    def _device_context_actions(self, device: CanvasDevice) -> list[QAction]:
-        """Build the right-click menu actions for one DeviceItem.
+    def _device_context_menu(self, device: CanvasDevice) -> QMenu:
+        """Build the right-click menu for one DeviceItem.
 
-        Two entries today:
+        Returns a fully-assembled ``QMenu`` so the canvas can include
+        submenus (rather than just a flat list of actions). Entries:
+
           * ``Rename device…`` — sets a per-device ``user_name`` that
             wins over every automatic naming source (local_name,
             gatt_device_name, broadcast_name, vendor+model fallback).
@@ -1375,8 +1378,12 @@ class CanvasWindow(QMainWindow):
             post-CONNECT_IND data-channel traffic and (with an IRK
             loaded) resolving its rotating RPAs back to a stable
             identity. Disabled when prerequisites aren't met.
+          * ``Copy ▶`` submenu — Address / Name / Stable key /
+            All info (the multi-line tooltip we already build).
         """
-        rename_action = QAction("Rename device…", self)
+        menu = QMenu()
+
+        rename_action = menu.addAction("Rename device…")
         rename_action.setToolTip(
             "Set a custom name for this device. Wins over every "
             "automatic naming source (local name, GATT name, vendor)."
@@ -1385,7 +1392,7 @@ class CanvasWindow(QMainWindow):
             lambda checked=False, d=device: self._rename_device(d)
         )
 
-        follow_action = QAction("Follow this device", self)
+        follow_action = menu.addAction("Follow this device")
         if self._coord is None or self._live is None or not self._live.running:
             follow_action.setEnabled(False)
             follow_action.setToolTip(
@@ -1407,7 +1414,52 @@ class CanvasWindow(QMainWindow):
                 lambda checked=False, a=addr, r=is_random:
                     self._follow_device(a, r)
             )
-        return [rename_action, follow_action]
+
+        menu.addSeparator()
+        copy_menu = menu.addMenu("Copy")
+
+        # Most-recent address (addresses[0]; load_canvas_devices sorts
+        # them by last_seen DESC). Disabled when the device has none.
+        addr_str = device.addresses[0][0] if device.addresses else ""
+        addr_action = copy_menu.addAction("Address")
+        if addr_str:
+            addr_action.triggered.connect(
+                lambda checked=False, s=addr_str: self._copy_to_clipboard(s)
+            )
+        else:
+            addr_action.setEnabled(False)
+
+        name_str = _pick_display_label(device)
+        name_action = copy_menu.addAction("Name")
+        name_action.triggered.connect(
+            lambda checked=False, s=name_str: self._copy_to_clipboard(s)
+        )
+
+        key_action = copy_menu.addAction("Stable key")
+        key_action.triggered.connect(
+            lambda checked=False, s=device.stable_key: self._copy_to_clipboard(s)
+        )
+
+        all_action = copy_menu.addAction("All info (tooltip)")
+        all_action.triggered.connect(
+            lambda checked=False, d=device: self._copy_to_clipboard(_build_tooltip(d))
+        )
+
+        return menu
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        """Put ``text`` on the system clipboard and surface what was
+        copied via the toolbar status line.
+
+        Long values (the All-info tooltip) get truncated in the
+        confirmation message so the status bar doesn't blow out width.
+        """
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        first_line = text.splitlines()[0] if "\n" in text else text
+        snippet = first_line if len(first_line) <= 60 else first_line[:57] + "…"
+        self.status.setText(f"  copied: {snippet}")
 
     def _rename_device(self, device: CanvasDevice) -> None:
         """Prompt for a new ``user_name`` and persist via the devices repo.

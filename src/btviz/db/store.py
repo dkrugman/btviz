@@ -9,12 +9,61 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH_ENV = "BTVIZ_DB_PATH"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 # Incremental migrations applied to existing DBs to bring them up to
 # ``SCHEMA_VERSION``. Fresh DBs get the full schema.sql (which already
 # contains everything through SCHEMA_VERSION) and skip these.
+_V2_TO_V3_SQL = """
+CREATE TABLE device_ad_history (
+    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    ad_type     INTEGER NOT NULL,
+    ad_value    BLOB    NOT NULL,
+    first_seen  REAL    NOT NULL,
+    last_seen   REAL    NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (device_id, ad_type, ad_value)
+);
+CREATE INDEX idx_dah_type ON device_ad_history(ad_type);
+
+CREATE TABLE packets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL REFERENCES sessions(id)  ON DELETE CASCADE,
+    device_id   INTEGER NOT NULL REFERENCES devices(id)   ON DELETE CASCADE,
+    address_id  INTEGER NOT NULL REFERENCES addresses(id) ON DELETE CASCADE,
+    ts          REAL    NOT NULL,
+    rssi        INTEGER NOT NULL,
+    channel     INTEGER NOT NULL,
+    pdu_type    INTEGER NOT NULL,
+    sniffer_id  INTEGER REFERENCES sniffers(id),
+    raw         BLOB
+);
+CREATE INDEX idx_packets_device_ts  ON packets(device_id,  ts);
+CREATE INDEX idx_packets_sniffer_ts ON packets(sniffer_id, ts);
+CREATE INDEX idx_packets_session_ts ON packets(session_id, ts);
+
+CREATE TABLE device_clusters (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    label           TEXT,
+    created_at      REAL NOT NULL,
+    last_decided_at REAL NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'auto'
+);
+
+CREATE TABLE device_cluster_members (
+    cluster_id    INTEGER NOT NULL REFERENCES device_clusters(id) ON DELETE CASCADE,
+    device_id     INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    score         REAL,
+    contributions TEXT,
+    profile       TEXT,
+    decided_at    REAL NOT NULL,
+    decided_by    TEXT NOT NULL DEFAULT 'auto',
+    PRIMARY KEY (cluster_id, device_id)
+);
+CREATE INDEX idx_dcm_device ON device_cluster_members(device_id);
+"""
+
 _V1_TO_V2_SQL = """
 CREATE TABLE sniffers (
     id              INTEGER PRIMARY KEY,
@@ -78,6 +127,10 @@ class Store:
             self.conn.executescript(_V1_TO_V2_SQL)
             self.conn.execute("PRAGMA user_version = 2")
             version = 2
+        if version == 2:
+            self.conn.executescript(_V2_TO_V3_SQL)
+            self.conn.execute("PRAGMA user_version = 3")
+            version = 3
         if version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unknown db schema version {version}; app expects {SCHEMA_VERSION}"

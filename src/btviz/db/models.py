@@ -233,6 +233,52 @@ class BroadcastReceiver:
     rssi_avg: float | None = None
 
 
+# --- RPA collapse / cluster framework -------------------------------------
+
+@dataclass
+class DeviceAdHistory:
+    device_id:  int
+    ad_type:    int      # BLE AD type byte
+    ad_value:   bytes    # raw payload
+    first_seen: float
+    last_seen:  float
+    count:      int = 1
+
+
+@dataclass
+class Packet:
+    id:         int | None
+    session_id: int
+    device_id:  int
+    address_id: int
+    ts:         float
+    rssi:       int
+    channel:    int
+    pdu_type:   int
+    sniffer_id: int | None = None
+    raw:        bytes | None = None
+
+
+@dataclass
+class DeviceCluster:
+    id:              int | None
+    created_at:      float
+    last_decided_at: float
+    source:          str = "auto"   # 'auto' | 'manual' | 'irk'
+    label:           str | None = None
+
+
+@dataclass
+class DeviceClusterMember:
+    cluster_id:    int
+    device_id:     int
+    decided_at:    float
+    score:         float | None = None
+    contributions: dict | None = None  # {signal: [score, weight]}
+    profile:       str | None = None
+    decided_by:    str = "auto"
+
+
 # --- physical sniffers -----------------------------------------------------
 
 @dataclass

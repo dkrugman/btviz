@@ -26,6 +26,19 @@ useful diff against the codebase.
       train, structurally complex; needs PA-syncing toolkit firmware
       feeding the same DB before it pays off.
 
+## Capture / discovery
+
+- [ ] **Switch live discovery to `list_dongles_fast()` (ioreg) instead
+      of `list_dongles()` (slow extcap probe).** The slow probe has
+      now demonstrably failed multiple times — it both under-counts
+      (silently omitting Nordic dongles whose firmware is in a hung
+      state) and *mis-attributes* (labels Adafruit + DK as "nRF
+      Sniffer for Bluetooth LE"). The fast probe reads USB descriptors
+      directly via ioreg and has been reliable. Switch live capture's
+      `CaptureCoordinator.refresh_dongles` to fast-probe; keep slow
+      probe as a fallback for non-macOS platforms (ioreg is macOS-only)
+      and for devices where we need extcap-supplied interface_id paths.
+
 ## Canvas UX
 
 - [ ] **`apply_grid_layout` collision avoidance.** When a subset of
@@ -36,6 +49,18 @@ useful diff against the codebase.
       occupied grid slots when laying out unplaced devices, or shift
       the saved-position devices to vacant slots. "Reset layout" is
       the user-facing workaround today.
+- [ ] **[done in branch]** Visible fast-vs-slow discovery mismatch
+      in the sniffer panel — sniffer rows that fast-discovery found
+      but slow-discovery couldn't probe show
+      `"USB-detected but not responding to extcap probe — try replug
+      to recover."` in their tooltip. Implementation:
+      `feat/visible-extcap-discovery-mismatch`.
+- [ ] **[done in branch]** Surface `SnifferProcess` startup errors in
+      the toolbar status. Canvas now subscribes to
+      `TOPIC_SNIFFER_STATE` while live is running and shows
+      `state.last_error` when it appears, instead of letting the
+      capture-loop exit silently. Implementation:
+      `feat/visible-extcap-discovery-mismatch`.
 - [ ] **Smooth slide animation for sniffer panel toggle.** Currently
       an instant snap — `QPropertyAnimation` on `maximumWidth` driving
       the `QHBoxLayout` reflow would make it feel deliberate.

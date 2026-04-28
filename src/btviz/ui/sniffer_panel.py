@@ -136,6 +136,14 @@ class SnifferPanel(QWidget):
         # the destructive button in red on hover.
         self._x_btn_hover_idx: int | None = None
 
+        # Set of serial_numbers (DB column) that fast/USB discovery
+        # turned up but the slow extcap probe couldn't reach. Populated
+        # by ``set_extcap_unreachable`` after a live-capture start
+        # discovery sweep. Surfaced as a warning line in the row
+        # tooltip — visually nothing changes today, the dot stays gray
+        # because no packets flow.
+        self._extcap_unreachable: set[str] = set()
+
         # Repaint timer — keeps the flash decay smooth without us having
         # to push frames from the bus thread. Runs only while the panel
         # has any active flash; stopped otherwise to keep CPU idle.
@@ -173,6 +181,19 @@ class SnifferPanel(QWidget):
             self._anim.start()
         # No update() here — the timer paints; calling update on every
         # packet would saturate the event loop on heavy traffic.
+
+    def set_extcap_unreachable(self, serials: set[str]) -> None:
+        """Mark sniffers that USB discovery saw but extcap couldn't probe.
+
+        These rows render the same as inactive ones today (grey dot,
+        dim silhouette), but their tooltip carries an extra line
+        explaining the mismatch and suggesting recovery. Pass an empty
+        set to clear the marking (e.g. when live capture stops).
+        """
+        if self._extcap_unreachable == serials:
+            return
+        self._extcap_unreachable = set(serials)
+        self.update()
 
     def is_expanded(self) -> bool:
         return self._expanded
@@ -562,7 +583,10 @@ class SnifferPanel(QWidget):
         # Tooltip swaps as cursor enters / leaves rows.
         s = self._row_at(pos)
         if s is not None:
-            new_tt = _row_tooltip(s)
+            unreachable = bool(
+                s.serial_number and s.serial_number in self._extcap_unreachable
+            )
+            new_tt = _row_tooltip(s, extcap_unreachable=unreachable)
             if self.toolTip() != new_tt:
                 self.setToolTip(new_tt)
         else:
@@ -640,11 +664,14 @@ def _short_id(sn: str) -> str:
     return sn[-6:] if len(sn) >= 6 else sn
 
 
-def _row_tooltip(s: Sniffer) -> str:
+def _row_tooltip(s: Sniffer, *, extcap_unreachable: bool = False) -> str:
     """Multi-line tooltip with the full identity for a sniffer row.
 
     Shown on hover so any truncated value in the rendered row is
-    available in full.
+    available in full. ``extcap_unreachable`` adds a warning when fast
+    USB discovery saw the dongle but the slow extcap probe couldn't
+    reach it (typically a Nordic-firmware hung state that a replug
+    clears).
     """
     lines: list[str] = []
     lines.append(s.name or _autogen_name(s))
@@ -667,4 +694,10 @@ def _row_tooltip(s: Sniffer) -> str:
     if s.removed:
         state.append("removed (hidden)")
     lines.append(f"State:       {', '.join(state)}")
+    if extcap_unreachable:
+        lines.append("─" * 32)
+        lines.append(
+            "⚠ USB-detected but not responding to extcap probe — "
+            "try replug to recover."
+        )
     return "\n".join(lines)

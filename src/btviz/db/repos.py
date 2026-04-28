@@ -1087,6 +1087,68 @@ class Meta:
         )
 
 
+# --- cluster framework tables ----------------------------------------------
+
+class AdHistory:
+    """Upserts per-device AD-type vocabulary into device_ad_history."""
+
+    def __init__(self, store: Store) -> None:
+        self.s = store
+
+    def upsert_many(
+        self,
+        device_id: int,
+        entries: list[tuple[int, bytes]],
+        ts: float,
+    ) -> None:
+        """Insert or update (device_id, ad_type, ad_value) rows.
+
+        ``entries`` is a list of (ad_type, ad_value_bytes) pairs. The
+        on-conflict clause bumps last_seen and count for re-observed entries.
+        """
+        self.s.conn.executemany(
+            """
+            INSERT INTO device_ad_history
+                (device_id, ad_type, ad_value, first_seen, last_seen, count)
+            VALUES (?, ?, ?, ?, ?, 1)
+            ON CONFLICT (device_id, ad_type, ad_value) DO UPDATE SET
+                last_seen = excluded.last_seen,
+                count     = count + 1
+            """,
+            [(device_id, ad_type, ad_value, ts, ts) for ad_type, ad_value in entries],
+        )
+
+
+class Packets:
+    """Inserts per-packet event rows into packets."""
+
+    def __init__(self, store: Store) -> None:
+        self.s = store
+
+    def insert(
+        self,
+        session_id: int,
+        device_id: int,
+        address_id: int,
+        ts: float,
+        rssi: int,
+        channel: int,
+        pdu_type: int,
+        sniffer_id: int | None = None,
+        raw: bytes | None = None,
+    ) -> None:
+        self.s.conn.execute(
+            """
+            INSERT INTO packets
+                (session_id, device_id, address_id, ts, rssi, channel,
+                 pdu_type, sniffer_id, raw)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (session_id, device_id, address_id, ts, rssi, channel,
+             pdu_type, sniffer_id, raw),
+        )
+
+
 # --- umbrella convenience --------------------------------------------------
 
 class Repos:
@@ -1105,3 +1167,5 @@ class Repos:
         self.broadcasts = Broadcasts(store)
         self.sniffers = Sniffers(store)
         self.meta = Meta(store)
+        self.ad_history = AdHistory(store)
+        self.packets = Packets(store)

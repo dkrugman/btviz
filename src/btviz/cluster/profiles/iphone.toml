@@ -1,0 +1,19 @@
+[iphone]
+threshold = 0.75
+min_total_weight = 0.50
+
+[iphone.weights]
+apple_continuity  = 0.40
+rssi_signature    = 0.25
+rotation_cohort   = 0.15
+mfg_data_prefix   = 0.10
+adv_interval      = 0.05
+pdu_distribution  = 0.05
+
+[iphone.params.rotation_cohort]
+expected_rotation = 900.0
+window_min        = 0.05
+window_max        = 180.0
+
+[iphone.params.adv_interval]
+ppm_full_mismatch = 400.0

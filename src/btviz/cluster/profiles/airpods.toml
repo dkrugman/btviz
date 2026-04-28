@@ -1,0 +1,21 @@
+[airpods]
+threshold = 0.75
+min_total_weight = 0.50
+required_for_merge = ["apple_continuity"]
+
+[airpods.weights]
+apple_continuity  = 0.50
+rssi_signature    = 0.20
+rotation_cohort   = 0.15
+mfg_data_prefix   = 0.10
+adv_interval      = 0.05
+
+[airpods.params.rotation_cohort]
+expected_rotation = 900.0
+window_min        = 0.05
+window_max        = 600.0
+
+[airpods.params.rssi_signature]
+min_sniffers      = 2
+std_floor         = 2.5
+recent_window     = 60.0

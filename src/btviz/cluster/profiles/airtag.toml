@@ -1,0 +1,26 @@
+[airtag]
+threshold = 0.70
+min_total_weight = 0.50
+required_eventually = ["rotation_cohort"]
+
+[airtag.weights]
+rotation_cohort   = 0.35
+rssi_signature    = 0.25
+status_byte_match = 0.20
+apple_continuity  = 0.10
+adv_interval      = 0.05
+pdu_distribution  = 0.05
+
+[airtag.params.rotation_cohort]
+expected_rotation = 900.0
+window_min        = 0.05
+window_max        = 60.0
+
+[airtag.params.rssi_signature]
+min_sniffers      = 2
+std_floor         = 1.5
+z_full_mismatch   = 4.0
+recent_window     = 30.0
+
+[airtag.params.apple_continuity]
+airtag_set_match_score = 0.40

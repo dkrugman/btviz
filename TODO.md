@@ -88,6 +88,11 @@ useful diff against the codebase.
 
 ## RPA collapse / clustering (the post-CRC problem)
 
+The framework design lives at `docs/rpa_collapse/` — module-per-signal,
+per-device-class profiles weighting them, a small aggregator that
+scores candidate pairs and decides whether to merge. The list below is
+the implementation order.
+
 - [ ] **Wide fingerprint schema migration.** Three new tables:
     - `device_ad_history (device_id, ad_type, ad_value, first_seen,
       last_seen, count)` — per-device AD-entry vocabulary.
@@ -95,21 +100,24 @@ useful diff against the codebase.
       channel, pdu_type, sniffer_short_id)` — slim per-packet event
       log for temporal analysis.
     - Add `packets.raw` BLOB column for forensic re-decode capability.
-- [ ] **Cluster-based RPA collapse.** Once wide fingerprint exists:
-      DBSCAN / hierarchical clustering on a feature vector
-      `(vendor_id, sorted_service_uuids, tx_power, mfg_data_prefix,
-      conn_interval, adv_interval_ms, rssi_signature)`. Goal:
-      collapse the ~30 `Apple, Inc. apple_device` rows that are
-      really 5–10 physical iPhones rotating RPAs.
-- [ ] **Manual merge action.** Multi-select device boxes →
-      right-click → "Merge as same device" → creates a synthetic
-      identity row, re-points addresses. Fallback for when automatic
-      methods fall short or for explicit user labeling.
+- [ ] **Pluggable signal framework.** ``Signal`` protocol +
+      ``ClusterContext`` + per-device-class ``ClassProfile`` weights.
+      Skeleton in `src/btviz/cluster/` (this branch). Concrete signal
+      modules: rotation_cohort, rssi_signature, adv_interval,
+      service_uuid, mfg_data_prefix, apple_continuity, tx_power,
+      status_byte, pdu_distribution.
+- [ ] **Cluster aggregator + merge.** Weighted-sum aggregator over
+      applicable signals; threshold-based decision; writes to a new
+      `device_clusters` table (cluster id → member device ids).
+      Manual merge action (multi-select → "Merge as same device")
+      uses the same table.
 - [ ] **IRK resolution.** UI to import IRKs (paste-text or
       .btsnoop import), AES-128 verify each unresolved RPA against
       each IRK, populate `addresses.resolved_via_irk_id`, merge
       `devices` rows when multiple RPAs resolve to one IRK. Schema
       already supports this — only the UI + crypto path are missing.
+      Treated as a separate signal in the framework above (the
+      strongest one — cryptographic proof rather than probability).
 - [ ] **LLM oracle for cluster identification.** Once a cluster's
       fingerprint is known, ask an LLM "what device emits these
       service UUIDs + manufacturer data prefix?" with citations to
@@ -117,6 +125,27 @@ useful diff against the codebase.
 - [ ] **Per-packet retention policy.** Knob to drop `packets` older
       than N days while keeping aggregates. Required once per-packet
       table exists; not urgent before that.
+
+## Privacy / threat-model awareness
+
+- [ ] **Traffic-analysis self-audit (defense direction).** Barman et
+      al. 2021 ("Every Byte Matters") show that even encrypted BLE
+      traffic leaks device model, app opens, and fine-grained user
+      actions (e.g. "record insulin injection") via packet sizes +
+      timings. We're a *capture* tool, so this is informational —
+      but worth being aware that the patterns we use to *fingerprint
+      and cluster* are the same patterns an adversary uses to
+      *track and profile* a wearer. If we ever ship features that
+      stream user data over BLE (own broadcasters / fake clients)
+      this becomes a real concern. Reference:
+      Proc. ACM IMWUT 5(2), Article 54.
+- [ ] **Apple Find My / OF awareness.** Heinrich et al. 2021 ("Who
+      Can Find My Devices?") fully specify Apple's offline-finding
+      protocol. Each AirTag emits 28 bytes of EC public key per
+      packet, rotating every 15 min. Without the IRK, two consecutive
+      rotations are AES-128-uncorrelated — confirms the only passive
+      avenue for AirTag collapse is behavioral (rotation cohort,
+      RSSI signature, status byte). Cited in `docs/rpa_collapse/`.
 
 ## Cleanup
 

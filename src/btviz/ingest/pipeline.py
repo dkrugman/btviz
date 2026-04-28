@@ -103,6 +103,9 @@ class IngestContext:
     # (genuine bug to investigate).
     ext_adv_count: int = 0
     ext_adv_with_baa: int = 0
+    # Set True to write a row to `packets` for every attributed packet.
+    # Off by default: at 200 pkts/s that's ~17M rows/day.
+    keep_packets: bool = False
 
 
 def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> bool:
@@ -214,6 +217,25 @@ def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> bool:
         rssi=pkt.rssi, channel=pkt.channel, phy=pkt.phy,
         pdu_type=pkt.pdu_type,
     )
+
+    # AD vocabulary: upsert any new (device, ad_type, ad_value) tuples.
+    ad_entries = _extract_ad_entries(pkt.extras.get("layers", {}))
+    if ad_entries:
+        repos.ad_history.upsert_many(device.id, ad_entries, pkt.ts)
+
+    # Per-packet event row (opt-in — off by default due to volume).
+    if ctx.keep_packets:
+        pdu_int = _PDU_TYPE_INT.get(pkt.pdu_type, 0xFF)
+        repos.packets.insert(
+            session_id=ctx.session_id,
+            device_id=device.id,
+            address_id=addr.id,
+            ts=pkt.ts,
+            rssi=pkt.rssi or 0,
+            channel=pkt.channel or 0,
+            pdu_type=pdu_int,
+        )
+
     return True
 
 
@@ -310,6 +332,87 @@ def _hexstr_to_bytes(s: str) -> bytes | None:
         return None
 
 
+_PDU_TYPE_INT: dict[str | None, int] = {
+    "ADV_IND": 0, "ADV_DIRECT_IND": 1, "ADV_NONCONN_IND": 2,
+    "SCAN_REQ": 3, "SCAN_RSP": 4, "CONNECT_IND": 5,
+    "ADV_SCAN_IND": 6, "ADV_EXT_IND": 7,
+}
+
+
+def _extract_ad_entries(layers: dict) -> list[tuple[int, bytes]]:
+    """Extract (ad_type, ad_value_bytes) pairs from tshark EK layers.
+
+    Returns canonical byte representations for the AD types that the
+    cluster signals consume. Only entries that parse cleanly are returned;
+    failures are silently dropped so a malformed field never kills an ingest.
+
+    Supported types:
+      0x09 (Complete Local Name)   → UTF-8 bytes
+      0x02/0x03 (16-bit UUIDs)     → 2 bytes LE per UUID, one entry each
+      0xFF (Manufacturer Specific) → company_id LE16 + data bytes
+      0x0A (TX Power Level)        → 1-byte signed
+      0x19 (Appearance)            → 2 bytes LE
+    """
+    import struct
+
+    results: list[tuple[int, bytes]] = []
+
+    def _lookup(key: str) -> Any:
+        for layer in ("btle", "btcommon"):
+            v = layers.get(layer, {}).get(key)
+            if v is not None:
+                return v
+        return None
+
+    # 0x09 Complete Local Name
+    name_raw = _first(_lookup("btcommon_btcommon_eir_ad_entry_device_name"))
+    if isinstance(name_raw, str) and name_raw:
+        try:
+            results.append((0x09, name_raw.encode("utf-8")))
+        except Exception:
+            pass
+
+    # 0x02/0x03 16-bit Service UUIDs (tshark merges both types into one field)
+    uuid16_raw = _lookup("btcommon_btcommon_eir_ad_entry_uuid_16")
+    if uuid16_raw is not None:
+        uuids = uuid16_raw if isinstance(uuid16_raw, list) else [uuid16_raw]
+        for u in uuids:
+            v = _as_int(u)
+            if v is not None:
+                try:
+                    results.append((0x03, struct.pack("<H", v & 0xFFFF)))
+                except Exception:
+                    pass
+
+    # 0xFF Manufacturer Specific: reconstruct company_id LE16 + data
+    cid = _as_int(_lookup("btcommon_btcommon_eir_ad_entry_company_id"))
+    data_raw = _first(_lookup("btcommon_btcommon_eir_ad_entry_data"))
+    if cid is not None:
+        data_bytes = _hexstr_to_bytes(data_raw) if isinstance(data_raw, str) else b""
+        try:
+            results.append((0xFF, struct.pack("<H", cid & 0xFFFF) + (data_bytes or b"")))
+        except Exception:
+            pass
+
+    # 0x0A TX Power Level
+    tx_raw = _as_int(_lookup("btcommon_btcommon_eir_ad_entry_power_level"))
+    if tx_raw is not None:
+        try:
+            results.append((0x0A, struct.pack("b", max(-128, min(127, tx_raw)))))
+        except Exception:
+            pass
+
+    # 0x19 Appearance
+    appearance = _as_int(_lookup("btcommon_btcommon_eir_ad_entry_appearance"))
+    if appearance is not None:
+        try:
+            results.append((0x19, struct.pack("<H", appearance & 0xFFFF)))
+        except Exception:
+            pass
+
+    return results
+
+
 def _extract_ad_clues(layers: dict) -> dict[str, Any]:
     """Pull identity clues from AD entries.
 
@@ -376,6 +479,7 @@ def ingest_file(
     project: str,
     session_name: str | None = None,
     keep_bad_crc: bool = False,
+    keep_packets: bool = False,
 ) -> IngestReport:
     """Ingest a pcap/pcapng file into the store under the named project."""
     path = Path(path)
@@ -404,7 +508,7 @@ def ingest_file(
             "SELECT COUNT(*) AS n FROM addresses"
         ).fetchone()["n"]
 
-        ctx = IngestContext(session_id=sess.id)
+        ctx = IngestContext(session_id=sess.id, keep_packets=keep_packets)
 
         for rec in dissect_file(path, keep_bad_crc=keep_bad_crc):
             packets_seen += 1

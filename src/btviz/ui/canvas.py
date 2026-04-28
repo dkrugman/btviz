@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..bus import EventBus
+from ..bus import EventBus, TOPIC_SNIFFER_STATE
 from ..capture.coordinator import CaptureCoordinator, FollowRequest
 from ..capture.live_ingest import LiveIngest
 from ..db.models import DeviceLayout
@@ -1035,6 +1035,10 @@ class CanvasWindow(QMainWindow):
         # per-source notifications can drive the panel's serial-keyed
         # activity dot.
         self._source_to_serial: dict[str, str] = {}
+        # Bus unsubscribe callback for TOPIC_SNIFFER_STATE — set in
+        # _start_live and cleared in _stop_live. Surfaces per-sniffer
+        # errors (notably capture-loop FIFO failures) on the toolbar.
+        self._sniffer_state_unsub: "Callable[[], None] | None" = None
 
         # Active sort keys (None = honor saved per-device layouts). A
         # transient view-mode toggle: changing either dropdown triggers
@@ -1278,6 +1282,37 @@ class CanvasWindow(QMainWindow):
             for d in self._coord.dongles
         }
 
+        # Compare the slow extcap probe's discovered set against the DB
+        # rows the panel already shows (those came from the fast/USB
+        # probe). Anything in the DB that the extcap probe missed gets
+        # flagged "USB-detected but not extcap-reachable" — typically a
+        # Nordic firmware in a hung state that a replug clears. Tooltip
+        # in the panel explains the recovery.
+        extcap_serials = {
+            (d.serial_number or d.serial_path)
+            for d in self._coord.dongles
+        }
+        try:
+            db_sniffers = self.repos.sniffers.list_all(
+                active_only=False, include_removed=False,
+            )
+            unreachable = {
+                s.serial_number for s in db_sniffers
+                if s.serial_number and s.serial_number not in extcap_serials
+            }
+        except Exception:  # noqa: BLE001 - never let a UX hint break live start
+            unreachable = set()
+        self.sniffer_panel.set_extcap_unreachable(unreachable)
+
+        # Surface any per-sniffer state changes (notably last_error from
+        # capture-loop failures) on the toolbar status. Without this
+        # subscription, a SnifferProcess that fails its FIFO open
+        # exits silently and the user sees "capturing on N" with fewer
+        # blinking dots than they expect.
+        self._sniffer_state_unsub = self._bus.subscribe(
+            TOPIC_SNIFFER_STATE, self._on_sniffer_state,
+        )
+
         self._live = LiveIngest(
             self._bus, self.repos, self.project_id,
             session_name=f"live-{int(time.time())}",
@@ -1317,6 +1352,12 @@ class CanvasWindow(QMainWindow):
         if self._live_timer is not None:
             self._live_timer.stop()
             self._live_timer = None
+        if self._sniffer_state_unsub is not None:
+            try:
+                self._sniffer_state_unsub()
+            except Exception:  # noqa: BLE001
+                pass
+            self._sniffer_state_unsub = None
         if self._coord is not None:
             try:
                 self._coord.stop_all()
@@ -1329,8 +1370,32 @@ class CanvasWindow(QMainWindow):
         self._coord = None
         self._bus = None
         self._source_to_serial = {}
+        # Clear the panel's "extcap-unreachable" hint — the next live
+        # start will recompute it from a fresh discovery sweep.
+        self.sniffer_panel.set_extcap_unreachable(set())
         # One last reload so the user sees the final state of the session.
         self.reload()
+
+    def _on_sniffer_state(self, state) -> None:
+        """Bus subscriber for ``TOPIC_SNIFFER_STATE``.
+
+        Surfaces per-sniffer status changes — most importantly the
+        ``last_error`` field, which previously vanished into the void
+        when a SnifferProcess's capture-loop exited silently (e.g.
+        FIFO open returned no bytes). Without this, the toolbar still
+        said "capturing on N" while only N-1 dongles were actually
+        running.
+
+        Runs on the bus reader thread; the toolbar status label is a
+        Qt widget but ``setText`` is thread-safe enough on macOS for
+        this lightweight use. If we see threading issues here, route
+        through a Qt signal.
+        """
+        err = getattr(state, "last_error", None)
+        if not err:
+            return
+        sid = getattr(getattr(state, "dongle", None), "short_id", "?")
+        self.status.setText(f"  sniffer error [{sid}]: {err}")
 
     def _live_tick(self) -> None:
         """QTimer callback (main thread). Drains the queue; reloads every Nth."""

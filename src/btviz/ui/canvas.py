@@ -1079,6 +1079,10 @@ class CanvasWindow(QMainWindow):
         # per-source notifications can drive the panel's serial-keyed
         # activity dot.
         self._source_to_serial: dict[str, str] = {}
+        # Dongles found by the last extcap slow-probe (at capture start).
+        # Cached here so "Refresh Sniffers" can include hub-connected dongles
+        # even after the coordinator is torn down on stop.
+        self._last_coord_dongles: list = []
         # Bus unsubscribe callback for TOPIC_SNIFFER_STATE — set in
         # _start_live and cleared in _stop_live. Surfaces per-sniffer
         # errors (notably capture-loop FIFO failures) on the toolbar.
@@ -1423,6 +1427,9 @@ class CanvasWindow(QMainWindow):
                 pass
             self._sniffer_state_unsub = None
         if self._coord is not None:
+            # Save before teardown so "Refresh Sniffers" can merge them in
+            # after the coordinator is gone (list_dongles_fast misses hub dongles).
+            self._last_coord_dongles = list(self._coord.dongles)
             try:
                 self._coord.stop_all()
             except Exception:  # noqa: BLE001
@@ -1665,23 +1672,22 @@ class CanvasWindow(QMainWindow):
                 discovered_to_db_records, list_dongles_fast,
             )
             dongles = list_dongles_fast()
-            # If live capture is running, the coordinator holds the authoritative
-            # list of active dongles (found via the slow extcap probe). Merge
-            # them in so hub-connected dongles aren't accidentally deactivated
-            # by ioreg misses.
-            if self._coord is not None:
-                coord_serials = {
-                    (d.serial_number or d.serial_path)
-                    for d in self._coord.dongles
-                }
-                fast_serials = {
-                    (d.serial_number or d.serial_path) for d in dongles
-                }
-                if coord_serials - fast_serials:
-                    extra = [
-                        d for d in self._coord.dongles
-                        if (d.serial_number or d.serial_path) not in fast_serials
-                    ]
+            # Merge with the extcap-probe result that ran at capture start.
+            # list_dongles_fast() (ioreg/USB) misses hub-connected dongles on
+            # some macOS configurations. The coordinator's slow probe (or the
+            # cached copy from the last capture) is authoritative for those.
+            ref = (
+                self._coord.dongles
+                if self._coord is not None
+                else self._last_coord_dongles
+            )
+            if ref:
+                fast_serials = {(d.serial_number or d.serial_path) for d in dongles}
+                extra = [
+                    d for d in ref
+                    if (d.serial_number or d.serial_path) not in fast_serials
+                ]
+                if extra:
                     dongles = dongles + extra
             records = discovered_to_db_records(dongles)
             self.repos.sniffers.record_discovered(records)

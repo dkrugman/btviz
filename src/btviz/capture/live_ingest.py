@@ -191,21 +191,24 @@ class LiveIngest:
         recorded = 0
         with self._repos.store.tx():
             for pkt in batch:
+                src = pkt.source or ""
+                # Fire for every decoded packet so the activity dot flashes
+                # even when the packet has no adv_addr (e.g. data-channel
+                # frames, SCAN_RSP, hub-connected sniffers on non-primary chs).
+                if self._on_source_packet is not None:
+                    try:
+                        self._on_source_packet(src)
+                    except Exception:  # noqa: BLE001
+                        import traceback
+                        traceback.print_exc()
                 if record_packet(self._repos, self._ctx, pkt):
                     recorded += 1
-                    src = pkt.source or ""
                     state = self._sources.get(src)
                     if state is None:
                         state = _SourceState()
                         self._sources[src] = state
                     state.last_packet_ts = pkt.ts
                     state.packet_count += 1
-                    if self._on_source_packet is not None:
-                        try:
-                            self._on_source_packet(src)
-                        except Exception:  # noqa: BLE001
-                            import traceback
-                            traceback.print_exc()
         self.stats.packets_recorded += recorded
         self.stats.flushes += 1
         self.stats.last_flush_size = len(batch)

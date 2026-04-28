@@ -469,6 +469,7 @@ _SORT_KEY_LABELS: tuple[str, ...] = (
     "RSSI (avg)",
     "Vendor",
     "Packets",
+    "Last seen",
 )
 _SORT_KEYS: dict[str, "Callable[[CanvasDevice], Any]"] = {
     "Type":         lambda d: (d.device_class or "~"),
@@ -477,7 +478,50 @@ _SORT_KEYS: dict[str, "Callable[[CanvasDevice], Any]"] = {
     "RSSI (avg)":   lambda d: -(d.rssi_avg if d.rssi_avg is not None else -200),
     "Vendor":       lambda d: ((d.vendor or d.oui_vendor) or "~").lower(),
     "Packets":      lambda d: -d.packet_count,
+    # Most-recent first. Devices with no observation timestamp get
+    # pushed to the end via a sentinel (negated max float).
+    "Last seen":    lambda d: -(d.last_seen or 0.0),
 }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Recency → box opacity
+# ──────────────────────────────────────────────────────────────────────────
+
+# Time thresholds for the dormancy fade. Devices observed in the last
+# minute paint at full opacity; anything older than 24 hours bottoms out
+# at the floor. Between, opacity decays linearly in *log* time so a
+# 5-minute-old device looks distinctly fresher than a 1-hour-old one
+# (linear-in-seconds would have the difference be invisible).
+_RECENCY_FRESH_S = 60.0           # < 1 min ago → fully opaque
+_RECENCY_DORMANT_S = 86400.0      # > 24 hr ago → at floor
+_RECENCY_MIN_OPACITY = 0.10       # never disappear entirely
+
+
+def opacity_for_recency(last_seen_ts: float, now_ts: float | None = None) -> float:
+    """Linear-in-log-time opacity for a CanvasDevice based on its
+    last_seen wall-clock timestamp.
+
+    100% for the first minute, decays to 10% by 24 hours, capped both
+    ends. Devices that never produced an observation (last_seen=0)
+    return the floor opacity — they're listed because of identity
+    info but produced no traffic in this project.
+    """
+    if last_seen_ts is None or last_seen_ts <= 0:
+        return _RECENCY_MIN_OPACITY
+    if now_ts is None:
+        now_ts = time.time()
+    age = max(0.0, now_ts - last_seen_ts)
+    if age < _RECENCY_FRESH_S:
+        return 1.0
+    if age >= _RECENCY_DORMANT_S:
+        return _RECENCY_MIN_OPACITY
+    import math
+    log_age = math.log10(age)
+    log_min = math.log10(_RECENCY_FRESH_S)
+    log_max = math.log10(_RECENCY_DORMANT_S)
+    frac = (log_age - log_min) / (log_max - log_min)
+    return 1.0 - (1.0 - _RECENCY_MIN_OPACITY) * frac
 
 
 def cols_for_viewport(viewport_width: int | None) -> int:
@@ -1127,11 +1171,19 @@ class CanvasWindow(QMainWindow):
         # devices keep their saved positions regardless.
         cols = cols_for_viewport(self.view.viewport().width())
         apply_grid_layout(devs, cols=cols)
+        # Single ``now`` reference so all opacities computed in this
+        # reload pass see consistent ages — avoids tearing if reload
+        # is triggered mid-tick.
+        now_ts = time.time()
         for d in devs:
             if d.hidden:
                 continue
             item = DeviceItem(d, self._persist_device,
                               context_cb=self._device_context_menu)
+            # Dormancy fade: 100% if seen in last minute, decaying log-
+            # linearly to 10% at 24 hours and beyond. Live capture's
+            # periodic reload (~2s) keeps this current.
+            item.setOpacity(opacity_for_recency(d.last_seen, now_ts))
             self.scene.addItem(item)
         # Status reflects what's actually on the canvas — `len(devs)` would
         # include hidden devices (rows with hidden=1 in device_layouts) that

@@ -72,6 +72,19 @@ useful diff against the codebase.
       from the canvas).
 - [ ] **iPhone / iPad / Mac SVG icons.** Currently only emoji
       fallbacks exist; the `apple_device.svg` cascade covers them.
+- [ ] **Radiating-waves activity animation on active devices.** Boxes
+      whose ``last_seen`` is within the last few seconds emit a brief
+      expanding-circle animation behind the icon — a visual heartbeat
+      that's distinct from the existing static opacity fade.
+      Implementation likely needs a per-device QTimer + custom paint
+      (or a single scene-level QPropertyAnimation on a phase value).
+- [ ] **Auto-hide stale devices.** Toolbar toggle / preference to
+      flip ``hidden=1`` on devices not observed in the last N hours
+      (e.g. 1h / 24h / 7d / never). Hidden devices reappear when
+      observed again. Doesn't fix the duplicates-multiplying problem
+      (RPA collapse does), but immediately winnows visual clutter
+      from stale captures. Needs a "show hidden" toggle so users can
+      surface them again without "Reset layout".
 
 ## RPA collapse / clustering (the post-CRC problem)
 

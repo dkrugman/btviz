@@ -1,6 +1,6 @@
--- btviz schema v1
+-- btviz schema v3
 -- Global: devices + addresses. Per-project: sessions, groups, layouts, keys.
--- Raw packets are not stored; only per-session aggregates.
+-- v3 adds: device_ad_history, packets, device_clusters, device_cluster_members.
 
 -- --------------------------------------------------------------------------
 -- Global device identity
@@ -267,3 +267,67 @@ CREATE TABLE meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- --------------------------------------------------------------------------
+-- RPA collapse / cluster framework (v3)
+-- --------------------------------------------------------------------------
+
+-- Per-device AD-type vocabulary. One row per unique (device, ad_type, ad_value)
+-- tuple observed across all sessions. Upserted at ingest time; never deleted.
+-- Used by signals: service_uuid_match, mfg_data_prefix, apple_continuity,
+-- status_byte_match, tx_power_match.
+CREATE TABLE device_ad_history (
+    device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    ad_type     INTEGER NOT NULL,    -- BLE AD type byte (0x01..0xFF)
+    ad_value    BLOB    NOT NULL,    -- raw AD payload bytes
+    first_seen  REAL    NOT NULL,
+    last_seen   REAL    NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (device_id, ad_type, ad_value)
+);
+CREATE INDEX idx_dah_type ON device_ad_history(ad_type);
+
+-- Per-packet event stream. One row per BLE packet that passes CRC. Populated
+-- by the live-ingest path (gated behind sessions.keep_packets). Used by
+-- signals: rotation_cohort (timestamps), rssi_signature (per-sniffer RSSI).
+-- raw is nullable; only stored when sessions.keep_raw = 1.
+CREATE TABLE packets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL REFERENCES sessions(id)  ON DELETE CASCADE,
+    device_id   INTEGER NOT NULL REFERENCES devices(id)   ON DELETE CASCADE,
+    address_id  INTEGER NOT NULL REFERENCES addresses(id) ON DELETE CASCADE,
+    ts          REAL    NOT NULL,    -- unix epoch, sub-ms precision
+    rssi        INTEGER NOT NULL,    -- signed dBm
+    channel     INTEGER NOT NULL,    -- 37/38/39 primary; 0..36 data
+    pdu_type    INTEGER NOT NULL,    -- BLE PDU type byte
+    sniffer_id  INTEGER REFERENCES sniffers(id),
+    raw         BLOB                 -- nullable; opt-in via sessions.keep_raw
+);
+CREATE INDEX idx_packets_device_ts  ON packets(device_id,    ts);
+CREATE INDEX idx_packets_sniffer_ts ON packets(sniffer_id,   ts);
+CREATE INDEX idx_packets_session_ts ON packets(session_id,   ts);
+
+-- Cluster header. One row per physical device identity inferred by the runner.
+-- source: 'auto' = runner decision, 'manual' = user override, 'irk' = IRK match.
+CREATE TABLE device_clusters (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    label           TEXT,
+    created_at      REAL NOT NULL,
+    last_decided_at REAL NOT NULL,
+    source          TEXT NOT NULL DEFAULT 'auto'
+);
+
+-- Cluster membership. A device belongs to at most one cluster; enforced by the
+-- runner (not a schema constraint, to allow re-clustering transitions).
+-- contributions is JSON: {"signal_name": [score, weight], ...}
+CREATE TABLE device_cluster_members (
+    cluster_id    INTEGER NOT NULL REFERENCES device_clusters(id) ON DELETE CASCADE,
+    device_id     INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    score         REAL,
+    contributions TEXT,    -- JSON
+    profile       TEXT,
+    decided_at    REAL NOT NULL,
+    decided_by    TEXT NOT NULL DEFAULT 'auto',
+    PRIMARY KEY (cluster_id, device_id)
+);
+CREATE INDEX idx_dcm_device ON device_cluster_members(device_id);

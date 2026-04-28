@@ -1327,6 +1327,18 @@ class CanvasWindow(QMainWindow):
             self._coord = None
             return
 
+        # Persist the extcap-discovered dongles into the sniffers table so
+        # the panel renders them as active. The fast USB path (_refresh_sniffers)
+        # misses hub-connected dongles on some systems; the slow extcap path
+        # used here is authoritative — if it found them, they're active.
+        try:
+            from ..extcap.discovery import discovered_to_db_records
+            records = discovered_to_db_records(self._coord.dongles)
+            self.repos.sniffers.record_discovered(records)
+            self.sniffer_panel.refresh()
+        except Exception:  # noqa: BLE001
+            pass
+
         # Build short_id → serial_number map so the per-source notifier
         # can drive the panel's serial-keyed activity dot.
         self._source_to_serial = {
@@ -1425,6 +1437,12 @@ class CanvasWindow(QMainWindow):
         # Clear the panel's "extcap-unreachable" hint — the next live
         # start will recompute it from a fresh discovery sweep.
         self.sniffer_panel.set_extcap_unreachable(set())
+        # Mark all sniffers inactive in the DB so the panel goes grey.
+        try:
+            self.repos.sniffers.record_discovered([])
+            self.sniffer_panel.refresh()
+        except Exception:  # noqa: BLE001
+            pass
         # One last reload so the user sees the final state of the session.
         self.reload()
 
@@ -1647,6 +1665,24 @@ class CanvasWindow(QMainWindow):
                 discovered_to_db_records, list_dongles_fast,
             )
             dongles = list_dongles_fast()
+            # If live capture is running, the coordinator holds the authoritative
+            # list of active dongles (found via the slow extcap probe). Merge
+            # them in so hub-connected dongles aren't accidentally deactivated
+            # by ioreg misses.
+            if self._coord is not None:
+                coord_serials = {
+                    (d.serial_number or d.serial_path)
+                    for d in self._coord.dongles
+                }
+                fast_serials = {
+                    (d.serial_number or d.serial_path) for d in dongles
+                }
+                if coord_serials - fast_serials:
+                    extra = [
+                        d for d in self._coord.dongles
+                        if (d.serial_number or d.serial_path) not in fast_serials
+                    ]
+                    dongles = dongles + extra
             records = discovered_to_db_records(dongles)
             self.repos.sniffers.record_discovered(records)
         except Exception as e:  # noqa: BLE001

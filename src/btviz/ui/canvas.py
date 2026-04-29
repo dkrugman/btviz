@@ -84,7 +84,6 @@ _HEADER_H = 50
 _BOX_H_COLLAPSED = _HEADER_H + 30   # body holds one summary line
 _BOX_H_EXPANDED = _HEADER_H + 220   # body holds detailed info block
 _BOX_RADIUS = 10
-_ICON_SIZE = 32                      # pt; QFont sets this in points
 _GRID_DX = _BOX_W + 24               # column pitch (box + gutter)
 _GRID_DY = _BOX_H_COLLAPSED + 22     # row pitch (collapsed-box + gutter)
 _GRID_MARGIN_X = 20                  # left margin before the first column
@@ -116,64 +115,7 @@ _KIND_FILL = {
     "unknown": QColor(235, 235, 235),
 }
 
-# device_class -> emoji icon. Apple-Continuity-derived classes are first;
-# GAP-appearance-derived classes second. Edit freely; everything else
-# falls back to ``_FALLBACK_ICON``. macOS renders these via Apple Color
-# Emoji; modern Linux distros via Noto Color Emoji.
-_DEVICE_CLASS_ICONS: dict[str, str] = {
-    # Apple Continuity
-    "airpods":        "\U0001F3A7",  # 🎧
-    "airtag":         "\U0001F4CD",  # 📍
-    "apple_watch":    "⌚",      # ⌚
-    "apple_device":   "\U0001F4F1",  # 📱  (most are iPhones)
-    "apple_airplay":  "\U0001F4FA",  # 📺
-    "homekit":        "\U0001F3E0",  # 🏠
-    "ibeacon":        "\U0001F4E1",  # 📡
-    # GAP appearance fallback
-    "phone":          "\U0001F4F1",  # 📱
-    "computer":       "\U0001F4BB",  # 💻
-    "watch":          "⌚",      # ⌚
-    "clock":          "\U0001F550",  # 🕐
-    "display":        "\U0001F5A5",  # 🖥️
-    "remote_control": "\U0001F39B",  # 🎛
-    "eyewear":        "\U0001F453",  # 👓
-    "tag":            "\U0001F3F7",  # 🏷
-    "keyring":        "\U0001F511",  # 🔑
-    "media_player":   "\U0001F3B5",  # 🎵
-    "barcode_scanner": "\U0001F4E6",  # 📦
-    "thermometer":    "\U0001F321",  # 🌡
-    "heart_rate_sensor": "❤",   # ❤
-    "blood_pressure_monitor": "\U0001FA7A",  # 🩺
-    "hid":            "⌨",      # ⌨
-    "glucose_meter":  "\U0001FA78",  # 🩸
-    "running_walking_sensor": "\U0001F3C3",  # 🏃
-    "cycling_sensor": "\U0001F6B4",  # 🚴
-    "pulse_oximeter": "\U0001FAC1",  # 🫁
-    "weight_scale":   "⚖",      # ⚖
-    "fitness_tracker": "\U0001F3CB",  # 🏋
-    "hearing_aid":    "\U0001F9BB",  # 🦻
-    "personal_mobility_device": "\U0001F9BD",  # 🦽
-    # New classes that came in with the iconscout drop. Emoji are emoji-
-    # only fallbacks; SVGs in data/icons/ supersede them automatically.
-    "camera":         "\U0001F4F7",  # 📷
-    "headphones":     "\U0001F3A7",  # 🎧 (same as airpods — generic non-Apple)
-    "windows_computer": "\U0001F5A5",  # 🖥
-    "hid_keyboard":   "⌨",       # ⌨
-    "hid_mouse":      "\U0001F5B1",  # 🖱
-    "hid_joystick":   "\U0001F579",  # 🕹
-    "hid_gamepad":    "\U0001F3AE",  # 🎮
-    # Apple-class refinements emitted by Continuity Nearby action_code
-    # heuristics (see decode/apple_continuity.classify). iPhone and iPad
-    # aren't reliably distinguishable from passive sniffing today, but
-    # the entries are registered so user-set labels and future heuristics
-    # can use them. apple_device.svg covers them as a fallback via the
-    # SVG cascade until we add iphone.svg / ipad.svg / mac.svg.
-    "iphone":         "\U0001F4F1",  # 📱 (same as apple_device for now)
-    "ipad":           "\U0001F4F1",  # 📱 (no distinct tablet emoji that's BLE-specific)
-    "mac":            "\U0001F4BB",  # 💻
-}
-_FALLBACK_ICON = "\U0001F50C"        # 🔌  generic BLE-ish stand-in
-_FALLBACK_SVG_NAME = "fallback_icon" # picked up from data/icons/<name>.svg
+_FALLBACK_SVG_NAME = "fallback_icon"  # data/icons/fallback_icon.svg — unknown classes
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -617,22 +559,13 @@ class DeviceItem(QGraphicsItem):
         # Square off the bottom of the header so it joins the body cleanly.
         painter.drawRect(QRectF(0, _BOX_RADIUS, _BOX_W, _HEADER_H - _BOX_RADIUS))
 
-        # Icon (left side). Cascade:
-        #   1. SVG matching device_class (data/icons/<class>.svg)
-        #   2. SVG fallback (data/icons/fallback_icon.svg) — covers any
-        #      class without a specific SVG, including unknown classes.
-        #   3. Class emoji from _DEVICE_CLASS_ICONS
-        #   4. _FALLBACK_ICON emoji
-        # Steps 1+2 are pure-SVG; 3+4 are pure-emoji. We commit to one path
-        # so the icon area's font/style is set up only once.
+        # Icon (left side): device_class SVG, falling back to fallback_icon.svg.
         icon_rect = QRectF(6, 0, 44, _HEADER_H)
         renderer = (
             _icon_renderer(self.device.device_class)
             or _icon_renderer(_FALLBACK_SVG_NAME)
         )
         if renderer is not None:
-            # Center a square SVG inside the icon area, with a few pixels
-            # of padding so it doesn't crowd the rounded corner.
             svg_size = 36
             cx = icon_rect.x() + icon_rect.width() / 2
             cy = icon_rect.y() + icon_rect.height() / 2
@@ -640,18 +573,6 @@ class DeviceItem(QGraphicsItem):
                 painter,
                 QRectF(cx - svg_size / 2, cy - svg_size / 2, svg_size, svg_size),
             )
-        else:
-            icon = _DEVICE_CLASS_ICONS.get(
-                self.device.device_class or "", _FALLBACK_ICON
-            )
-            icon_font = QFont()
-            icon_font.setPointSize(_ICON_SIZE)
-            # Force a font that renders color emoji on macOS; on Linux Qt's
-            # cascade picks Noto Color Emoji or similar.
-            icon_font.setFamily("Apple Color Emoji")
-            painter.setFont(icon_font)
-            painter.setPen(QColor(30, 30, 30))
-            painter.drawText(icon_rect, Qt.AlignVCenter | Qt.AlignHCenter, icon)
 
         # Title text (right of icon, two-line region with word wrap).
         # Prefer broadcast_name / GATT name / local name over the

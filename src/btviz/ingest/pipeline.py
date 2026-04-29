@@ -37,7 +37,7 @@ from ..decode.appearance import appearance_to_class
 from ..decode.apple_continuity import classify as classify_apple, parse_continuity
 from ..decode.auracast import parse_auracast
 from ..vendors import company_vendor, oui_vendor
-from .normalize import normalize
+from .normalize import _as_int, _first, normalize
 from .tshark import dissect_file
 
 APPLE_COMPANY_ID = 0x004C
@@ -297,26 +297,6 @@ _ADV_PDU_TYPES = frozenset({
     "SCAN_REQ", "SCAN_RSP", "CONNECT_IND",
 })
 
-
-def _first(v: Any) -> Any:
-    if isinstance(v, list):
-        return v[0] if v else None
-    return v
-
-
-def _as_int(v: Any) -> int | None:
-    v = _first(v)
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return int(v)
-    if isinstance(v, int):
-        return v
-    try:
-        s = str(v).strip()
-        return int(s, 0) if s.startswith(("0x", "0X")) else int(s)
-    except (ValueError, AttributeError):
-        return None
 
 
 def _hexstr_to_bytes(s: str) -> bytes | None:

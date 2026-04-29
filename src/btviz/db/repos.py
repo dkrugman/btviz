@@ -22,12 +22,9 @@ from typing import Iterable
 from .models import (
     Address,
     Broadcast,
-    BroadcastReceiver,
     CanvasState,
-    Connection,
     Device,
     DeviceLayout,
-    DeviceProjectMeta,
     Group,
     IRK,
     LTK,

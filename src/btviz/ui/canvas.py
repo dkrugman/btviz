@@ -996,6 +996,13 @@ class CanvasWindow(QMainWindow):
         self._live: LiveIngest | None = None
         self._live_timer: QTimer | None = None
         self._reload_tick = 0       # increments per timer fire; reload() runs every Nth
+        # Cluster-runner state. ``_cluster_ctx`` is built lazily on the
+        # first cluster tick; profiles + signals are static so we cache
+        # the context for the lifetime of the window. ``_cluster_tick``
+        # paces the heavy O(n²) cluster pass at a longer cadence than
+        # the scene reload.
+        self._cluster_ctx = None
+        self._cluster_tick = 0
         # short_id (pkt.source) → serial_number, so the bus subscriber's
         # per-source notifications can drive the panel's serial-keyed
         # activity dot.
@@ -1430,6 +1437,54 @@ class CanvasWindow(QMainWindow):
                 f"({stats.ext_adv_with_baa} baa) "
                 f"bcast={stats.broadcasts_seen}"
             )
+        # Cluster pass at a slower cadence than the scene reload — it's
+        # O(n²) over recent devices and we don't want to compete with
+        # ingest. 60 ticks * 250ms = 15s.
+        if self._reload_tick % 60 == 0:
+            self._run_cluster_tick()
+
+    def _run_cluster_tick(self) -> None:
+        """Hydrate devices, run the cluster aggregator, persist results.
+
+        Wrapped in a broad try/except because the cluster framework is
+        new and we don't want a runner crash to take down live capture.
+        Failures land in the toolbar status, not as exceptions.
+        """
+        try:
+            from ..cluster import (
+                ClusterContext, ClusterRunner,
+                load_devices, load_profiles, load_signals,
+            )
+            if self._cluster_ctx is None:
+                self._cluster_ctx = ClusterContext(
+                    signals=load_signals(),
+                    profiles=load_profiles(),
+                    now=time.time(),
+                    db=self.store,
+                )
+            else:
+                # Refresh ``now`` so age-sensitive signals (rotation_cohort,
+                # rssi_signature recent-window) see the current clock.
+                self._cluster_ctx.now = time.time()
+
+            devices = load_devices(self.store, recent_window_s=300.0)
+            if not devices:
+                return
+
+            runner = ClusterRunner(self._cluster_ctx)
+            result = runner.run_once(devices)
+            written = self.repos.clusters.apply_run(
+                result.merge_decisions, time.time(),
+            )
+            self._cluster_tick += 1
+            if result.merge_decisions:
+                self.status.setText(
+                    f"  clusters: {result.devices_in} → "
+                    f"{result.cluster_count} ({written} groups, "
+                    f"{result.elapsed_s:.2f}s)"
+                )
+        except Exception as e:  # noqa: BLE001 — never let cluster crash live capture
+            self.status.setText(f"  cluster error: {e}")
 
     def _on_live_packet(self, source: str) -> None:
         """LiveIngest per-source notifier. Drives the panel's activity dot."""

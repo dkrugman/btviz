@@ -1146,6 +1146,148 @@ class Packets:
         )
 
 
+class Clusters:
+    """Persists cluster-runner output into device_clusters / device_cluster_members.
+
+    The runner emits a list of merge edges; we close them into groups via
+    union-find, then write one ``device_clusters`` row per multi-device
+    group with a ``device_cluster_members`` row per device. Single-device
+    clusters are skipped — a row with no merge partners isn't interesting
+    to persist.
+
+    ``apply_run`` is idempotent for a given ``source``: it wipes existing
+    clusters of that source before writing the new state. Manual clusters
+    (``source='manual'``) are preserved across auto-runs and vice versa,
+    so user overrides don't get clobbered by the next periodic tick.
+    """
+
+    def __init__(self, store: Store) -> None:
+        self.s = store
+
+    def apply_run(
+        self,
+        decisions: "list[tuple[int, int, object]]",
+        now: float,
+        *,
+        source: str = "auto",
+    ) -> int:
+        """Replace all clusters of ``source`` with the runner's merge decisions.
+
+        ``decisions`` is the ``RunResult.merge_decisions`` list:
+        ``[(device_id_a, device_id_b, Decision), ...]``. Returns the number
+        of clusters written.
+        """
+        with self.s.tx():
+            self.s.conn.execute(
+                "DELETE FROM device_clusters WHERE source = ?", (source,),
+            )
+            if not decisions:
+                return 0
+
+            parent: dict[int, int] = {}
+            decision_for: dict[tuple[int, int], object] = {}
+
+            def find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(x: int, y: int) -> None:
+                rx, ry = find(x), find(y)
+                if rx != ry:
+                    parent[rx] = ry
+
+            for a_id, b_id, decision in decisions:
+                parent.setdefault(a_id, a_id)
+                parent.setdefault(b_id, b_id)
+                key = (min(a_id, b_id), max(a_id, b_id))
+                decision_for[key] = decision
+                union(a_id, b_id)
+
+            groups: dict[int, list[int]] = {}
+            for did in parent:
+                groups.setdefault(find(did), []).append(did)
+
+            written = 0
+            for members in groups.values():
+                if len(members) < 2:
+                    continue
+                cur = self.s.conn.execute(
+                    """
+                    INSERT INTO device_clusters
+                        (label, created_at, last_decided_at, source)
+                    VALUES (NULL, ?, ?, ?)
+                    """,
+                    (now, now, source),
+                )
+                cluster_id = cur.lastrowid
+                for did in members:
+                    score, contributions, profile = _member_evidence(
+                        did, members, decision_for,
+                    )
+                    self.s.conn.execute(
+                        """
+                        INSERT INTO device_cluster_members
+                            (cluster_id, device_id, score, contributions,
+                             profile, decided_at, decided_by)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            cluster_id, did, score, contributions, profile,
+                            now, source,
+                        ),
+                    )
+                written += 1
+            return written
+
+    def list_for_device(self, device_id: int) -> "list[dict]":
+        """All cluster rows the given device participates in (typically <=1)."""
+        rows = self.s.conn.execute(
+            """
+            SELECT c.id, c.label, c.source, m.score, m.profile, m.decided_at
+              FROM device_cluster_members m
+              JOIN device_clusters c ON c.id = m.cluster_id
+             WHERE m.device_id = ?
+            """,
+            (device_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _member_evidence(
+    device_id: int,
+    members: "list[int]",
+    decision_for: "dict[tuple[int, int], object]",
+) -> "tuple[float | None, str | None, str | None]":
+    """Score / contributions / profile for one cluster member.
+
+    Pulls the strongest decision this device participated in within the
+    cluster — gives the UI something to show as "why is this here".
+    Returns ``(None, None, None)`` if the device has no recorded edge
+    (can happen with transitive closure: A↔B, B↔C makes A↔C implicit).
+    """
+    best_decision = None
+    best_score = -2.0
+    for other in members:
+        if other == device_id:
+            continue
+        key = (min(device_id, other), max(device_id, other))
+        d = decision_for.get(key)
+        if d is None:
+            continue
+        if d.score > best_score:
+            best_score = d.score
+            best_decision = d
+    if best_decision is None:
+        return (None, None, None)
+    contributions = json.dumps({
+        name: [round(s, 4), round(w, 4)]
+        for name, (s, w) in best_decision.signals.items()
+    })
+    return (round(best_decision.score, 4), contributions, best_decision.profile)
+
+
 # --- umbrella convenience --------------------------------------------------
 
 class Repos:
@@ -1166,3 +1308,4 @@ class Repos:
         self.meta = Meta(store)
         self.ad_history = AdHistory(store)
         self.packets = Packets(store)
+        self.clusters = Clusters(store)

@@ -1056,14 +1056,12 @@ class CanvasWindow(QMainWindow):
         # the event loop; by the time it fires, the show event has
         # finished and the viewport has its final width.
         QTimer.singleShot(0, self.reload)
-        # Initial sniffer panel state: read whatever is already in the DB
-        # so the window draws immediately, then run a fast (ioreg-only)
-        # discovery sweep on the next event-loop tick so currently-plugged
-        # sniffers light up green without the user having to click Refresh.
-        # The slow extcap probe is reserved for Start live, where the user
-        # has explicitly opted into the wait.
+        # Read whatever is already in the DB so the window draws immediately.
+        # No auto-discovery here: a fast (ioreg-only) sweep at startup misses
+        # hub-connected dongles and would mark them inactive. The user runs
+        # discovery via Refresh sniffers / Start live; previous-session state
+        # (preserved across Stop) covers the common case of "I just relaunched".
         self.sniffer_panel.refresh()
-        QTimer.singleShot(0, self._refresh_sniffers)
         self.repos.meta.set(self.repos.meta.LAST_PROJECT, str(project_id))
 
     # --- data ---------------------------------------------------------
@@ -1252,13 +1250,26 @@ class CanvasWindow(QMainWindow):
             self._coord = None
             return
 
-        # Persist the extcap-discovered dongles into the sniffers table so
-        # the panel renders them as active. The fast USB path (_refresh_sniffers)
-        # misses hub-connected dongles on some systems; the slow extcap path
-        # used here is authoritative — if it found them, they're active.
+        # Persist the discovered dongles into the sniffers table so the
+        # panel renders them as active. Each detection path has blind
+        # spots: fast (ioreg) misses hub-connected dongles on some
+        # systems; slow (extcap) intermittently misses the DK when its
+        # serial port is held by a stale handle. Pass the union to
+        # record_discovered so a row is only deactivated when *neither*
+        # path sees it. A device that ioreg sees but extcap missed still
+        # won't capture this session (no SnifferProcess), but the panel
+        # accurately reflects "plugged in".
         try:
-            from ..extcap.discovery import discovered_to_db_records
-            records = discovered_to_db_records(self._coord.dongles)
+            from ..extcap.discovery import (
+                discovered_to_db_records, list_dongles_fast,
+            )
+            slow_dongles = list(self._coord.dongles)
+            slow_keys = {(d.serial_number or d.serial_path) for d in slow_dongles}
+            extra_fast = [
+                d for d in list_dongles_fast()
+                if (d.serial_number or d.serial_path) not in slow_keys
+            ]
+            records = discovered_to_db_records(slow_dongles + extra_fast)
             self.repos.sniffers.record_discovered(records)
             self.sniffer_panel.refresh()
         except Exception:  # noqa: BLE001

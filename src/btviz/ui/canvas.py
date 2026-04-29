@@ -425,6 +425,23 @@ _SORT_KEYS: dict[str, "Callable[[CanvasDevice], Any]"] = {
     "Last seen":    lambda d: -(d.last_seen or 0.0),
 }
 
+# Cluster auto-run cadences. The integer is the number of _live_tick
+# callbacks (each = 250 ms) between automatic cluster runs. ``off``
+# disables the auto-run entirely so the toolbar's "Run cluster" button
+# is the only trigger — useful when iterating on signal logic and you
+# don't want the runner to fire mid-edit.
+_CLUSTER_PERIOD_LABELS: tuple[str, ...] = (
+    "off", "5s", "15s", "30s", "1m", "5m",
+)
+_CLUSTER_PERIOD_TICKS: dict[str, int] = {
+    "off": 0,
+    "5s":  20,
+    "15s": 60,
+    "30s": 120,
+    "1m":  240,
+    "5m":  1200,
+}
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Recency → box opacity
@@ -1000,9 +1017,12 @@ class CanvasWindow(QMainWindow):
         # first cluster tick; profiles + signals are static so we cache
         # the context for the lifetime of the window. ``_cluster_tick``
         # paces the heavy O(n²) cluster pass at a longer cadence than
-        # the scene reload.
+        # the scene reload. ``_cluster_period_ticks`` controls cadence:
+        # 0 = off (manual-only), N = run every N _live_tick callbacks
+        # (each tick is 250 ms). Defaults to 60 = 15s.
         self._cluster_ctx = None
         self._cluster_tick = 0
+        self._cluster_period_ticks = 60
         # short_id (pkt.source) → serial_number, so the bus subscriber's
         # per-source notifications can drive the panel's serial-keyed
         # activity dot.
@@ -1051,6 +1071,22 @@ class CanvasWindow(QMainWindow):
         tb.addSeparator()
 
         self._live_action = tb.addAction("Start live", self._toggle_live)
+        tb.addSeparator()
+
+        # Cluster controls. Manual button runs the aggregator on demand
+        # (works whether or not capture is live — the aggregator only
+        # needs the DB). The dropdown picks how often the live-tick path
+        # auto-runs it. "off" makes capture-time analysis manual-only.
+        tb.addAction("Run cluster", self._run_cluster_tick)
+        tb.addWidget(QLabel("  every: "))
+        self._cluster_period_combo = QComboBox()
+        for label in _CLUSTER_PERIOD_LABELS:
+            self._cluster_period_combo.addItem(label)
+        self._cluster_period_combo.setCurrentText("15s")
+        self._cluster_period_combo.currentTextChanged.connect(
+            self._on_cluster_period_changed,
+        )
+        tb.addWidget(self._cluster_period_combo)
         tb.addSeparator()
         self.status = QLabel("")
         tb.addWidget(self.status)
@@ -1164,6 +1200,15 @@ class CanvasWindow(QMainWindow):
             s if (self._current_sort_primary and s in _SORT_KEYS) else None
         )
         self.reload()
+
+    def _on_cluster_period_changed(self, label: str) -> None:
+        """Toolbar dropdown change → adjust auto-run cadence.
+
+        The change takes effect on the next ``_live_tick`` callback.
+        Switching to ``off`` halts the auto-run; the toolbar's "Run
+        cluster" button still works.
+        """
+        self._cluster_period_ticks = _CLUSTER_PERIOD_TICKS.get(label, 60)
 
     def clear_all_data(self) -> None:
         """Wipe all observations, sessions, broadcasts, and layout for
@@ -1439,8 +1484,10 @@ class CanvasWindow(QMainWindow):
             )
         # Cluster pass at a slower cadence than the scene reload — it's
         # O(n²) over recent devices and we don't want to compete with
-        # ingest. 60 ticks * 250ms = 15s.
-        if self._reload_tick % 60 == 0:
+        # ingest. Cadence is the toolbar dropdown's selection (default
+        # 60 ticks = 15 s); 0 means "off, manual-only".
+        period = self._cluster_period_ticks
+        if period > 0 and self._reload_tick % period == 0:
             self._run_cluster_tick()
 
     def _run_cluster_tick(self) -> None:

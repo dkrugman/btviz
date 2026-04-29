@@ -1056,14 +1056,14 @@ class CanvasWindow(QMainWindow):
         # the event loop; by the time it fires, the show event has
         # finished and the viewport has its final width.
         QTimer.singleShot(0, self.reload)
-        # The sniffer panel reads from the DB at startup so the window
-        # appears immediately. Discovery happens on demand via the
-        # "Refresh sniffers" toolbar action — calling the Nordic extcap
-        # synchronously here would block UI launch by tens of seconds
-        # while the extcap probes every serial-class USB device looking
-        # for the sniffer protocol (slow when USB-to-UART bridges like
-        # the Adafruit Bluefruit LE Sniffer are connected).
+        # Initial sniffer panel state: read whatever is already in the DB
+        # so the window draws immediately, then run a fast (ioreg-only)
+        # discovery sweep on the next event-loop tick so currently-plugged
+        # sniffers light up green without the user having to click Refresh.
+        # The slow extcap probe is reserved for Start live, where the user
+        # has explicitly opted into the wait.
         self.sniffer_panel.refresh()
+        QTimer.singleShot(0, self._refresh_sniffers)
         self.repos.meta.set(self.repos.meta.LAST_PROJECT, str(project_id))
 
     # --- data ---------------------------------------------------------

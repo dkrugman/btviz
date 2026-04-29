@@ -162,11 +162,28 @@ class CanvasDevice:
     hidden: bool = False
 
 
-def load_canvas_devices(store: Store, project_id: int) -> list[CanvasDevice]:
-    """Load all devices observed in the project plus their saved layout."""
+def load_canvas_devices(
+    store: Store,
+    project_id: int,
+    *,
+    stale_cutoff: float | None = None,
+) -> list[CanvasDevice]:
+    """Load all devices observed in the project plus their saved layout.
+
+    ``stale_cutoff`` is an absolute epoch threshold; devices whose latest
+    observation timestamp is below it are excluded. ``None`` (default)
+    means "show everything" — historical behavior. Filtering happens in
+    SQL via HAVING so the existing addresses/broadcasts/etc. follow-up
+    queries don't have to know about it.
+    """
     conn = store.conn
+    having = ""
+    params: list = [project_id]
+    if stale_cutoff is not None:
+        having = "HAVING MAX(o.last_seen) >= ?"
+        params.append(stale_cutoff)
     rows = conn.execute(
-        """
+        f"""
         SELECT
             d.id, d.stable_key, d.kind,
             d.user_name, d.gatt_device_name, d.local_name,
@@ -185,8 +202,9 @@ def load_canvas_devices(store: Store, project_id: int) -> list[CanvasDevice]:
         JOIN devices  d ON d.id = o.device_id
         WHERE s.project_id = ?
         GROUP BY d.id
+        {having}
         """,
-        (project_id,),
+        params,
     ).fetchall()
 
     devices: dict[int, CanvasDevice] = {}
@@ -440,6 +458,21 @@ _CLUSTER_PERIOD_TICKS: dict[str, int] = {
     "30s": 120,
     "1m":  240,
     "5m":  1200,
+}
+
+# Stale-device window. Devices whose latest observation is older than
+# this cutoff are hidden from the canvas AND excluded from the cluster
+# runner's hydrator. ``all`` disables the filter so every device the
+# project has ever seen is visible/clusterable. Default 5m matches
+# what ``load_devices(recent_window_s=300.0)`` was hardcoded to before
+# this dropdown existed.
+_STALE_WINDOW_LABELS: tuple[str, ...] = ("1m", "5m", "15m", "1h", "all")
+_STALE_WINDOW_SECONDS: dict[str, float | None] = {
+    "1m":  60.0,
+    "5m":  300.0,
+    "15m": 900.0,
+    "1h":  3600.0,
+    "all": None,
 }
 
 
@@ -1023,6 +1056,11 @@ class CanvasWindow(QMainWindow):
         self._cluster_ctx = None
         self._cluster_tick = 0
         self._cluster_period_ticks = 60
+        # Stale-device cutoff in seconds. Devices whose latest
+        # observation is older than this are hidden from the canvas and
+        # excluded from the cluster hydrator. None disables the filter.
+        # Default 5m matches the prior cluster-only hardcoded value.
+        self._stale_window_s: float | None = 300.0
         # short_id (pkt.source) → serial_number, so the bus subscriber's
         # per-source notifications can drive the panel's serial-keyed
         # activity dot.
@@ -1087,6 +1125,15 @@ class CanvasWindow(QMainWindow):
             self._on_cluster_period_changed,
         )
         tb.addWidget(self._cluster_period_combo)
+        tb.addWidget(QLabel("  hide stale: "))
+        self._stale_window_combo = QComboBox()
+        for label in _STALE_WINDOW_LABELS:
+            self._stale_window_combo.addItem(label)
+        self._stale_window_combo.setCurrentText("5m")
+        self._stale_window_combo.currentTextChanged.connect(
+            self._on_stale_window_changed,
+        )
+        tb.addWidget(self._stale_window_combo)
         tb.addSeparator()
         self.status = QLabel("")
         tb.addWidget(self.status)
@@ -1111,7 +1158,14 @@ class CanvasWindow(QMainWindow):
 
     def reload(self) -> None:
         self.scene.clear()
-        devs = load_canvas_devices(self.store, self.project_id)
+        cutoff = (
+            time.time() - self._stale_window_s
+            if self._stale_window_s is not None
+            else None
+        )
+        devs = load_canvas_devices(
+            self.store, self.project_id, stale_cutoff=cutoff,
+        )
         # Sort mode (toolbar dropdowns) overrides saved positions: zero
         # out positions, sort the list, and re-grid. Saved layouts in
         # the DB are untouched, so toggling back to "(saved positions)"
@@ -1209,6 +1263,15 @@ class CanvasWindow(QMainWindow):
         cluster" button still works.
         """
         self._cluster_period_ticks = _CLUSTER_PERIOD_TICKS.get(label, 60)
+
+    def _on_stale_window_changed(self, label: str) -> None:
+        """Toolbar dropdown change → re-filter canvas + cluster hydrator.
+
+        Reload immediately so the canvas reflects the new cutoff (the
+        cluster runner picks it up on its next tick).
+        """
+        self._stale_window_s = _STALE_WINDOW_SECONDS.get(label, 300.0)
+        self.reload()
 
     def clear_all_data(self) -> None:
         """Wipe all observations, sessions, broadcasts, and layout for
@@ -1514,7 +1577,9 @@ class CanvasWindow(QMainWindow):
                 # rssi_signature recent-window) see the current clock.
                 self._cluster_ctx.now = time.time()
 
-            devices = load_devices(self.store, recent_window_s=300.0)
+            devices = load_devices(
+                self.store, recent_window_s=self._stale_window_s,
+            )
             if not devices:
                 return
 

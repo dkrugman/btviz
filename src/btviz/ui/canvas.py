@@ -1264,10 +1264,14 @@ class CanvasWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
 
-        # Build short_id → serial_number map so the per-source notifier
+        # Build short_id → DB-serial map so the per-source notifier
         # can drive the panel's serial-keyed activity dot.
+        # Must match discovered_to_db_records: serial_number or serial_path.
+        # Dongles without a USB serial (common on nRF52840 dongle firmware)
+        # fall back to serial_path, which is what the sniffers table stores.
+        # Using short_id here causes a key mismatch against the panel lookup.
         self._source_to_serial = {
-            d.short_id: (d.serial_number or d.short_id)
+            d.short_id: (d.serial_number or d.serial_path)
             for d in self._coord.dongles
         }
 

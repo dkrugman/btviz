@@ -1369,12 +1369,10 @@ class CanvasWindow(QMainWindow):
         # Clear the panel's "extcap-unreachable" hint — the next live
         # start will recompute it from a fresh discovery sweep.
         self.sniffer_panel.set_extcap_unreachable(set())
-        # Mark all sniffers inactive in the DB so the panel goes grey.
-        try:
-            self.repos.sniffers.record_discovered([])
-            self.sniffer_panel.refresh()
-        except Exception:  # noqa: BLE001
-            pass
+        # Leave sniffer rows as-is: stopping capture doesn't unplug them.
+        # Dots stay green to reflect "detected, idle". A row only goes grey
+        # when a fresh discovery sweep (Refresh sniffers / next Start live)
+        # fails to find it.
         # One last reload so the user sees the final state of the session.
         self.reload()
 

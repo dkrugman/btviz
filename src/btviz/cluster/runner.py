@@ -21,7 +21,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
-from .aggregator import cluster_pair
+from .aggregator import cluster_pair_with_reason
 from .base import ClusterContext, Decision, Device
 from .cluster_log import get_cluster_logger
 
@@ -38,6 +38,11 @@ class RunResult:
     user-facing "how many clusters did we collapse into" number, use
     ``clusters_by_class`` (post-union-find), or ``cluster_count`` for
     the total.
+
+    ``abstain_reasons_by_class`` is the per-class breakdown of *why*
+    pairs abstained — surfaces things like "1485 apple_device pairs
+    abstained on below_min_total_weight:0.55/0.60" so it's clear when
+    the issue is profile config vs. signal output.
     """
 
     elapsed_s: float
@@ -50,6 +55,9 @@ class RunResult:
     merges_by_class: Counter[str] = field(default_factory=Counter)
     clusters_by_class: Counter[str] = field(default_factory=Counter)
     cluster_count: int = 0
+    abstain_reasons_by_class: dict[str, Counter[str]] = field(
+        default_factory=dict,
+    )
 
 
 class ClusterRunner:
@@ -147,10 +155,15 @@ class ClusterRunner:
         self, a: Device, b: Device, result: RunResult
     ) -> None:
         result.pairs_evaluated += 1
-        decision = cluster_pair(self.ctx, a, b)
+        decision, abstain_reason = cluster_pair_with_reason(self.ctx, a, b)
 
         if decision is None:
             result.abstain_count += 1
+            if abstain_reason:
+                bucket = result.abstain_reasons_by_class.setdefault(
+                    a.device_class, Counter(),
+                )
+                bucket[abstain_reason] += 1
             return
 
         log.info("decision %s", _decision_json(a, b, decision))
@@ -198,6 +211,20 @@ class ClusterRunner:
             lines.append(
                 f"{indent}{count:>4} {cls:<{width}}  → {after:>4}{tag}"
             )
+
+        # Abstain breakdown — when a class is "unchanged" it's almost
+        # always because every pair abstained for the same reason; show
+        # which one so the user can tell config gaps from data gaps.
+        if r.abstain_reasons_by_class:
+            lines.append(f"{indent}abstains:")
+            for cls in r.by_class:
+                reasons = r.abstain_reasons_by_class.get(cls)
+                if not reasons:
+                    continue
+                for reason, count in reasons.most_common():
+                    lines.append(
+                        f"{indent}  {count:>4} {cls:<{width}}  {reason}"
+                    )
         return "\n".join(lines)
 
 

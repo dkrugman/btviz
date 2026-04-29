@@ -29,35 +29,41 @@ def cluster_pair(
     Thin wrapper over ``cluster_pair_with_reason`` for callers (tests,
     external use) that don't need the abstain-reason side channel.
     """
-    decision, _reason = cluster_pair_with_reason(ctx, a, b)
+    decision, _reason, _contribs = cluster_pair_with_reason(ctx, a, b)
     return decision
 
 
 def cluster_pair_with_reason(
     ctx: ClusterContext, a: Device, b: Device
-) -> tuple[Decision | None, str | None]:
-    """Score a pair; return (Decision | None, abstain_reason | None).
+) -> tuple[
+    Decision | None,
+    str | None,
+    dict[str, tuple[float, float]] | None,
+]:
+    """Score a pair; return (Decision, abstain_reason, contributions).
 
     Mirrors ``cluster_pair`` but surfaces the *reason* an abstain
-    happened, so the runner can roll abstains up by class+reason and
-    show "1485 apple_device pairs abstained on below_min_total_weight"
-    in the summary instead of silently throwing the information away.
+    happened plus any partial signal contributions accumulated before
+    the abstain. The runner uses this to roll abstains up by
+    class+reason in the summary AND to emit a per-pair debug line
+    showing exactly what scored.
 
-    The abstain reason is non-None iff the returned Decision is None.
-    Reasons:
-      - ``cross_class``: pair's device classes don't match
-      - ``missing_eventually:<sig_names>``: required-eventually signal
-        didn't apply this run
-      - ``below_min_total_weight:<got>/<min>``: signals contributed
-        but their total weight fell short of the profile floor
+    Return shape:
+      - merge decided: (Decision, None, None) — contributions already
+        live inside the Decision
+      - abort (rejected): (Decision(merge=False, abort_reason=...),
+        None, None) — same as above
+      - abstain: (None, reason, contribs_or_None) — contribs is the
+        partial dict of {sig_name: (score, weight)} accumulated
+        before the abstain, or None if no signal contributed at all
     """
     profile = pick_profile(ctx, a, b)
     if profile is None:
-        return None, "cross_class"
+        return None, "cross_class", None
 
     irk_short = _try_irk_short_circuit(ctx, a, b, profile.name)
     if irk_short is not None:
-        return irk_short, None
+        return irk_short, None, None
 
     weighted_sum = 0.0
     total_weight = 0.0
@@ -118,14 +124,20 @@ def cluster_pair_with_reason(
             signals=contributions,
             profile=profile.name,
             abort_reason=f"missing_required_for_merge:{','.join(missing_for_merge)}",
-        ), None
+        ), None, None
 
     if missing_eventually:
-        return None, f"missing_eventually:{','.join(missing_eventually)}"
+        return (
+            None,
+            f"missing_eventually:{','.join(missing_eventually)}",
+            contributions or None,
+        )
 
     if total_weight < profile.min_total_weight:
-        return None, (
-            f"below_min_total_weight:{total_weight:.2f}/{profile.min_total_weight:.2f}"
+        return (
+            None,
+            f"below_min_total_weight:{total_weight:.2f}/{profile.min_total_weight:.2f}",
+            contributions or None,
         )
 
     final = weighted_sum / total_weight if total_weight else 0.0
@@ -134,7 +146,7 @@ def cluster_pair_with_reason(
         score=final,
         signals=contributions,
         profile=profile.name,
-    ), None
+    ), None, None
 
 
 def _try_irk_short_circuit(

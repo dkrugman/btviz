@@ -1087,6 +1087,14 @@ class CanvasWindow(QMainWindow):
             self._on_cluster_period_changed,
         )
         tb.addWidget(self._cluster_period_combo)
+        # Verbose abstain logging: toggle the cluster logger between
+        # INFO (default) and DEBUG. DEBUG enables a per-pair line for
+        # every abstain, with the partial signals/scores. Useful while
+        # iterating on signals/profiles; very loud (O(n²) per class).
+        self._cluster_verbose_action = tb.addAction(
+            "Verbose cluster log", self._on_cluster_verbose_toggled,
+        )
+        self._cluster_verbose_action.setCheckable(True)
         tb.addSeparator()
         self.status = QLabel("")
         tb.addWidget(self.status)
@@ -1209,6 +1217,27 @@ class CanvasWindow(QMainWindow):
         cluster" button still works.
         """
         self._cluster_period_ticks = _CLUSTER_PERIOD_TICKS.get(label, 60)
+
+    def _on_cluster_verbose_toggled(self) -> None:
+        """Flip the cluster logger between INFO (default) and DEBUG.
+
+        DEBUG enables a per-pair abstain line showing exactly what
+        signals contributed (and at what weight) before the aggregator
+        gave up. Loud — O(n²) per class — so off by default.
+        """
+        import logging
+        from ..cluster import get_cluster_logger
+        logger = get_cluster_logger()
+        if self._cluster_verbose_action.isChecked():
+            logger.setLevel(logging.DEBUG)
+            for h in logger.handlers:
+                h.setLevel(logging.DEBUG)
+            self.status.setText("  cluster log: verbose (DEBUG)")
+        else:
+            logger.setLevel(logging.INFO)
+            for h in logger.handlers:
+                h.setLevel(logging.INFO)
+            self.status.setText("  cluster log: normal (INFO)")
 
     def clear_all_data(self) -> None:
         """Wipe all observations, sessions, broadcasts, and layout for

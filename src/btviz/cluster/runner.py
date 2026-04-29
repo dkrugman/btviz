@@ -155,7 +155,9 @@ class ClusterRunner:
         self, a: Device, b: Device, result: RunResult
     ) -> None:
         result.pairs_evaluated += 1
-        decision, abstain_reason = cluster_pair_with_reason(self.ctx, a, b)
+        decision, abstain_reason, contribs = cluster_pair_with_reason(
+            self.ctx, a, b,
+        )
 
         if decision is None:
             result.abstain_count += 1
@@ -164,6 +166,19 @@ class ClusterRunner:
                     a.device_class, Counter(),
                 )
                 bucket[abstain_reason] += 1
+            # Per-pair abstain detail at DEBUG so the user can opt in
+            # to "tell me exactly what each pair scored" without
+            # drowning the default INFO log. Volume is O(n²) per class;
+            # a 50-device run with 4 classes can easily produce
+            # thousands of these lines.
+            log.debug(
+                "abstain %s %s vs %s (%s%s)",
+                a.device_class,
+                _device_ref(a),
+                _device_ref(b),
+                abstain_reason or "no_reason",
+                _format_contribs(contribs),
+            )
             return
 
         log.info("decision %s", _decision_json(a, b, decision))
@@ -248,6 +263,22 @@ def _addr(d: Device) -> str:
 def _device_ref(d: Device) -> str:
     """Stable-id-first reference suitable for human-readable lines."""
     return f"device_{d.id} ({_addr(d)})"
+
+
+def _format_contribs(
+    contribs: dict[str, tuple[float, float]] | None,
+) -> str:
+    """Render contributions as ", signals: name=score×weight, …" or "".
+
+    Empty contribs (no signal had an opinion) returns an empty string
+    so the caller's format string degrades cleanly.
+    """
+    if not contribs:
+        return ""
+    parts = ", ".join(
+        f"{name}={s:.2f}×{w:.2f}" for name, (s, w) in contribs.items()
+    )
+    return f", signals: {parts}"
 
 
 def _decision_json(a: Device, b: Device, decision: Decision) -> str:

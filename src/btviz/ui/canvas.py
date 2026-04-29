@@ -1590,40 +1590,44 @@ class CanvasWindow(QMainWindow):
     def _refresh_sniffers(self) -> None:
         """Re-run discovery, persist into the sniffers table, refresh panel.
 
-        Uses the fast ``list_dongles_fast()`` path which enumerates USB
-        descriptors via ioreg — instant, no subprocess hang. The slow
-        ``list_dongles()`` path that calls the Nordic extcap binary's
-        --extcap-interfaces probe is reserved for capture-time use, where
-        the user has explicitly asked to start a capture and expects to
-        wait. Discovery for the panel display doesn't need that probe.
+        Each detection path has blind spots — fast (ioreg) misses
+        hub-connected dongles on some systems; slow (extcap) intermittently
+        misses the DK. We always pass the union to record_discovered so a
+        row is only deactivated when *neither* path saw it.
 
-        Discovery failure (e.g. ioreg unavailable on a non-macOS host)
-        shouldn't crash the canvas — log it via the status bar and keep
-        what's already in the DB on screen.
+        When capturing we reuse the cached slow result from capture start
+        rather than re-probing — extcap can't see device nodes that are
+        currently held open by SnifferProcess, so a fresh probe would
+        return a false-incomplete set. When not capturing we run the slow
+        probe synchronously; the user clicked the button, they expect it
+        to actually rediscover.
+
+        Discovery failure (e.g. extcap binary missing) shouldn't crash the
+        canvas — log it via the status bar and keep DB state on screen.
         """
         try:
             from ..extcap.discovery import (
-                discovered_to_db_records, list_dongles_fast,
+                discovered_to_db_records, list_dongles, list_dongles_fast,
             )
-            dongles = list_dongles_fast()
-            # Merge with the extcap-probe result that ran at capture start.
-            # list_dongles_fast() (ioreg/USB) misses hub-connected dongles on
-            # some macOS configurations. The coordinator's slow probe (or the
-            # cached copy from the last capture) is authoritative for those.
-            ref = (
-                self._coord.dongles
-                if self._coord is not None
-                else self._last_coord_dongles
-            )
-            if ref:
-                fast_serials = {(d.serial_number or d.serial_path) for d in dongles}
-                extra = [
-                    d for d in ref
-                    if (d.serial_number or d.serial_path) not in fast_serials
-                ]
-                if extra:
-                    dongles = dongles + extra
-            records = discovered_to_db_records(dongles)
+            fast_dongles = list_dongles_fast()
+            if self._coord is not None:
+                slow_dongles = list(self._coord.dongles)
+            elif self._last_coord_dongles:
+                slow_dongles = list(self._last_coord_dongles)
+            else:
+                self.status.setText("  discovering sniffers…")
+                # Force the status repaint before the (multi-second) probe
+                # so the user gets feedback rather than a frozen toolbar.
+                from PySide6.QtWidgets import QApplication
+                QApplication.processEvents()
+                slow_dongles = list_dongles()
+                self.status.setText("")
+            fast_keys = {(d.serial_number or d.serial_path) for d in fast_dongles}
+            extra_slow = [
+                d for d in slow_dongles
+                if (d.serial_number or d.serial_path) not in fast_keys
+            ]
+            records = discovered_to_db_records(fast_dongles + extra_slow)
             self.repos.sniffers.record_discovered(records)
         except Exception as e:  # noqa: BLE001
             self.status.setText(f"  sniffer discovery failed: {e}")

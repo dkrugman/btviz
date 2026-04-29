@@ -159,10 +159,10 @@ class ClusterRunner:
             result.merge_decisions.append((a.id, b.id, decision))
             result.merges_by_class[a.device_class] += 1
             log.info(
-                "merge %s ← %s %s (score %.2f)",
-                _device_ref(b),
+                "merge %s %s ← %s (score %.2f)",
                 a.device_class,
-                _addr(a),
+                _device_ref(b),
+                _device_ref(a),
                 decision.score,
             )
         else:
@@ -175,7 +175,7 @@ class ClusterRunner:
             log.info(
                 "no-merge %s %s vs %s (score %.2f%s)",
                 a.device_class,
-                _addr(a),
+                _device_ref(a),
                 _device_ref(b),
                 decision.score,
                 reason,

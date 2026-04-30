@@ -82,6 +82,13 @@ class LiveIngest:
         self._ctx: IngestContext | None = None
         self._session_id: int | None = None
         self._on_source_packet: Callable[[str, int | None], None] | None = None
+        # Optional per-device callback fired on each successfully-recorded
+        # packet. Receives (device_id, channel) so the canvas can flash a
+        # per-device channel indicator. Distinct from the source callback
+        # because attribution to a device requires a successful
+        # ``record_packet`` (i.e. the packet had a parseable adv_addr) —
+        # the source callback fires for every decoded packet regardless.
+        self._on_device_packet: Callable[[int, int | None], None] | None = None
         self._sources: dict[str, _SourceState] = {}
         # Per-source decode diagnostics. ``received`` increments for
         # every bus packet from each source (before decode); ``rejected``
@@ -120,6 +127,21 @@ class LiveIngest:
         dots and the per-row channel-tag highlight.
         """
         self._on_source_packet = fn
+
+    def set_device_packet_callback(
+        self, fn: "Callable[[int, int | None], None] | None",
+    ) -> None:
+        """Set a per-device notifier called on flush (main thread).
+
+        Receives ``(device_id, channel)`` for each packet that
+        successfully recorded against a device row (i.e. ``pkt.adv_addr``
+        was parseable). Used to drive the per-device-box channel-flash
+        indicator on the canvas.
+
+        Skipped packets (no adv_addr) don't trigger this — they wouldn't
+        have a device_id anyway.
+        """
+        self._on_device_packet = fn
 
     def source_stats(self) -> dict[str, _SourceState]:
         """Snapshot of per-source packet counters. Read on main thread."""
@@ -235,7 +257,8 @@ class LiveIngest:
                     except Exception:  # noqa: BLE001
                         import traceback
                         traceback.print_exc()
-                if record_packet(self._repos, self._ctx, pkt):
+                device_id = record_packet(self._repos, self._ctx, pkt)
+                if device_id is not None:
                     recorded += 1
                     state = self._sources.get(src)
                     if state is None:
@@ -243,6 +266,15 @@ class LiveIngest:
                         self._sources[src] = state
                     state.last_packet_ts = pkt.ts
                     state.packet_count += 1
+                    # Per-device flash: fire after successful attribution
+                    # so the canvas can light up the right DeviceItem
+                    # with the channel color.
+                    if self._on_device_packet is not None:
+                        try:
+                            self._on_device_packet(device_id, pkt.channel)
+                        except Exception:  # noqa: BLE001
+                            import traceback
+                            traceback.print_exc()
         self.stats.packets_recorded += recorded
         self.stats.flushes += 1
         self.stats.last_flush_size = len(batch)

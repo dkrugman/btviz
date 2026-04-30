@@ -1,40 +1,21 @@
 """apple_continuity signal.
 
-Parses Apple Continuity Protocol TLVs out of each device's
-manufacturer-specific advertising data (AD type 0xFF, company id
-0x004C) and uses **shared TLV payloads** as a clustering fingerprint.
-
-The Continuity Protocol uses a TLV format embedded inside Apple's
-manufacturer data:
-
-    [0x4C, 0x00,        # Apple company id (little-endian 0x004C)
-     <type><length><payload> ...repeating...]
-
-Common types observed in this dataset:
-
-  0x07  ProximityPairing  AirPods + Beats (model + battery + lid)
-  0x09  AirPlaySource     speakers / Apple TV
-  0x0A  AirPlayTarget
-  0x0C  Handoff           encrypted, rotates with the user's session
-  0x0D  TetheringTarget
-  0x0F  NearbyAction      "Tap to set up"
-  0x10  NearbyInfo        action-type + status flags + auth tag
-  0x11  FindMyDevice      AirTags
-  0x12  Pairing           short state code OR longer pairing data
+Uses Apple Continuity Protocol TLVs (parsed by
+``_continuity_protocol``) as a clustering fingerprint. Two devices
+that share a long payload are near-certainly the same physical
+advertiser captured under different addresses (RPA collapse); two
+devices that share only TLV types are likely the same Apple class
+(both iPhones, both AirPods, etc.) but possibly different units.
 
 Scoring rationale:
-  * Long payloads (>= 8 bytes) embed encrypted session keys, sequence
-    numbers, or device-specific bytes that an unrelated device is
-    extremely unlikely to emit by coincidence. So a *byte-for-byte*
-    payload match between two devices is near-certainty same physical
-    advertiser captured under different addresses (RPA collapse).
+  * Long payloads (>= 8 bytes) embed encrypted session keys,
+    sequence numbers, or device-specific stable bytes that an
+    unrelated device is extremely unlikely to emit by coincidence.
   * Short payloads (e.g. 0x12 with a 2-byte state code) are state
     enums shared by many devices of the same model — too generic to
-    fingerprint. Ignored.
-  * Two devices with disjoint Continuity type sets are *probably*
-    different categories of Apple device (e.g. iPhone vs AirPods).
-    We score this case mildly negative; the aggregator caller can
-    decide whether to weight that further.
+    fingerprint as same-device.
+  * Disjoint Continuity vocabularies = different roles entirely
+    (e.g. iPhone vs AirPods); we score that mildly negative.
 
 Output domain:
   * None    one or both devices have no Continuity history → abstain
@@ -49,39 +30,27 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ..base import ClusterContext, Device
+from ._continuity_protocol import APPLE_CID_BE, parse_continuity
 
 AD_TYPE_MFG = 0xFF
-APPLE_CID_BE = b"\x4c\x00"   # little-endian 0x004C as on-the-wire bytes
+
+# Re-export for backward compatibility with the v1 test suite — older
+# tests imported _parse_continuity_tlvs directly.
+def _parse_continuity_tlvs(blob: bytes) -> list[tuple[int, bytes]]:
+    """Backward-compat shim returning (type, payload) tuples.
+
+    Internal callers should use ``parse_continuity`` from
+    ``_continuity_protocol`` directly to get richly-decoded TLVs;
+    this wrapper is kept so external tooling that imported the v1
+    private helper keeps working.
+    """
+    return [(tlv.type, tlv.payload) for tlv in parse_continuity(blob)]
+
 
 # Minimum payload length (in bytes) for a TLV to count as a "fingerprint"
 # match. Payloads shorter than this are state enums shared across many
 # devices of the same model; matching them yields false positives.
 DEFAULT_MIN_FINGERPRINT_BYTES = 8
-
-
-def _parse_continuity_tlvs(blob: bytes) -> list[tuple[int, bytes]]:
-    """Pull (type, payload) tuples out of one mfg_data blob.
-
-    Returns an empty list when the CID isn't Apple, the blob is too
-    short, or a length byte runs past end-of-blob (truncated capture).
-    """
-    if len(blob) < 4 or blob[:2] != APPLE_CID_BE:
-        return []
-    out: list[tuple[int, bytes]] = []
-    i = 2
-    n = len(blob)
-    while i + 1 < n:
-        t = blob[i]
-        length = blob[i + 1]
-        payload_start = i + 2
-        payload_end = payload_start + length
-        if payload_end > n:
-            # Truncated TLV — accept what's there only if length>0; some
-            # captures cut off mid-payload. Keep parsing what we can.
-            break
-        out.append((t, bytes(blob[payload_start:payload_end])))
-        i = payload_end
-    return out
 
 
 def _device_fingerprints(
@@ -114,10 +83,10 @@ def _device_fingerprints(
         if not blob or len(blob) < 4 or blob[:2] != APPLE_CID_BE:
             continue
         saw_continuity = True
-        for t, pl in _parse_continuity_tlvs(bytes(blob)):
-            types.add(t)
-            if len(pl) >= min_fingerprint_bytes:
-                payloads.add((t, pl))
+        for tlv in parse_continuity(bytes(blob)):
+            types.add(tlv.type)
+            if len(tlv.payload) >= min_fingerprint_bytes:
+                payloads.add((tlv.type, tlv.payload))
     if not saw_continuity:
         return None
     return payloads, types

@@ -12,7 +12,20 @@ adv_interval      = 0.05
 pdu_distribution  = 0.05
 
 [airtag.params.rotation_cohort]
-expected_rotation = 900.0
+# IMPORTANT: ``expected_rotation`` is the **expected handoff-gap
+# duration** in the score formula, NOT the RPA rotation interval.
+# The signal's score is `1 - |best_gap - expected_rotation| /
+# expected_rotation`, evaluated only inside [window_min, window_max].
+#
+# Setting it to 900 (the AirTag rotation period) made the math
+# unreachable — best_gap is at most window_max=60, so delta was
+# always >= 840, score always <= 0.07. See deep-dive doc §1b.
+#
+# 30 s puts the score's peak in the middle of the handoff window so
+# typical observed gaps (1-60 s during the rotation moment) score
+# usefully. The signal needs the packets table populated to fire at
+# all (see §1c).
+expected_rotation = 30.0
 window_min        = 0.05
 window_max        = 60.0
 

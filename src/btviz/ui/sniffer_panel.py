@@ -118,8 +118,21 @@ _DOT_INACTIVE = QColor(155, 155, 160)        # gray
 _DOT_REMOVED = QColor(155, 155, 160, 70)     # very faint
 _DOT_OUTLINE = QColor(80, 80, 80)
 
-# Activity flash decay: how long a dot stays "flashed" after a packet.
-_FLASH_DURATION_S = 0.6
+# Activity flash decay: how long the *dot* stays "flashed" after a
+# packet. Shorter than the tag fade so each packet's contribution is
+# discrete / readable rather than blurring into a long-running bright
+# state. At ~150 pkts/sec this still looks "near-solid bright" because
+# the inter-packet interval (~6 ms) is smaller than this duration; at
+# slower rates individual flashes are visible.
+_FLASH_DURATION_S = 0.3
+
+# Channel-tag fade decay. Longer than the dot flash so the colored
+# pill behind the channel number reads as "near-solid" and doesn't
+# distract from / obscure the digit. The user perceives steady-but-
+# subtly-animated activity rather than rapid flicker. When packets
+# stop entirely the tag still visibly fades to idle within this
+# window so silence is detectable.
+_TAG_FADE_DURATION_S = 1.5
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -171,11 +184,12 @@ class SnifferPanel(QWidget):
 
         # serial_number -> {channel -> monotonic time of last hit}.
         # Each packet on a channel relights that specific tag to bright
-        # blue and starts a fade back to idle over the same window the
-        # activity dot uses (_FLASH_DURATION_S). Multiple tags in one
-        # row can be in-flight simultaneously — a ScanUnmonitored
-        # sniffer hopping between channels keeps both tags warm if
-        # the hop interval is shorter than the fade window.
+        # blue and starts a fade back to idle over
+        # ``_TAG_FADE_DURATION_S`` (longer than the dot fade so the
+        # number stays readable). Multiple tags in one row can be
+        # in-flight simultaneously — a ScanUnmonitored sniffer hopping
+        # between channels keeps each visited tag warm if the hop
+        # interval is shorter than the fade window.
         self._channel_hit_at: dict[str, dict[int, float]] = {}
 
         # Hovered X-button index (sniffer row), if any. Used to render
@@ -326,7 +340,7 @@ class SnifferPanel(QWidget):
         # permanent {serial: {}} entry).
         for sn, hits in list(self._channel_hit_at.items()):
             for ch, t in list(hits.items()):
-                if now - t > _FLASH_DURATION_S:
+                if now - t > _TAG_FADE_DURATION_S:
                     del hits[ch]
             if not hits:
                 del self._channel_hit_at[sn]
@@ -415,9 +429,9 @@ class SnifferPanel(QWidget):
         Each tag carries an independent fade animation: a packet on
         channel C relights the tag for that channel to bright blue and
         starts a linear-alpha fade back to idle grey over
-        ``_FLASH_DURATION_S``. Multiple tags can be in-flight at once
-        — a hopping sniffer keeps each visited tag warm if its hop
-        interval is shorter than the fade window.
+        ``_TAG_FADE_DURATION_S``. Multiple tags can be in-flight at
+        once — a hopping sniffer keeps each visited tag warm if its
+        hop interval is shorter than the fade window.
 
         Tags are laid out horizontally and centered in the channel
         column so the row reads "[37] [38] [39]" left-to-right.
@@ -444,8 +458,8 @@ class SnifferPanel(QWidget):
             hit_t = hits.get(ch)
             if hit_t is not None:
                 age = now - hit_t
-                if age < _FLASH_DURATION_S:
-                    t = age / _FLASH_DURATION_S  # 0 = just hit, 1 = fully faded
+                if age < _TAG_FADE_DURATION_S:
+                    t = age / _TAG_FADE_DURATION_S  # 0 = just hit, 1 = fully faded
                     bg = _interp(_CH_TAG_BG_ACTIVE, _CH_TAG_BG_IDLE, t)
                     fg = _interp(_CH_TAG_FG_ACTIVE, _CH_TAG_FG_IDLE, t)
                 else:

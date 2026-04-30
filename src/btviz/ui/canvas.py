@@ -549,6 +549,23 @@ def opacity_for_recency(
     return 1.0 - (1.0 - _RECENCY_MIN_OPACITY) * frac
 
 
+def _shorten_source_label(src: str) -> str:
+    """Compact a sniffer ``short_id`` for status-bar display.
+
+    Strips the trailing ``-None`` suffix that macOS appends to
+    serial-less device nodes (Nordic dongles without a USB iSerial)
+    and truncates very long iSerial-based ids — keeping the head
+    digits intact. Used only for human-readable diagnostics; the
+    full short_id is the ``_source_to_serial`` key elsewhere.
+    """
+    s = src or "?"
+    if s.endswith("-None"):
+        s = s[: -len("-None")]
+    if len(s) > 8:
+        s = s[:8]
+    return s
+
+
 def cols_for_viewport(viewport_width: int | None) -> int:
     """Pick a column count that fits the current viewport.
 
@@ -1628,7 +1645,7 @@ class CanvasWindow(QMainWindow):
         if self._reload_tick % 8 == 0:
             self.reload()
             stats = self._live.stats
-            self.status.setText(
+            base = (
                 f"  live: rx={stats.packets_received:,} "
                 f"dec={stats.packets_decoded:,} "
                 f"rec={stats.packets_recorded:,} "
@@ -1638,6 +1655,22 @@ class CanvasWindow(QMainWindow):
                 f"({stats.ext_adv_with_baa} baa) "
                 f"bcast={stats.broadcasts_seen}"
             )
+            # Per-source diagnostic: short_id → received/rejected. Lets
+            # the user spot at a glance which sniffer is producing
+            # decoded packets vs which is silent or all-rejecting. E.g.
+            # ``[ 213101:5/5 213201:8200/12 0010502893191:11000/0 ]``
+            # means dongle 213101 produced 5 bus packets, all rejected
+            # at decode (something wrong with that one); 213201 is
+            # producing 8200 bytes-worth with only 12 rejects (healthy);
+            # the DK is doing the bulk of the work.
+            health = self._live.source_health()
+            if health:
+                pieces = []
+                for src, (recv, rej) in sorted(health.items()):
+                    short = _shorten_source_label(src)
+                    pieces.append(f"{short}:{recv:,}/{rej}")
+                base += "    [ " + " ".join(pieces) + " ]"
+            self.status.setText(base)
         # Cluster pass at a slower cadence than the scene reload — it's
         # O(n²) over recent devices and we don't want to compete with
         # ingest. Cadence is the toolbar dropdown's selection (default

@@ -83,6 +83,15 @@ class LiveIngest:
         self._session_id: int | None = None
         self._on_source_packet: Callable[[str, int | None], None] | None = None
         self._sources: dict[str, _SourceState] = {}
+        # Per-source decode diagnostics. ``received`` increments for
+        # every bus packet from each source (before decode); ``rejected``
+        # increments when ``decode_live_packet`` returns None. Their
+        # difference is the per-source decoded count. Used by the
+        # toolbar status to spot "this dongle is delivering bytes but
+        # nothing decodes" vs "this dongle is silent." Mutated under
+        # ``_lock`` because ``_on_packet`` runs on a reader thread.
+        self._source_received: dict[str, int] = {}
+        self._source_rejected: dict[str, int] = {}
         # One-shot diagnostic: log the first reject per source so we can
         # see the byte layout when decode_live_packet returns None for
         # everything (DLT mismatch, unexpected PHDR variant, etc.).
@@ -116,6 +125,21 @@ class LiveIngest:
         """Snapshot of per-source packet counters. Read on main thread."""
         return dict(self._sources)
 
+    def source_health(self) -> dict[str, tuple[int, int]]:
+        """Per-source ``(received, rejected)`` snapshot, main thread.
+
+        Reading is racy but cheap — we never decrement, so worst case
+        a sample shows a value that's a few packets stale. Used by the
+        toolbar status string to surface which sniffer is producing
+        decodable bytes vs which is silent or all-rejecting.
+        """
+        with self._lock:
+            return {
+                src: (self._source_received.get(src, 0),
+                      self._source_rejected.get(src, 0))
+                for src in self._source_received
+            }
+
     def start(self) -> int:
         """Open a live session and begin queuing packets. Returns session id."""
         if self.running:
@@ -148,6 +172,9 @@ class LiveIngest:
     def _on_packet(self, pkt: Packet) -> None:
         """Bus subscriber — runs on a reader thread. NO DB access."""
         self.stats.packets_received += 1
+        src = pkt.source or "?"
+        with self._lock:
+            self._source_received[src] = self._source_received.get(src, 0) + 1
         # The coordinator stamps pkt.extras["dlt"] from the pcap global
         # header so the decoder can pick the right PHDR layout
         # (256 = LE_LL_WITH_PHDR, 272 = NORDIC_BLE).
@@ -156,10 +183,13 @@ class LiveIngest:
             pkt.raw, source=pkt.source, ts=pkt.ts, dlt=dlt,
         )
         if decoded is None:
+            with self._lock:
+                self._source_rejected[src] = (
+                    self._source_rejected.get(src, 0) + 1
+                )
             # One-shot per-source hexdump so we can see what the decoder
             # rejected — distinguishes a DLT / PHDR mismatch (bytes don't
             # start with the Nordic phdr we expect) from a runtime error.
-            src = pkt.source or "?"
             if src not in self._dumped_sources:
                 self._dumped_sources.add(src)
                 head = (pkt.raw or b"")[:32]

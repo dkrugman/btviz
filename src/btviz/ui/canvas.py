@@ -467,9 +467,15 @@ _CLUSTER_PERIOD_TICKS: dict[str, int] = {
 # is a compromise between "live session feel" and "let me see what
 # was here a few minutes ago".
 _STALE_WINDOW_LABELS: tuple[str, ...] = (
+    "5s", "15s", "30s", "1m", "5m",
     "10m", "15m", "30m", "60m", "90m", "24hr", "all",
 )
 _STALE_WINDOW_SECONDS: dict[str, float | None] = {
+    "5s":   5.0,
+    "15s":  15.0,
+    "30s":  30.0,
+    "1m":   60.0,
+    "5m":   300.0,
     "10m":  600.0,
     "15m":  900.0,
     "30m":  1800.0,

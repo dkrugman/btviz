@@ -1,0 +1,22 @@
+[apple_device]
+# Apple devices broadcast Continuity TLVs constantly — the protocol
+# itself is the strongest clustering signal we have for them. Threshold
+# is set so an exact long-payload match (1.0 weighted at 0.55) plus
+# any of the supporting signals is enough to merge.
+threshold = 0.75
+min_total_weight = 0.40
+
+[apple_device.weights]
+apple_continuity  = 0.55
+mfg_data_prefix   = 0.20
+service_uuid_match = 0.10
+adv_interval      = 0.07
+rssi_signature    = 0.05
+pdu_distribution  = 0.03
+
+[apple_device.params.apple_continuity]
+# Production default — long Continuity payloads (Handoff, NearbyInfo
+# auth tags, AirPods proximity bytes) embed enough entropy at this
+# length that a byte-for-byte match between two devices is essentially
+# never coincidence.
+min_fingerprint_bytes = 8

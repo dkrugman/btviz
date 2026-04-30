@@ -51,6 +51,11 @@ from ..capture.live_ingest import LiveIngest
 from ..db.models import DeviceLayout
 from ..db.repos import Repos
 from ..db.store import Store, open_store
+from .channel_colors import (
+    channel_label as _channel_label,
+    color_for_channel as _channel_color,
+    text_color_for_channel as _channel_text_color,
+)
 
 # Bundled SVG icons (optional). Drop ``<device_class>.svg`` here and the
 # canvas renders it instead of the emoji fallback. See data/icons/README.md
@@ -116,6 +121,16 @@ _KIND_FILL = {
 }
 
 _FALLBACK_SVG_NAME = "fallback_icon"  # data/icons/fallback_icon.svg — unknown classes
+
+# Channel-activity flash on each device box. The badge appears in the
+# top-right corner of the header for this duration after each packet
+# attributed to the device. 0.6 s matches the sniffer-panel dot-flash
+# window so spectrum activity reads consistently across the two UIs.
+_CHANNEL_FLASH_DURATION_S = 0.6
+_CH_FLASH_BADGE_W = 34
+_CH_FLASH_BADGE_H = 18
+_CH_FLASH_BADGE_MARGIN = 6
+_CH_FLASH_TRAIL_W = 6   # width of each comet-tail prior-channel pip
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -607,6 +622,15 @@ class DeviceItem(QGraphicsItem):
         # right-click menu. Signature: (device) -> list[QAction]. When
         # None, no context menu is shown.
         self._context_cb = context_cb
+        # Channel flash state — populated by ``notify_channel_hit``
+        # whenever a packet for this device is recorded. We track the
+        # most-recent channel + the wall-clock time it was seen, plus
+        # a small ring of recent channels so an Auracast train hopping
+        # quickly across data channels paints a comet-tail rather than
+        # one-channel-replacing-the-other instantly.
+        self._flash_channel: int | None = None
+        self._flash_at: float = 0.0
+        self._flash_recent: list[tuple[float, int]] = []
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
@@ -617,6 +641,35 @@ class DeviceItem(QGraphicsItem):
         # broadcast name, addresses, etc.) so the user can mouse-over to
         # see what doesn't fit on screen.
         self.setToolTip(_build_tooltip(device))
+
+    def notify_channel_hit(self, channel: int | None) -> None:
+        """Record a packet hit on this device on the given channel.
+
+        Called from the canvas's per-device LiveIngest callback. The
+        channel-flash badge in the header lights up with the channel's
+        canonical color for ~_FLASH_DURATION_S seconds, fading out
+        over that window. Hits in quick succession push the prior
+        channel into a "recent tail" so a hopping device shows a
+        small streak.
+
+        Hits with ``channel=None`` (decoder couldn't determine) are
+        ignored — there's no useful color to paint.
+        """
+        if channel is None:
+            return
+        now = time.time()
+        # Keep a small recency tail (last ~6 channels in the past
+        # _FLASH_DURATION_S seconds) so an Auracast train's hop
+        # sequence reads as a comet-tail rather than a single-pixel
+        # blink.
+        self._flash_recent.append((now, channel))
+        cutoff = now - _CHANNEL_FLASH_DURATION_S
+        self._flash_recent = [
+            (t, c) for t, c in self._flash_recent if t >= cutoff
+        ][-6:]
+        self._flash_channel = channel
+        self._flash_at = now
+        self.update()
 
     # --- geometry -----------------------------------------------------
 
@@ -682,6 +735,90 @@ class DeviceItem(QGraphicsItem):
             self._paint_collapsed_body(painter)
         else:
             self._paint_expanded_body(painter)
+
+        self._paint_channel_flash(painter)
+
+    def _paint_channel_flash(self, painter: QPainter) -> None:
+        """Render the per-device channel-activity badge.
+
+        Layout: a colored pill in the top-right of the header band
+        showing the most-recently-active channel (number + canonical
+        color from ``channel_colors``). To its left, a comet-tail of
+        smaller pips for prior channels in the last few hundred ms —
+        useful for an Auracast train hopping through data channels
+        where the *sequence* tells you more than any single hit.
+
+        Both elements fade out together over ``_CHANNEL_FLASH_DURATION_S``
+        so quiet devices don't carry a stale badge.
+        """
+        if not self._flash_recent:
+            return
+        now = time.time()
+        cutoff = now - _CHANNEL_FLASH_DURATION_S
+        # Drop expired entries while we're here so memory doesn't grow.
+        self._flash_recent = [
+            (t, c) for t, c in self._flash_recent if t >= cutoff
+        ]
+        if not self._flash_recent:
+            return
+
+        # Newest first — the rightmost slot is the most recent.
+        flash_t, flash_ch = self._flash_recent[-1]
+        age = max(0.0, now - flash_t)
+        alpha = max(0.0, 1.0 - age / _CHANNEL_FLASH_DURATION_S)
+
+        right_x = _BOX_W - _CH_FLASH_BADGE_MARGIN
+        top_y = _CH_FLASH_BADGE_MARGIN
+        badge_rect = QRectF(
+            right_x - _CH_FLASH_BADGE_W, top_y,
+            _CH_FLASH_BADGE_W, _CH_FLASH_BADGE_H,
+        )
+
+        # Comet tail: small pips to the left of the main badge for
+        # the prior channels in the recent window. Skip the newest
+        # since it's drawn as the main badge.
+        prior = list(self._flash_recent[:-1])
+        if prior:
+            font = QFont()
+            font.setPointSize(7)
+            font.setBold(True)
+            painter.setFont(font)
+            for i, (t, ch) in enumerate(reversed(prior)):
+                tail_age = max(0.0, now - t)
+                tail_alpha = max(
+                    0.0, 1.0 - tail_age / _CHANNEL_FLASH_DURATION_S,
+                )
+                pip = QColor(_channel_color(ch))
+                pip.setAlphaF(tail_alpha * 0.85)
+                pip_rect = QRectF(
+                    badge_rect.left()
+                    - (i + 1) * (_CH_FLASH_TRAIL_W + 1),
+                    top_y + 2,
+                    _CH_FLASH_TRAIL_W, _CH_FLASH_BADGE_H - 4,
+                )
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(pip))
+                painter.drawRoundedRect(pip_rect, 2, 2)
+
+        # Main badge.
+        bg = QColor(_channel_color(flash_ch))
+        bg.setAlphaF(alpha)
+        fg = QColor(_channel_text_color(flash_ch))
+        fg.setAlphaF(alpha)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(bg))
+        painter.drawRoundedRect(badge_rect, 4, 4)
+
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(8)
+        painter.setFont(font)
+        painter.setPen(QPen(fg))
+        painter.drawText(
+            badge_rect,
+            Qt.AlignmentFlag.AlignCenter,
+            str(flash_ch),
+        )
 
     def _paint_collapsed_body(self, painter: QPainter) -> None:
         d = self.device
@@ -1190,6 +1327,16 @@ class CanvasWindow(QMainWindow):
         self._canvas_refresh_timer.timeout.connect(self._maybe_refresh_canvas)
         self._canvas_refresh_timer.start()
 
+        # 20 Hz repaint pump for the per-device channel-flash badges.
+        # Only one of these widgets exists per canvas, and it only runs
+        # cycles while at least one DeviceItem has an active flash —
+        # the timer auto-stops when the scene goes idle so it doesn't
+        # burn CPU at rest.
+        self._channel_flash_timer = QTimer(self)
+        self._channel_flash_timer.setInterval(50)
+        self._channel_flash_timer.timeout.connect(self._tick_channel_flash)
+        # Don't start until first hit; _on_device_packet kicks it off.
+
         # Defer the initial reload until after the window is shown. At
         # this point in __init__ the QGraphicsView's viewport hasn't
         # been laid out yet — viewport().width() returns Qt's default
@@ -1523,6 +1670,7 @@ class CanvasWindow(QMainWindow):
             session_name=f"live-{int(time.time())}",
         )
         self._live.set_packet_callback(self._on_live_packet)
+        self._live.set_device_packet_callback(self._on_device_packet)
         self._live.start()
 
         # Spawn sniffers and apply default roles. Subprocess startup can
@@ -1707,6 +1855,41 @@ class CanvasWindow(QMainWindow):
         if serial is None:
             return
         self.sniffer_panel.notify_packet(serial, channel=channel)
+
+    def _on_device_packet(self, device_id: int, channel: int | None) -> None:
+        """LiveIngest per-device notifier. Drives the per-DeviceItem
+        channel-flash badge so the canvas shows spectrum activity
+        per-device in real time.
+
+        Looks up the DeviceItem by ``device_id`` in the scene. The
+        scene gets fully rebuilt by ``reload()`` every ~2 s during
+        live capture, so an item we found a moment ago may have been
+        replaced — do the lookup fresh on every hit. The cost is one
+        scene-items() iteration; the alternative is maintaining a
+        per-canvas ``id -> DeviceItem`` index synchronized with each
+        reload, which is more bookkeeping for marginal gain at the
+        device counts we care about (low thousands).
+        """
+        for item in self.scene.items():
+            if isinstance(item, DeviceItem) and item.device.device_id == device_id:
+                item.notify_channel_hit(channel)
+                if not self._channel_flash_timer.isActive():
+                    self._channel_flash_timer.start()
+                return
+
+    def _tick_channel_flash(self) -> None:
+        """20 Hz repaint pump — calls update() on every DeviceItem
+        with an active flash so the badge alpha fades smoothly. Stops
+        the timer when no items have anything left to fade so the
+        canvas is idle at rest.
+        """
+        any_active = False
+        for item in self.scene.items():
+            if isinstance(item, DeviceItem) and item._flash_recent:
+                any_active = True
+                item.update()
+        if not any_active:
+            self._channel_flash_timer.stop()
 
     def _publish_sniffer_channels(self) -> None:
         """Push each sniffer's listening-channel set to the panel.

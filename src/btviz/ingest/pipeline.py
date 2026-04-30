@@ -108,12 +108,14 @@ class IngestContext:
     keep_packets: bool = False
 
 
-def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> bool:
+def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> "int | None":
     """Apply one packet's contribution to the DB.
 
-    Returns True if the packet was attributed to a device (observation
-    written), False if skipped (no advertising address, etc.). Does
-    NOT manage transactions — callers are responsible for tx scoping.
+    Returns the attributed ``device.id`` when the packet was recorded,
+    or ``None`` when skipped (no advertising address, etc.). Truthy/
+    falsy semantics are preserved — callers using ``if record_packet
+    (...)`` work unchanged. Does NOT manage transactions — callers are
+    responsible for tx scoping.
 
     Side effects on ``ctx``:
       * adds the device id to ``seen_device_ids``
@@ -123,7 +125,7 @@ def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> bool:
         data is seen
     """
     if not pkt.adv_addr:
-        return False
+        return None
 
     stable_key, kind = _ingest_key(pkt.adv_addr, pkt.adv_addr_type)
     device = repos.devices.upsert(stable_key, kind, now=pkt.ts)
@@ -236,7 +238,7 @@ def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> bool:
             pdu_type=pdu_int,
         )
 
-    return True
+    return device.id
 
 
 @dataclass

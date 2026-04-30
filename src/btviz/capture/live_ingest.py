@@ -38,6 +38,13 @@ from .packet import Packet
 # cadence we drive flush() at (typically 250ms).
 _DEFAULT_QUEUE_CAP = 8192
 
+# How recent a clean attribution must be to claim a CRC-failed packet on
+# the same (source, channel). Two seconds is generous enough to bridge a
+# small burst of CRC fails inside an otherwise healthy stream from the
+# same device, but short enough that we won't credit a dropout to a
+# device that stopped transmitting long ago.
+_CRC_ATTRIB_WINDOW_S = 2.0
+
 
 @dataclass
 class LiveIngestStats:
@@ -83,12 +90,25 @@ class LiveIngest:
         self._session_id: int | None = None
         self._on_source_packet: Callable[[str, int | None, bool], None] | None = None
         # Optional per-device callback fired on each successfully-recorded
-        # packet. Receives (device_id, channel) so the canvas can flash a
-        # per-device channel indicator. Distinct from the source callback
-        # because attribution to a device requires a successful
-        # ``record_packet`` (i.e. the packet had a parseable adv_addr) —
-        # the source callback fires for every decoded packet regardless.
-        self._on_device_packet: Callable[[int, int | None], None] | None = None
+        # packet. Receives (device_id, channel, crc_ok) so the canvas can
+        # flash a per-device channel indicator and render dropouts.
+        # Distinct from the source callback because attribution to a
+        # device requires a successful ``record_packet`` (i.e. the packet
+        # had a parseable adv_addr) — the source callback fires for every
+        # decoded packet regardless.
+        #
+        # CRC-failed packets cannot record (their address bits are
+        # unreliable), but we still fire this callback for them by
+        # attributing to the most recent clean device on the same
+        # (source, channel) within ``_CRC_ATTRIB_WINDOW_S``. That gives
+        # the canvas a per-device dropout flash matching the sniffer
+        # panel's CRC-fail indicator.
+        self._on_device_packet: Callable[[int, int | None, bool], None] | None = None
+        # Most recent clean attribution per (source, channel), used to
+        # route CRC-failed packets to the device that was most likely
+        # transmitting on that channel a moment ago. Stores
+        # ``(timestamp, device_id)``. Stale beyond ``_CRC_ATTRIB_WINDOW_S``.
+        self._last_clean_device: dict[tuple[str, int], tuple[float, int]] = {}
         self._sources: dict[str, _SourceState] = {}
         # Per-source decode diagnostics. ``received`` increments for
         # every bus packet from each source (before decode); ``rejected``
@@ -135,17 +155,19 @@ class LiveIngest:
         self._on_source_packet = fn
 
     def set_device_packet_callback(
-        self, fn: "Callable[[int, int | None], None] | None",
+        self, fn: "Callable[[int, int | None, bool], None] | None",
     ) -> None:
         """Set a per-device notifier called on flush (main thread).
 
-        Receives ``(device_id, channel)`` for each packet that
-        successfully recorded against a device row (i.e. ``pkt.adv_addr``
-        was parseable). Used to drive the per-device-box channel-flash
-        indicator on the canvas.
+        Receives ``(device_id, channel, crc_ok)`` for each packet
+        attributed to a device row. ``crc_ok=True`` for clean packets
+        that recorded normally; ``crc_ok=False`` for CRC-failed packets
+        that we credited to the most recent clean device on the same
+        (source, channel) inside ``_CRC_ATTRIB_WINDOW_S``.
 
-        Skipped packets (no adv_addr) don't trigger this — they wouldn't
-        have a device_id anyway.
+        Packets with no recoverable channel (None), or CRC fails with
+        no recent clean attribution on that channel, don't fire this —
+        there's no device id to point to.
         """
         self._on_device_packet = fn
 
@@ -272,12 +294,44 @@ class LiveIngest:
                         self._sources[src] = state
                     state.last_packet_ts = pkt.ts
                     state.packet_count += 1
+                    # Cache this attribution so a follow-up CRC-failed
+                    # packet on the same (source, channel) within the
+                    # window can be credited to this device.
+                    if pkt.channel is not None:
+                        self._last_clean_device[(src, pkt.channel)] = (
+                            pkt.ts, device_id,
+                        )
                     # Per-device flash: fire after successful attribution
                     # so the canvas can light up the right DeviceItem
                     # with the channel color.
                     if self._on_device_packet is not None:
                         try:
-                            self._on_device_packet(device_id, pkt.channel)
+                            self._on_device_packet(
+                                device_id, pkt.channel, pkt.crc_ok,
+                            )
+                        except Exception:  # noqa: BLE001
+                            import traceback
+                            traceback.print_exc()
+                elif (
+                    not pkt.crc_ok
+                    and pkt.channel is not None
+                    and self._on_device_packet is not None
+                ):
+                    # CRC-failed packets cannot record (address bits are
+                    # unreliable), but we want a per-device dropout flash
+                    # on the canvas. Credit the device that was most
+                    # recently transmitting cleanly on this same
+                    # (source, channel) pairing — that's the device the
+                    # sniffer's radio was tracking when the dropout hit.
+                    cached = self._last_clean_device.get((src, pkt.channel))
+                    if (
+                        cached is not None
+                        and pkt.ts - cached[0] <= _CRC_ATTRIB_WINDOW_S
+                    ):
+                        try:
+                            self._on_device_packet(
+                                cached[1], pkt.channel, False,
+                            )
                         except Exception:  # noqa: BLE001
                             import traceback
                             traceback.print_exc()

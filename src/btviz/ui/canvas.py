@@ -86,8 +86,11 @@ def _icon_renderer(device_class: str | None) -> QSvgRenderer | None:
 # Visual constants. Tuned for a ~1400×900 starting window.
 _BOX_W = 220
 _HEADER_H = 50
-_BOX_H_COLLAPSED = _HEADER_H + 30   # body holds one summary line
-_BOX_H_EXPANDED = _HEADER_H + 220   # body holds detailed info block
+# Collapsed body now holds three lines: summary, quality counters, and a
+# gauge icon strip. Expanded body grew by the same amount so the detail
+# block keeps the same vertical space it had before.
+_BOX_H_COLLAPSED = _HEADER_H + 52
+_BOX_H_EXPANDED = _HEADER_H + 242
 _BOX_RADIUS = 10
 _GRID_DX = _BOX_W + 24               # column pitch (box + gutter)
 _GRID_DY = _BOX_H_COLLAPSED + 22     # row pitch (collapsed-box + gutter)
@@ -131,6 +134,32 @@ _CH_FLASH_BADGE_W = 34
 _CH_FLASH_BADGE_H = 18
 _CH_FLASH_BADGE_MARGIN = 6
 _CH_FLASH_TRAIL_W = 6   # width of each comet-tail prior-channel pip
+
+# Advertising-channel strip (37/38/39): three small squares placed below
+# the data-channel badge in the header. Splits adv vs data activity so a
+# device sitting on a primary channel doesn't drown out occasional
+# data-channel hits (or vice-versa). Each square is independently faded.
+_ADV_CH_BOX_W = 14
+_ADV_CH_BOX_H = 14
+_ADV_CH_BOX_GAP = 2
+_ADV_STRIP_TOP_Y = (
+    _CH_FLASH_BADGE_MARGIN + _CH_FLASH_BADGE_H + 4
+)
+
+# Dropout flash (CRC-fail). When a packet is reported but its CRC didn't
+# verify we paint the indicator black with a red number — same treatment
+# the sniffer-panel channel tag uses, so the two UIs read alike.
+_FLASH_DROPOUT_BG = QColor(20, 20, 28)
+_FLASH_DROPOUT_FG = QColor(230, 70, 70)
+
+# Quality gauge icon at the bottom-right of the collapsed body. Solid
+# coloured dot whose hue tracks the device's CRC-fail rate. Tracks the
+# same green/yellow/red bands the sniffer-panel summary uses.
+_QUALITY_DOT_R = 5
+_QUALITY_GREEN = QColor(60, 180, 90)
+_QUALITY_YELLOW = QColor(220, 180, 50)
+_QUALITY_RED = QColor(220, 70, 70)
+_QUALITY_NEUTRAL = QColor(170, 170, 170)  # before any packets observed
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -640,14 +669,27 @@ class DeviceItem(QGraphicsItem):
         # None, no context menu is shown.
         self._context_cb = context_cb
         # Channel flash state — populated by ``notify_channel_hit``
-        # whenever a packet for this device is recorded. We track the
-        # most-recent channel + the wall-clock time it was seen, plus
-        # a small ring of recent channels so an Auracast train hopping
-        # quickly across data channels paints a comet-tail rather than
-        # one-channel-replacing-the-other instantly.
-        self._flash_channel: int | None = None
-        self._flash_at: float = 0.0
-        self._flash_recent: list[tuple[float, int]] = []
+        # whenever a packet for this device is recorded. Split into
+        # data (channels 0-36) and advertising (37-39) so the two
+        # populations of activity render in their own indicators:
+        # the data-channel badge sits in the top-right of the header,
+        # the adv strip sits below it.
+        #
+        # ``_data_flash_recent`` keeps a small recency tail of
+        # (ts, channel, crc_fail) tuples so a hopping Auracast train
+        # paints a comet-tail. ``_adv_flash`` is keyed by channel
+        # (37/38/39) holding the latest (ts, crc_fail) — adv channels
+        # don't hop, so we only need the most recent hit per channel
+        # for fade rendering.
+        self._data_flash_recent: list[tuple[float, int, bool]] = []
+        self._adv_flash: dict[int, tuple[float, bool]] = {}
+        # Per-device CRC quality counters mirror the sniffer-panel
+        # ones. ``_good_packets`` increments on every clean attribution;
+        # ``_bad_packets`` increments on each CRC-failed packet credited
+        # to this device by the LiveIngest last-clean-device cache.
+        # Surfaced in the collapsed body's quality line and gauge.
+        self._good_packets: int = 0
+        self._bad_packets: int = 0
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
@@ -659,33 +701,38 @@ class DeviceItem(QGraphicsItem):
         # see what doesn't fit on screen.
         self.setToolTip(_build_tooltip(device))
 
-    def notify_channel_hit(self, channel: int | None) -> None:
+    def notify_channel_hit(
+        self, channel: int | None, crc_ok: bool = True,
+    ) -> None:
         """Record a packet hit on this device on the given channel.
 
-        Called from the canvas's per-device LiveIngest callback. The
-        channel-flash badge in the header lights up with the channel's
-        canonical color for ~_FLASH_DURATION_S seconds, fading out
-        over that window. Hits in quick succession push the prior
-        channel into a "recent tail" so a hopping device shows a
-        small streak.
+        Called from the canvas's per-device LiveIngest callback.
+        Channels 0-36 (data) flash the header badge; 37/38/39 (adv)
+        flash one of the three squares in the adv strip below it.
+        Each indicator is independently faded over
+        ``_CHANNEL_FLASH_DURATION_S``.
 
-        Hits with ``channel=None`` (decoder couldn't determine) are
-        ignored — there's no useful color to paint.
+        ``crc_ok=False`` flags a dropout — the indicator paints black
+        with a red glyph instead of the channel-color.
+
+        Hits with ``channel=None`` are ignored for flash routing but
+        the CRC counter still ticks so quality stats stay correct.
         """
+        if not crc_ok:
+            self._bad_packets += 1
+        else:
+            self._good_packets += 1
         if channel is None:
             return
         now = time.time()
-        # Keep a small recency tail (last ~6 channels in the past
-        # _FLASH_DURATION_S seconds) so an Auracast train's hop
-        # sequence reads as a comet-tail rather than a single-pixel
-        # blink.
-        self._flash_recent.append((now, channel))
-        cutoff = now - _CHANNEL_FLASH_DURATION_S
-        self._flash_recent = [
-            (t, c) for t, c in self._flash_recent if t >= cutoff
-        ][-6:]
-        self._flash_channel = channel
-        self._flash_at = now
+        if channel >= 37:
+            self._adv_flash[channel] = (now, not crc_ok)
+        else:
+            self._data_flash_recent.append((now, channel, not crc_ok))
+            cutoff = now - _CHANNEL_FLASH_DURATION_S
+            self._data_flash_recent = [
+                e for e in self._data_flash_recent if e[0] >= cutoff
+            ][-6:]
         self.update()
 
     # --- geometry -----------------------------------------------------
@@ -756,33 +803,29 @@ class DeviceItem(QGraphicsItem):
         self._paint_channel_flash(painter)
 
     def _paint_channel_flash(self, painter: QPainter) -> None:
-        """Render the per-device channel-activity badge.
+        """Render the per-device channel-activity indicators.
 
-        Layout: a colored pill in the top-right of the header band
-        showing the most-recently-active channel (number + canonical
-        color from ``channel_colors``). To its left, a comet-tail of
-        smaller pips for prior channels in the last few hundred ms —
-        useful for an Auracast train hopping through data channels
-        where the *sequence* tells you more than any single hit.
+        Two stacked elements in the top-right of the header band:
 
-        Both elements fade out together over ``_CHANNEL_FLASH_DURATION_S``
-        so quiet devices don't carry a stale badge.
+        * The data-channel badge — most-recently-active channel in
+          0-36 with its canonical channel-color, plus a comet-tail of
+          prior data hits for hopping streams (e.g. Auracast).
+        * The advertising strip — three small squares (37/38/39),
+          each independently lit when that primary channel sees a hit.
+
+        Both fade over ``_CHANNEL_FLASH_DURATION_S``. CRC-failed hits
+        paint black with a red glyph (matching the sniffer panel's
+        dropout treatment) so a dropping device reads the same way
+        in both UIs.
         """
-        if not self._flash_recent:
-            return
         now = time.time()
         cutoff = now - _CHANNEL_FLASH_DURATION_S
-        # Drop expired entries while we're here so memory doesn't grow.
-        self._flash_recent = [
-            (t, c) for t, c in self._flash_recent if t >= cutoff
-        ]
-        if not self._flash_recent:
-            return
 
-        # Newest first — the rightmost slot is the most recent.
-        flash_t, flash_ch = self._flash_recent[-1]
-        age = max(0.0, now - flash_t)
-        alpha = max(0.0, 1.0 - age / _CHANNEL_FLASH_DURATION_S)
+        # ---- data badge (channels 0-36) ---------------------------------
+        # Drop expired entries while we're here so memory doesn't grow.
+        self._data_flash_recent = [
+            e for e in self._data_flash_recent if e[0] >= cutoff
+        ]
 
         right_x = _BOX_W - _CH_FLASH_BADGE_MARGIN
         top_y = _CH_FLASH_BADGE_MARGIN
@@ -791,61 +834,172 @@ class DeviceItem(QGraphicsItem):
             _CH_FLASH_BADGE_W, _CH_FLASH_BADGE_H,
         )
 
-        # Comet tail: small pips to the left of the main badge for
-        # the prior channels in the recent window. Skip the newest
-        # since it's drawn as the main badge.
-        prior = list(self._flash_recent[:-1])
-        if prior:
-            font = QFont()
-            font.setPointSize(7)
-            font.setBold(True)
-            painter.setFont(font)
-            for i, (t, ch) in enumerate(reversed(prior)):
-                tail_age = max(0.0, now - t)
-                tail_alpha = max(
-                    0.0, 1.0 - tail_age / _CHANNEL_FLASH_DURATION_S,
-                )
-                pip = QColor(_channel_color(ch))
-                pip.setAlphaF(tail_alpha * 0.85)
-                pip_rect = QRectF(
-                    badge_rect.left()
-                    - (i + 1) * (_CH_FLASH_TRAIL_W + 1),
-                    top_y + 2,
-                    _CH_FLASH_TRAIL_W, _CH_FLASH_BADGE_H - 4,
-                )
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(pip))
-                painter.drawRoundedRect(pip_rect, 2, 2)
+        if self._data_flash_recent:
+            flash_t, flash_ch, flash_bad = self._data_flash_recent[-1]
+            age = max(0.0, now - flash_t)
+            alpha = max(0.0, 1.0 - age / _CHANNEL_FLASH_DURATION_S)
 
-        # Main badge.
-        bg = QColor(_channel_color(flash_ch))
+            prior = list(self._data_flash_recent[:-1])
+            if prior:
+                font = QFont()
+                font.setPointSize(7)
+                font.setBold(True)
+                painter.setFont(font)
+                for i, (t, ch, bad) in enumerate(reversed(prior)):
+                    tail_age = max(0.0, now - t)
+                    tail_alpha = max(
+                        0.0, 1.0 - tail_age / _CHANNEL_FLASH_DURATION_S,
+                    )
+                    pip = QColor(
+                        _FLASH_DROPOUT_BG if bad else _channel_color(ch)
+                    )
+                    pip.setAlphaF(tail_alpha * 0.85)
+                    pip_rect = QRectF(
+                        badge_rect.left()
+                        - (i + 1) * (_CH_FLASH_TRAIL_W + 1),
+                        top_y + 2,
+                        _CH_FLASH_TRAIL_W, _CH_FLASH_BADGE_H - 4,
+                    )
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QBrush(pip))
+                    painter.drawRoundedRect(pip_rect, 2, 2)
+
+            self._paint_flash_cell(
+                painter, badge_rect, flash_ch, flash_bad, alpha,
+                font_pt=8,
+            )
+
+        # ---- adv strip (channels 37/38/39) ------------------------------
+        # Three squares right-aligned under the data badge. Even when
+        # nothing has fired yet we draw faint placeholders so the user
+        # knows where the indicators live.
+        strip_total_w = (
+            3 * _ADV_CH_BOX_W + 2 * _ADV_CH_BOX_GAP
+        )
+        strip_left = right_x - strip_total_w
+        for idx, ch in enumerate((37, 38, 39)):
+            cell_x = strip_left + idx * (_ADV_CH_BOX_W + _ADV_CH_BOX_GAP)
+            cell_rect = QRectF(
+                cell_x, _ADV_STRIP_TOP_Y, _ADV_CH_BOX_W, _ADV_CH_BOX_H,
+            )
+            entry = self._adv_flash.get(ch)
+            if entry is not None and entry[0] >= cutoff:
+                age = max(0.0, now - entry[0])
+                alpha = max(0.0, 1.0 - age / _CHANNEL_FLASH_DURATION_S)
+                self._paint_flash_cell(
+                    painter, cell_rect, ch, entry[1], alpha,
+                    font_pt=7, radius=3,
+                )
+            else:
+                # Idle placeholder: faint outline of the channel color
+                # so the user can locate the indicator at a glance.
+                outline = QColor(_channel_color(ch))
+                outline.setAlphaF(0.18)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(outline, 1))
+                painter.drawRoundedRect(cell_rect, 3, 3)
+
+    @staticmethod
+    def _paint_flash_cell(
+        painter: QPainter,
+        rect: QRectF,
+        channel: int,
+        crc_fail: bool,
+        alpha: float,
+        *,
+        font_pt: int,
+        radius: int = 4,
+    ) -> None:
+        """Shared rendering for one flash cell (data badge or adv square).
+
+        Picks the channel-color (or the dropout black/red pair for
+        CRC failures) and draws filled rect + centered channel number.
+        """
+        if crc_fail:
+            bg = QColor(_FLASH_DROPOUT_BG)
+            fg = QColor(_FLASH_DROPOUT_FG)
+        else:
+            bg = QColor(_channel_color(channel))
+            fg = QColor(_channel_text_color(channel))
         bg.setAlphaF(alpha)
-        fg = QColor(_channel_text_color(flash_ch))
         fg.setAlphaF(alpha)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(bg))
-        painter.drawRoundedRect(badge_rect, 4, 4)
+        painter.drawRoundedRect(rect, radius, radius)
 
         font = QFont()
         font.setBold(True)
-        font.setPointSize(8)
+        font.setPointSize(font_pt)
         painter.setFont(font)
         painter.setPen(QPen(fg))
         painter.drawText(
-            badge_rect,
+            rect,
             Qt.AlignmentFlag.AlignCenter,
-            str(flash_ch),
+            str(channel),
         )
 
     def _paint_collapsed_body(self, painter: QPainter) -> None:
         d = self.device
         rssi = f"{d.rssi_avg:.0f}" if d.rssi_avg is not None else "—"
-        top_chs = sorted(d.channels.items(), key=lambda kv: -kv[1])[:3]
-        ch_str = "/".join(str(c) for c, _ in top_chs) if top_chs else "—"
+        all_chs = sorted(d.channels.items(), key=lambda kv: -kv[1])
+        top_chs = all_chs[:3]
+        if all_chs:
+            ch_str = "/".join(str(c) for c, _ in top_chs)
+            extra = len(all_chs) - len(top_chs)
+            if extra > 0:
+                ch_str += f" +{extra}"
+        else:
+            ch_str = "—"
         line = f"{d.packet_count:,} pkts · {rssi} dBm · ch {ch_str}"
         painter.drawText(
             QRectF(8, _HEADER_H + 4, _BOX_W - 16, 16),
             Qt.AlignVCenter | Qt.AlignLeft, line,
+        )
+        self._paint_quality_line(painter, _HEADER_H + 22)
+
+    def _paint_quality_line(self, painter: QPainter, y: float) -> None:
+        """Render the per-device CRC-quality line + gauge dot.
+
+        Same format as the sniffer panel summary: ``X good · Y CRC-fail
+        (Z%)`` followed by a small filled circle whose colour tracks the
+        error rate (green / yellow / red). When no packets have flowed
+        through this device since the canvas opened we show a neutral
+        dot so the user still knows the gauge is there.
+        """
+        good = self._good_packets
+        bad = self._bad_packets
+        total = good + bad
+        if total == 0:
+            txt = "Quality: — (no packets yet)"
+            color = _QUALITY_NEUTRAL
+        else:
+            bad_pct = 100.0 * bad / total
+            txt = (
+                f"{good:,} good · {bad:,} CRC-fail ({bad_pct:.1f}%)"
+            )
+            if bad_pct < 1.0:
+                color = _QUALITY_GREEN
+            elif bad_pct < 5.0:
+                color = _QUALITY_YELLOW
+            else:
+                color = _QUALITY_RED
+        # Reserve space on the right for the gauge dot, then draw the
+        # text in the remaining width so a long count never collides
+        # with the indicator.
+        dot_cx = _BOX_W - 12
+        dot_cy = y + 8
+        text_rect = QRectF(8, y, _BOX_W - 28, 16)
+        painter.setPen(QColor(50, 50, 50))
+        painter.drawText(
+            text_rect, Qt.AlignVCenter | Qt.AlignLeft, txt,
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(color))
+        painter.drawEllipse(
+            QRectF(
+                dot_cx - _QUALITY_DOT_R, dot_cy - _QUALITY_DOT_R,
+                _QUALITY_DOT_R * 2, _QUALITY_DOT_R * 2,
+            )
         )
 
     def _paint_expanded_body(self, painter: QPainter) -> None:
@@ -902,6 +1056,12 @@ class DeviceItem(QGraphicsItem):
             line(f"  {addr}")
         if len(d.addresses) > 4:
             line(f"  +{len(d.addresses) - 4} more")
+
+        # CRC-quality line + gauge dot at the bottom of the body. Same
+        # rendering as the collapsed view so the indicator's location
+        # stays consistent when the user expands a box.
+        body_h = _BOX_H_EXPANDED - _HEADER_H
+        self._paint_quality_line(painter, _HEADER_H + body_h - 18)
 
     @staticmethod
     def _truncate(s: str, n: int) -> str:
@@ -1893,10 +2053,17 @@ class CanvasWindow(QMainWindow):
             serial, channel=channel, crc_ok=crc_ok,
         )
 
-    def _on_device_packet(self, device_id: int, channel: int | None) -> None:
+    def _on_device_packet(
+        self, device_id: int, channel: int | None, crc_ok: bool = True,
+    ) -> None:
         """LiveIngest per-device notifier. Drives the per-DeviceItem
         channel-flash badge so the canvas shows spectrum activity
         per-device in real time.
+
+        ``crc_ok=False`` is fired by LiveIngest for CRC-failed packets
+        that it credited to this device via the last-clean-device
+        cache, so the canvas can render a dropout flash matching the
+        sniffer panel.
 
         Looks up the DeviceItem by ``device_id`` in the scene. The
         scene gets fully rebuilt by ``reload()`` every ~2 s during
@@ -1909,7 +2076,7 @@ class CanvasWindow(QMainWindow):
         """
         for item in self.scene.items():
             if isinstance(item, DeviceItem) and item.device.device_id == device_id:
-                item.notify_channel_hit(channel)
+                item.notify_channel_hit(channel, crc_ok=crc_ok)
                 if not self._channel_flash_timer.isActive():
                     self._channel_flash_timer.start()
                 return
@@ -1922,7 +2089,9 @@ class CanvasWindow(QMainWindow):
         """
         any_active = False
         for item in self.scene.items():
-            if isinstance(item, DeviceItem) and item._flash_recent:
+            if isinstance(item, DeviceItem) and (
+                item._data_flash_recent or item._adv_flash
+            ):
                 any_active = True
                 item.update()
         if not any_active:

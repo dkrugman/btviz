@@ -30,13 +30,38 @@ from __future__ import annotations
 
 import time
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import QSizePolicy, QWidget
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QColor,
+    QFont,
+    QPainter,
+    QPen,
+    QPolygonF,
+)
+from PySide6.QtWidgets import QMenu, QSizePolicy, QToolTip, QWidget
 
 from .channel_colors import (
     color_for_channel as _channel_color,
     text_color_for_channel as _channel_text_color,
+)
+
+# BLE physical-channel index → center frequency (MHz). Adv channels
+# 37/38/39 are interleaved with the data channels in the 2.4 GHz
+# band: 37 sits below ch 0, 38 between ch 10 and 11, 39 above ch 36.
+# Used by the "sort by frequency" view and the per-box tooltip.
+_CHANNEL_MHZ: dict[int, int] = {
+    37: 2402,
+    **{c: 2404 + 2 * c for c in range(0, 11)},   # ch 0..10  → 2404..2424
+    38: 2426,
+    **{c: 2428 + 2 * (c - 11) for c in range(11, 37)},  # ch 11..36 → 2428..2478
+    39: 2480,
+}
+# Channels listed in ascending physical-frequency order — the alternative
+# display ordering exposed via the right-click sort menu.
+_CHANNELS_BY_FREQ: list[int] = sorted(
+    _CHANNEL_MHZ, key=lambda c: _CHANNEL_MHZ[c],
 )
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -121,9 +146,19 @@ class ChannelStrip(QWidget):
 
     expansionChanged = Signal(bool)
 
+    SORT_BY_CHANNEL = "channel"
+    SORT_BY_FREQUENCY = "frequency"
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._expanded = False
+        # Display order. ``"channel"`` paints boxes 0..39 left-to-right
+        # (index order — easy to find a known channel); ``"frequency"``
+        # paints them in physical-spectrum order, so 37 sits at the
+        # left edge between the band's lower guard and ch 0, 38 in the
+        # middle, 39 at the right edge. Toggled via the right-click
+        # menu on the strip.
+        self._sort_mode: str = self.SORT_BY_CHANNEL
         # Per-channel "last hit" timestamp + CRC-fail flag for the box
         # flash. Mirror of the per-(serial, channel) dict in the
         # sniffer panel — keyed by channel index here since this strip
@@ -210,6 +245,30 @@ class ChannelStrip(QWidget):
         return (
             _PANEL_H_EXPANDED if self._expanded else _PANEL_H_COLLAPSED
         )
+
+    def _channel_order(self) -> list[int]:
+        """Channels listed in current display (left-to-right) order."""
+        if self._sort_mode == self.SORT_BY_FREQUENCY:
+            return _CHANNELS_BY_FREQ
+        return list(range(_NUM_CHANNELS))
+
+    def _channel_at_pos(self, pos) -> int | None:
+        """Return the channel under widget-coords ``pos``, or None.
+
+        Used by the hover tooltip + right-click menu to identify which
+        box the cursor is over. Walks the same metrics the paint loop
+        uses so it stays in sync if the strip resizes.
+        """
+        box_w, total_w = self._box_metrics()
+        strip_left = (self.width() - total_w) // 2
+        x = pos.x() - strip_left
+        if x < 0 or x >= total_w:
+            return None
+        pitch = box_w + _BOX_GAP
+        idx = int(x // pitch)
+        if not 0 <= idx < _NUM_CHANNELS:
+            return None
+        return self._channel_order()[idx]
 
     # --------------------------------------------------------- internals
 
@@ -331,8 +390,8 @@ class ChannelStrip(QWidget):
         font.setBold(True)
         font.setPointSize(8 if box_w < 28 else 9)
         p.setFont(font)
-        for c in range(_NUM_CHANNELS):
-            x = left + c * (box_w + _BOX_GAP)
+        for slot, c in enumerate(self._channel_order()):
+            x = left + slot * (box_w + _BOX_GAP)
             rect = QRectF(x, top, box_w, _BOX_H_COLLAPSED)
             entry_t = self._hit_at.get(c)
             crc_fail = (
@@ -389,8 +448,8 @@ class ChannelStrip(QWidget):
             scale_max = max(scale_max, live, self._peak_height[c])
 
         h = area.height()
-        for c in range(_NUM_CHANNELS):
-            x = area.left() + c * (box_w + _BOX_GAP)
+        for slot, c in enumerate(self._channel_order()):
+            x = area.left() + slot * (box_w + _BOX_GAP)
             live = float(sum(self._bins[c]))
             bar_h = (live / scale_max) * h if scale_max > 0 else 0.0
             bar_rect = QRectF(
@@ -439,8 +498,67 @@ class ChannelStrip(QWidget):
     # -------------------------------------------------------- interaction
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
+        # Left-click toggles expansion. Right-click is left for
+        # ``contextMenuEvent`` to handle so it doesn't also flip the
+        # panel out from under the menu.
         if event.button() == Qt.MouseButton.LeftButton:
             self.toggle()
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        """Right-click → sort-mode menu.
+
+        Tiny menu (two items) so the user can flip between
+        index-ordered (default) and frequency-ordered display. The
+        right-click is the only space on the strip — there's no room
+        for a toolbar control given the 40 boxes already eat the
+        full width budget.
+        """
+        menu = QMenu(self)
+        a_chan = QAction("Sort by channel #", self)
+        a_chan.setCheckable(True)
+        a_chan.setChecked(self._sort_mode == self.SORT_BY_CHANNEL)
+        a_chan.triggered.connect(
+            lambda: self._set_sort_mode(self.SORT_BY_CHANNEL),
+        )
+        a_freq = QAction("Sort by frequency", self)
+        a_freq.setCheckable(True)
+        a_freq.setChecked(self._sort_mode == self.SORT_BY_FREQUENCY)
+        a_freq.triggered.connect(
+            lambda: self._set_sort_mode(self.SORT_BY_FREQUENCY),
+        )
+        menu.addAction(a_chan)
+        menu.addAction(a_freq)
+        menu.exec(event.globalPos())
+        event.accept()
+
+    def _set_sort_mode(self, mode: str) -> None:
+        if self._sort_mode == mode:
+            return
+        self._sort_mode = mode
+        self.update()
+
+    def event(self, ev) -> bool:  # noqa: N802 (Qt naming)
+        """Per-box tooltips fire on hover via QEvent.ToolTip.
+
+        Custom-painted widgets don't get setToolTip-per-region for
+        free — we override the dispatch and translate cursor pos to
+        a channel box. Outside any box the tooltip stays hidden.
+        """
+        if ev.type() == QEvent.Type.ToolTip:
+            ch = self._channel_at_pos(ev.pos())
+            if ch is None:
+                QToolTip.hideText()
+                ev.ignore()
+                return True
+            mhz = _CHANNEL_MHZ.get(ch)
+            kind = "adv" if ch >= 37 else "data"
+            QToolTip.showText(
+                ev.globalPos(),
+                f"Channel {ch} ({kind}) — {mhz} MHz",
+                self,
+            )
+            return True
+        return super().event(ev)

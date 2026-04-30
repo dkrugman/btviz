@@ -47,14 +47,52 @@ def _params(raw: Mapping[str, Any] | None) -> _Params:
 def _observations_on_sniffer(
     ctx: ClusterContext, device: Device
 ) -> dict[int, list[float]]:
-    """Return {sniffer_short_id: [ts, ...]} for the device.
+    """Return {sniffer_id: [ts, ...]} for the device.
 
-    For the in-memory test path, observations are attached to the
-    ctx.cache under key 'observations'. For the DB-backed path
-    (post-schema), this becomes a SELECT against the packets table.
+    Two ingestion paths share this function:
+
+    1. **In-memory tests.** Synthetic observations are pre-loaded
+       into ``ctx.cache["observations"]`` as ``{device_id: {sniffer_id:
+       [ts, ...]}}``. Used by tests/cluster/test_framework.py.
+
+    2. **Production (DB-backed).** When ``ctx.cache["observations"]``
+       has no entry for this device, lazy-load from the ``packets``
+       table. The result is cached so subsequent pairs sharing this
+       device read from memory. With cache disabled the cost is one
+       SQL query per device per run; ``run_once`` typically touches
+       N devices and queries each one ~N times across the O(n²)
+       pair loop, so caching turns N² queries into N.
+
+    The fallback path also writes its result back into the cache, so
+    tests that mix synthetic + DB-backed inputs in one ctx (none
+    today, but future-proofing) get consistent behavior.
+
+    Returns an empty dict when the device has no packet history (no
+    sniffers ever attributed observations to it). The signal's
+    ``applies_to`` will then return False and the aggregator routes
+    the pair through ``missing_eventually`` if rotation_cohort is
+    required-eventually for the profile.
     """
-    obs_by_device = ctx.cache.get("observations", {})
-    return obs_by_device.get(device.id, {})
+    cache = ctx.cache.setdefault("observations", {})
+    if device.id in cache:
+        return cache[device.id]
+
+    if ctx.db is None:
+        cache[device.id] = {}
+        return {}
+
+    rows = ctx.db.conn.execute(
+        "SELECT sniffer_id, ts FROM packets"
+        " WHERE device_id = ? AND sniffer_id IS NOT NULL",
+        (device.id,),
+    ).fetchall()
+    out: dict[int, list[float]] = {}
+    for r in rows:
+        sniffer_id = r["sniffer_id"] if not isinstance(r, (tuple, list)) else r[0]
+        ts = r["ts"] if not isinstance(r, (tuple, list)) else r[1]
+        out.setdefault(sniffer_id, []).append(ts)
+    cache[device.id] = out
+    return out
 
 
 class RotationCohort:

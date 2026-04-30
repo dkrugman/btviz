@@ -81,7 +81,7 @@ class LiveIngest:
         self._unsub: Callable[[], None] | None = None
         self._ctx: IngestContext | None = None
         self._session_id: int | None = None
-        self._on_source_packet: Callable[[str], None] | None = None
+        self._on_source_packet: Callable[[str, int | None], None] | None = None
         self._sources: dict[str, _SourceState] = {}
         # One-shot diagnostic: log the first reject per source so we can
         # see the byte layout when decode_live_packet returns None for
@@ -99,12 +99,16 @@ class LiveIngest:
     def running(self) -> bool:
         return self._unsub is not None
 
-    def set_packet_callback(self, fn: Callable[[str], None] | None) -> None:
+    def set_packet_callback(
+        self, fn: Callable[[str, int | None], None] | None,
+    ) -> None:
         """Set a per-source notifier called on flush (main thread).
 
-        Receives the packet's ``source`` (dongle short id) for each
-        successfully-attributed packet. Used to drive sniffer-panel
-        activity dots.
+        Receives ``(source, channel)`` for each decoded packet — source
+        is the dongle short id; channel is the BLE channel index (0-39)
+        from the decoded pseudo-header, or ``None`` when the decoder
+        couldn't determine it. Used to drive sniffer-panel activity
+        dots and the per-row channel-tag highlight.
         """
         self._on_source_packet = fn
 
@@ -197,7 +201,7 @@ class LiveIngest:
                 # frames, SCAN_RSP, hub-connected sniffers on non-primary chs).
                 if self._on_source_packet is not None:
                     try:
-                        self._on_source_packet(src)
+                        self._on_source_packet(src, pkt.channel)
                     except Exception:  # noqa: BLE001
                         import traceback
                         traceback.print_exc()

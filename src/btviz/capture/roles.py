@@ -15,10 +15,47 @@ everything else is a direct setting.
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 
 # Primary BLE advertising channels.
 PRIMARY_ADV_CHANNELS: tuple[int, ...] = (37, 38, 39)
+
+# Data channels — everything that's not a primary advertising channel.
+# BLE channel index space is 0..39; 37/38/39 are advertising, 0..36 are
+# data. Some of these can also carry secondary-advertising payloads on
+# 5.0+ extended advertising, but for our purposes the distinction here
+# is just "channels a sniffer can be pointed at to hear connection /
+# extended-advertising traffic."
+DATA_CHANNELS: tuple[int, ...] = tuple(range(37))
+
+
+def find_unmonitored_stream(
+    excluded: "set[int] | None" = None,
+    *,
+    rng: random.Random | None = None,
+) -> int:
+    """Pick a random data channel (0..36) the caller is not already on.
+
+    Today this is a stub for testing the sniffer panel's channel
+    display: idle sniffers are assigned a random data channel so the
+    panel shows something meaningful while the real "tune to expected
+    data-channel transmissions based on advertising data" logic is
+    designed.
+
+    ``excluded`` lets the caller pass channels already covered by other
+    sniffers so we spread out instead of stacking. Passing ``None`` (or
+    an empty set) returns any data channel. ``rng`` is for deterministic
+    tests; defaults to the module-global Random.
+    """
+    pool = [c for c in DATA_CHANNELS if not excluded or c not in excluded]
+    if not pool:
+        # All 37 data channels covered — just pick any. Saves the caller
+        # from needing to handle "all monitored already" as a special case
+        # while we're in the testing-stub stage.
+        pool = list(DATA_CHANNELS)
+    rng = rng or random
+    return rng.choice(pool)
 
 
 @dataclass(frozen=True)

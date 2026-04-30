@@ -38,7 +38,9 @@ from ..db.store import Store
 # Visual constants
 # ──────────────────────────────────────────────────────────────────────────
 
-_STRIP_W = 22                  # collapsed-panel width (px)
+_STRIP_W = 76                  # collapsed-panel width (px); widened from
+                               # 22 to fit the channel-tag column to the
+                               # right of each dot.
 _PANEL_W = 280                 # expanded-panel width (px)
 _DOT_SIZE = 12
 _ROW_H = 52                    # row pitch (same in both states so dots
@@ -46,6 +48,23 @@ _ROW_H = 52                    # row pitch (same in both states so dots
 _TOP_PAD = 14
 _CHEVRON_W = 14
 _CHEVRON_H = 28
+_DOT_X = 11                    # dot column center stays at the original
+                               # narrow position, so existing tooltips and
+                               # hit-tests don't shift when we widened the
+                               # strip.
+
+# Channel-tag column. Sits right of the dot in both collapsed and
+# expanded modes. Renders the sniffer's listening set (1-3 advertising
+# channels, or one data channel for idle test mode) with the currently-
+# active one highlighted in a filled pill.
+_CH_COL_X = _DOT_X + _DOT_SIZE // 2 + 6
+_CH_COL_W = _STRIP_W - _CH_COL_X - 4
+_CH_TAG_H = 14
+_CH_TAG_BG_IDLE = QColor(225, 225, 232)
+_CH_TAG_BG_ACTIVE = QColor(95, 165, 235)
+_CH_TAG_FG_IDLE = QColor(80, 80, 90)
+_CH_TAG_FG_ACTIVE = QColor(255, 255, 255)
+_CH_TAG_FONT_PT = 8
 
 # Shape geometry (expanded mode). Dongles are 1:3, DKs ~1:2.15 — actual
 # aspect ratios of the hardware so the silhouettes read at a glance.
@@ -132,6 +151,19 @@ class SnifferPanel(QWidget):
         # Used to compute the flash decay; populated by notify_packet().
         self._last_packet_at: dict[str, float] = {}
 
+        # serial_number -> tuple of channel ints the sniffer is currently
+        # hopping over. Populated by ``set_sniffer_channels`` from the
+        # capture coordinator (reflects the role: Pinned/ScanUnmonitored/
+        # Follow). Empty / missing means "we don't know what it's
+        # listening to" — channel tags are skipped for that row.
+        self._listening_channels: dict[str, tuple[int, ...]] = {}
+
+        # serial_number -> the most recently observed channel for that
+        # sniffer (from pkt.channel of the last decoded packet).
+        # Highlighted in the channel-tag column. None until the first
+        # packet arrives, in which case no tag is bolded.
+        self._current_channel: dict[str, int | None] = {}
+
         # Hovered X-button index (sniffer row), if any. Used to render
         # the destructive button in red on hover.
         self._x_btn_hover_idx: int | None = None
@@ -169,14 +201,47 @@ class SnifferPanel(QWidget):
         )
         self.update()
 
-    def notify_packet(self, serial_number: str) -> None:
+    def set_sniffer_channels(
+        self, serial_number: str, channels: "list[int] | tuple[int, ...]",
+    ) -> None:
+        """Tell the panel which channels this sniffer is hopping over.
+
+        Driven by the capture coordinator: when a sniffer is started or
+        its role changes, push the new listening set here. 1-3 entries
+        for adv mode, 1 entry for follow / idle-stub. Pass an empty
+        sequence to clear (no channel tags painted for this row).
+        """
+        cur = self._listening_channels.get(serial_number)
+        new = tuple(channels)
+        if cur == new:
+            return
+        self._listening_channels[serial_number] = new
+        # Drop the current-channel highlight if it's no longer in the
+        # new set; otherwise the wrong tag would stay highlighted until
+        # the next packet arrives.
+        active = self._current_channel.get(serial_number)
+        if active is not None and active not in new:
+            self._current_channel[serial_number] = None
+        self.update()
+
+    def notify_packet(
+        self, serial_number: str, channel: "int | None" = None,
+    ) -> None:
         """Tick the activity-flash timer for a sniffer.
 
         Wire this to your live-capture bus — each packet from a known
         sniffer's interface should call this with its serial_number. The
         dot will flash brighter for ~600 ms then decay back to steady.
+
+        ``channel`` is the BLE channel index (0-39) the packet was
+        received on, sourced from the decoded packet's pseudo-header.
+        When provided, the panel highlights the corresponding tag in
+        the channel-tag column. Sub-second update frequency is achieved
+        by piggybacking on the existing flash-decay timer's repaint.
         """
         self._last_packet_at[serial_number] = time.monotonic()
+        if channel is not None:
+            self._current_channel[serial_number] = channel
         if not self._anim.isActive():
             self._anim.start()
         # No update() here — the timer paints; calling update on every
@@ -288,8 +353,9 @@ class SnifferPanel(QWidget):
         """
         for i, s in enumerate(self._sniffers):
             cy = self._dot_center_y(i)
-            # Activity dot (same x in both states — matches collapsed strip)
-            cx = _STRIP_W // 2
+            # Activity dot pinned to the left so the channel-tag column
+            # has a known starting x in both expanded and collapsed states.
+            cx = _DOT_X
             color = self._dot_color_for(s)
             p.setPen(QPen(_DOT_OUTLINE, 1))
             p.setBrush(QBrush(color))
@@ -299,6 +365,7 @@ class SnifferPanel(QWidget):
                 _DOT_SIZE,
                 _DOT_SIZE,
             )
+            self._paint_row_channels(p, s, cy)
             if self._expanded:
                 self._paint_row_silhouette(p, s, cy)
                 self._paint_row_text(p, s, cy)
@@ -306,6 +373,55 @@ class SnifferPanel(QWidget):
                 # don't need to be hideable — they're really there.
                 if not s.is_active:
                     self._paint_x_button(p, i, cy)
+
+    def _paint_row_channels(self, p: QPainter, s: Sniffer, cy: int) -> None:
+        """Paint the channel-tag column for one row.
+
+        Reads ``self._listening_channels[serial]`` (the configured set of
+        channels the sniffer is hopping over, 1..3 entries for adv-mode
+        or 1 for follow / idle-stub). The currently-active channel —
+        from the most recent packet's ``pkt.channel`` — is highlighted
+        in a filled pill. When no channel info is set yet, paints
+        nothing (avoids implying inactivity for sniffers that just
+        haven't reported a packet yet).
+        """
+        if not s.is_active or s.removed:
+            return
+        sn = s.serial_number or ""
+        channels = self._listening_channels.get(sn) or ()
+        if not channels:
+            return
+        active = self._current_channel.get(sn)
+
+        # Tag layout: stack vertically so 1-3 channels fit inside the
+        # row height without stealing horizontal space from the silhouette
+        # column in expanded mode.
+        n = len(channels)
+        gap = 2
+        col_h = n * _CH_TAG_H + (n - 1) * gap if n else 0
+        top = cy - col_h // 2
+
+        font = QFont()
+        font.setPointSize(_CH_TAG_FONT_PT)
+        font.setBold(True)
+        p.setFont(font)
+        for i, ch in enumerate(channels):
+            is_active = (active == ch)
+            bg = _CH_TAG_BG_ACTIVE if is_active else _CH_TAG_BG_IDLE
+            fg = _CH_TAG_FG_ACTIVE if is_active else _CH_TAG_FG_IDLE
+            rect = QRectF(
+                _CH_COL_X, top + i * (_CH_TAG_H + gap),
+                _CH_COL_W, _CH_TAG_H,
+            )
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(bg))
+            p.drawRoundedRect(rect, 3, 3)
+            p.setPen(QPen(fg))
+            p.drawText(
+                rect,
+                Qt.AlignmentFlag.AlignCenter,
+                str(ch),
+            )
 
     def _paint_row_silhouette(self, p: QPainter, s: Sniffer, cy: int) -> None:
         """Render a small icon of the actual hardware (1:3 dongle or

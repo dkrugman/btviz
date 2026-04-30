@@ -53,6 +53,35 @@ class DecodedAdv:
     adv_addr: str | None
     adv_data: bytes
     raw_pdu_header: int
+    # Firmware-reported CRC validity. False means the radio captured
+    # bytes but the LL-frame CRC failed — corruption somewhere in the
+    # payload, so the address / pdu_type / data fields are NOT
+    # trustworthy. We surface the placeholder so the live-ingest path
+    # can drive a "dropout" flash on the sniffer panel WITHOUT ever
+    # passing the packet through ``record_packet`` (which would
+    # otherwise spawn ghost-RPA device rows).
+    crc_ok: bool = True
+
+
+def _crc_fail_placeholder(channel: int, rssi: int) -> DecodedAdv:
+    """Return a minimal DecodedAdv for a CRC-failed packet.
+
+    Carries only channel + RSSI + ``crc_ok=False``; all decoded fields
+    set to safe defaults because the underlying bytes are corrupted.
+    Caller must NOT use ``adv_addr`` or any other parsed field for
+    attribution.
+    """
+    return DecodedAdv(
+        channel=channel,
+        rssi=rssi,
+        pdu_type="CRC_FAIL",
+        tx_add_random=False,
+        rx_add_random=False,
+        adv_addr=None,
+        adv_data=b"",
+        raw_pdu_header=0,
+        crc_ok=False,
+    )
 
 
 def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
@@ -61,11 +90,17 @@ def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
     The 16-bit flags field at bytes 8-9 (LE) carries CRC validity:
       bit 10 = CRC checked
       bit 11 = CRC valid
-    If the firmware checked the CRC and it failed, drop the packet —
-    bit-error corruption produces "ghost" devices whose addresses are
-    1-4 bits away from a real one (see fix/decode-drop-crc-failed-packets
-    diagnostic). If the firmware didn't check (bit 10 unset) we have to
-    accept the packet on faith.
+    If the firmware checked the CRC and it failed, return a
+    ``crc_ok=False`` placeholder rather than dropping outright — the
+    caller (live-ingest) needs to know a packet was *attempted* on
+    that channel so the UI can render a dropout flash. The historical
+    "drop entirely" behavior persists for the device-attribution path
+    in ``record_packet``, which checks ``pkt.crc_ok`` before spawning
+    a device row (otherwise bit-error corruption produces ghost
+    devices whose addresses are 1-4 bits away from a real one).
+
+    If the firmware didn't check the CRC (bit 10 unset), we accept
+    the packet on faith and return crc_ok=True.
     """
     if len(buf) < 10 + 4 + 2 + 6 + 3:
         return None
@@ -74,7 +109,7 @@ def decode_phdr_packet(buf: bytes) -> DecodedAdv | None:
     # buf[2] noise, buf[3] aa offenses, buf[4:8] ref AA, buf[8:10] flags
     flags = struct.unpack("<H", buf[8:10])[0]
     if (flags >> 10) & 0x1 and not (flags >> 11) & 0x1:
-        return None
+        return _crc_fail_placeholder(rf_channel, rssi_dbm)
     return _decode_ll(buf[10:], channel=rf_channel, rssi=rssi_dbm)
 
 
@@ -102,35 +137,36 @@ _NBE_FLAG_CRC_OK = 0x01
 
 
 def decode_nbe_packet(buf: bytes) -> DecodedAdv | None:
-    """Decode a Nordic-BLE (DLT 272) pcap payload. None if not adv or
-    if the firmware-reported CRC failed.
+    """Decode a Nordic-BLE (DLT 272) pcap payload.
 
-    Same return shape as ``decode_phdr_packet`` so callers can swap
-    based on the pcap link-type. Channel comes from offset 9, RSSI from
-    offset 10 (stored as a positive magnitude — we negate). The BLE LL
-    frame begins at offset 17 and is identical in layout to DLT 256.
+    Returns None when the buffer is too short to be a packet at all.
+    For CRC-failed packets, returns a ``crc_ok=False`` placeholder —
+    same pattern as ``decode_phdr_packet``. The placeholder carries
+    only channel + RSSI; the LL-frame parse is skipped because the
+    underlying bytes can't be trusted.
 
     Bit 0 of the flags byte at offset 8 is the firmware's CRC-OK flag
     (per Nordic's SnifferAPI/Packet.py:421 — ``self.crcOK = self.flags
     & 1``). Watch the offsets carefully: in the SnifferAPI source
     FLAGS_POS = 7, but that's relative to the post-syncword UART
     structure. The pcap-output format prepends a board_id byte, so on
-    the wire here flags is at byte 8. (Earlier we mistakenly read byte
-    7, which is always 0x0a = BLE_HEADER_LENGTH constant — bit 0 = 0
-    — and ended up rejecting every single packet.)
+    the wire here flags is at byte 8.
 
-    The firmware does NOT filter CRC-failed packets at the pcap-output
-    stage; we have to drop them here, otherwise bit-error corruption
-    masquerades as new RPAs and balloons the device count (the
+    Historical note: we used to drop CRC-failed packets entirely here
+    because passing them to ``record_packet`` produced ghost devices
+    whose addresses were 1-4 bits away from a real canonical (the
     diagnostic showed 72% of random-kind device rows in the user's DB
-    were ghost addresses 1-4 bits away from a real canonical).
+    were such ghosts). The current behavior — placeholder back to the
+    caller — preserves that property because ``record_packet`` checks
+    ``pkt.crc_ok`` before spawning a device row, while the sniffer
+    panel still gets to see the packet for its dropout flash.
     """
     if len(buf) < _NBE_HDR_LEN + 4 + 2 + 6 + 3:
         return None
-    if not (buf[_NBE_FLAGS_OFFSET] & _NBE_FLAG_CRC_OK):
-        return None
     rf_channel = buf[9]
     rssi_dbm = -buf[10]
+    if not (buf[_NBE_FLAGS_OFFSET] & _NBE_FLAG_CRC_OK):
+        return _crc_fail_placeholder(rf_channel, rssi_dbm)
     return _decode_ll(buf[_NBE_HDR_LEN:], channel=rf_channel, rssi=rssi_dbm)
 
 

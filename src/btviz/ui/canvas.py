@@ -1880,14 +1880,18 @@ class CanvasWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001 — never let cluster crash live capture
             self.status.setText(f"  cluster error: {e}")
 
-    def _on_live_packet(self, source: str, channel: int | None) -> None:
+    def _on_live_packet(
+        self, source: str, channel: int | None, crc_ok: bool = True,
+    ) -> None:
         """LiveIngest per-source notifier. Drives the panel's activity
-        dot and the per-row channel-tag highlight.
+        dot, channel-tag highlight, and CRC-failed dropout flash.
         """
         serial = self._source_to_serial.get(source)
         if serial is None:
             return
-        self.sniffer_panel.notify_packet(serial, channel=channel)
+        self.sniffer_panel.notify_packet(
+            serial, channel=channel, crc_ok=crc_ok,
+        )
 
     def _on_device_packet(self, device_id: int, channel: int | None) -> None:
         """LiveIngest per-device notifier. Drives the per-DeviceItem

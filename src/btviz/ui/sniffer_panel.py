@@ -113,7 +113,8 @@ _BORDER = QColor(200, 200, 208)
 
 # Activity dot palette — keyed by visual state.
 _DOT_DETECTED = QColor(60, 190, 80)          # steady green
-_DOT_FLASH = QColor(160, 255, 160)           # brief flash on packet
+_DOT_FLASH = QColor(160, 255, 160)           # brief flash on good packet
+_DOT_FLASH_CRC_FAIL = QColor(40, 40, 50)     # dropout flash — near-black
 _DOT_INACTIVE = QColor(155, 155, 160)        # gray
 _DOT_REMOVED = QColor(155, 155, 160, 70)     # very faint
 _DOT_OUTLINE = QColor(80, 80, 80)
@@ -133,6 +134,12 @@ _FLASH_DURATION_S = 0.1
 # stop entirely the tag still visibly fades to idle within this
 # window so silence is detectable.
 _TAG_FADE_DURATION_S = 1
+
+# Probability that a CRC-fail flash also draws a single random
+# "noise" pixel inside the dot. Cheap visual cue that the packet
+# was corrupted rather than just rendered dark — at 1 in 2 a
+# steady stream of dropouts produces a flickering speckle.
+_CRC_FAIL_NOISE_PROB = 0.5
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -191,6 +198,17 @@ class SnifferPanel(QWidget):
         # between channels keeps each visited tag warm if the hop
         # interval is shorter than the fade window.
         self._channel_hit_at: dict[str, dict[int, float]] = {}
+
+        # serial_number -> True iff the most-recent flash was a CRC-fail
+        # packet. Drives the dropout-style dot rendering for the
+        # remainder of the flash decay window.
+        self._last_was_crc_fail: dict[str, bool] = {}
+
+        # serial_number -> (good_count, bad_count) since the panel was
+        # opened. Surfaced in the row tooltip + the expanded body so
+        # the user can see per-sniffer signal quality at a glance.
+        self._good_packets: dict[str, int] = {}
+        self._bad_packets: dict[str, int] = {}
 
         # Hovered X-button index (sniffer row), if any. Used to render
         # the destructive button in red on hover.
@@ -253,7 +271,10 @@ class SnifferPanel(QWidget):
         self.update()
 
     def notify_packet(
-        self, serial_number: str, channel: "int | None" = None,
+        self,
+        serial_number: str,
+        channel: "int | None" = None,
+        crc_ok: bool = True,
     ) -> None:
         """Tick the activity-flash timer for a sniffer.
 
@@ -261,22 +282,41 @@ class SnifferPanel(QWidget):
         sniffer's interface should call this with its serial_number.
 
         Animations driven by this call:
-          * **Activity dot**: flashes brighter for ~600 ms then decays
-            back to steady (uses ``_last_packet_at``).
+          * **Activity dot**: flashes brighter for ``_FLASH_DURATION_S``
+            then decays back to steady (uses ``_last_packet_at``). When
+            ``crc_ok=False`` the flash colors land on the near-black
+            dropout palette and the dot renders speckle pixels for
+            the remainder of the decay window.
           * **Channel tag** (when ``channel`` is provided): the matching
-            tag relights to bright blue and fades back to idle over the
-            same ~600 ms window. Multiple tags can be in-flight at the
-            same time — a hopping sniffer keeps each visited tag warm
-            until its individual fade expires.
+            tag relights to bright blue and fades back to idle over
+            ``_TAG_FADE_DURATION_S``. Multiple tags can be in-flight at
+            the same time — a hopping sniffer keeps each visited tag
+            warm until its individual fade expires.
+          * **Quality counters** (good/bad): incremented per packet so
+            the row tooltip can surface a per-sniffer CRC-fail rate.
+            CRC-failed packets are not eligible for device
+            attribution upstream — ``record_packet`` skips them — but
+            they DO contribute to this counter so the user can see
+            that the radio is receiving even when packets aren't
+            decodable.
 
         Sub-second update frequency is achieved by piggybacking on the
         existing flash-decay timer's repaint.
         """
         now = time.monotonic()
         self._last_packet_at[serial_number] = now
+        self._last_was_crc_fail[serial_number] = not crc_ok
         if channel is not None:
             self._current_channel[serial_number] = channel
             self._channel_hit_at.setdefault(serial_number, {})[channel] = now
+        if crc_ok:
+            self._good_packets[serial_number] = (
+                self._good_packets.get(serial_number, 0) + 1
+            )
+        else:
+            self._bad_packets[serial_number] = (
+                self._bad_packets.get(serial_number, 0) + 1
+            )
         if not self._anim.isActive():
             self._anim.start()
         # No update() here — the timer paints; calling update on every
@@ -362,9 +402,13 @@ class SnifferPanel(QWidget):
         if flash_t is not None:
             age = time.monotonic() - flash_t
             if age < _FLASH_DURATION_S:
-                # Linear interpolate flash color → detected color across
-                # the decay window.
                 t = age / _FLASH_DURATION_S
+                # CRC-failed flash: dropout look — near-black flash that
+                # decays back to detected green. The painter also
+                # speckle-noise inside the dot for a clearly-different
+                # visual signature from a clean flash.
+                if self._last_was_crc_fail.get(s.serial_number):
+                    return _interp(_DOT_FLASH_CRC_FAIL, _DOT_DETECTED, t)
                 return _interp(_DOT_FLASH, _DOT_DETECTED, t)
         return _DOT_DETECTED
 
@@ -396,6 +440,7 @@ class SnifferPanel(QWidget):
         between collapsed and expanded modes — no vertical jump on toggle.
         Expanded adds silhouette + text columns to the right.
         """
+        import random as _random
         for i, s in enumerate(self._sniffers):
             cy = self._dot_center_y(i)
             # Activity dot pinned to the left so the channel-tag column
@@ -410,6 +455,28 @@ class SnifferPanel(QWidget):
                 _DOT_SIZE,
                 _DOT_SIZE,
             )
+            # Speckle: when this sniffer's most-recent flash was a CRC
+            # failure and the flash is still active, scatter 1-2 light
+            # noise pixels inside the dot for a clearly-different
+            # "dropout" signature. Stops naturally as the flash decays
+            # (this code only runs while _last_was_crc_fail is True
+            # AND _last_packet_at is fresh).
+            if (
+                s.is_active
+                and not s.removed
+                and self._last_was_crc_fail.get(s.serial_number)
+            ):
+                t = self._last_packet_at.get(s.serial_number, 0.0)
+                age = time.monotonic() - t
+                if age < _FLASH_DURATION_S:
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QBrush(QColor(220, 220, 220)))
+                    for _ in range(2):
+                        if _random.random() > _CRC_FAIL_NOISE_PROB:
+                            continue
+                        ox = _random.randint(-3, 3)
+                        oy = _random.randint(-3, 3)
+                        p.drawEllipse(cx + ox - 1, cy + oy - 1, 2, 2)
             self._paint_row_channels(p, s, cy)
             if self._expanded:
                 self._paint_row_silhouette(p, s, cy)
@@ -761,7 +828,12 @@ class SnifferPanel(QWidget):
             unreachable = bool(
                 s.serial_number and s.serial_number in self._extcap_unreachable
             )
-            new_tt = _row_tooltip(s, extcap_unreachable=unreachable)
+            good = self._good_packets.get(s.serial_number or "", 0)
+            bad = self._bad_packets.get(s.serial_number or "", 0)
+            new_tt = _row_tooltip(
+                s, extcap_unreachable=unreachable,
+                good_packets=good, bad_packets=bad,
+            )
             if self.toolTip() != new_tt:
                 self.setToolTip(new_tt)
         else:
@@ -839,14 +911,20 @@ def _short_id(sn: str) -> str:
     return sn[-6:] if len(sn) >= 6 else sn
 
 
-def _row_tooltip(s: Sniffer, *, extcap_unreachable: bool = False) -> str:
+def _row_tooltip(
+    s: Sniffer,
+    *,
+    extcap_unreachable: bool = False,
+    good_packets: int = 0,
+    bad_packets: int = 0,
+) -> str:
     """Multi-line tooltip with the full identity for a sniffer row.
 
     Shown on hover so any truncated value in the rendered row is
     available in full. ``extcap_unreachable`` adds a warning when fast
     USB discovery saw the dongle but the slow extcap probe couldn't
-    reach it (typically a Nordic-firmware hung state that a replug
-    clears).
+    reach it. ``good_packets`` / ``bad_packets`` add a "Quality:" line
+    so the user can see per-sniffer signal quality at a glance.
     """
     lines: list[str] = []
     lines.append(s.name or _autogen_name(s))
@@ -861,6 +939,13 @@ def _row_tooltip(s: Sniffer, *, extcap_unreachable: bool = False) -> str:
         lines.append(f"Display:     {s.display}")
     if s.usb_product:
         lines.append(f"USB product: {s.usb_product}")
+    total = good_packets + bad_packets
+    if total > 0:
+        bad_pct = 100.0 * bad_packets / total
+        lines.append(
+            f"Quality:     {good_packets:,} good · "
+            f"{bad_packets:,} CRC-fail ({bad_pct:.1f}%)"
+        )
     state = []
     if s.is_active:
         state.append("active")

@@ -500,28 +500,51 @@ _RECENCY_DORMANT_S = 86400.0      # > 24 hr ago → at floor
 _RECENCY_MIN_OPACITY = 0.10       # never disappear entirely
 
 
-def opacity_for_recency(last_seen_ts: float, now_ts: float | None = None) -> float:
+def opacity_for_recency(
+    last_seen_ts: float,
+    now_ts: float | None = None,
+    *,
+    dormant_s: float | None = None,
+) -> float:
     """Linear-in-log-time opacity for a CanvasDevice based on its
     last_seen wall-clock timestamp.
 
-    100% for the first minute, decays to 10% by 24 hours, capped both
-    ends. Devices that never produced an observation (last_seen=0)
-    return the floor opacity — they're listed because of identity
-    info but produced no traffic in this project.
+    100% for fresh devices, decaying to 10% at the dormant horizon and
+    flooring there. Both ends capped. Devices that never produced an
+    observation (last_seen=0) return the floor opacity — they're
+    listed because of identity info but produced no traffic in this
+    project.
+
+    ``dormant_s`` overrides the default 24 h horizon so the canvas can
+    tie the fade to the toolbar's ``show:`` cutoff: with ``show: 5m``
+    the dormant point is 300 s — a device just shy of falling off the
+    canvas paints near the floor, telegraphing it's about to vanish.
+
+    For very short dormant horizons we shrink the "fresh" window to
+    ``dormant_s * 0.2`` so the fade is visible across the user's
+    chosen range; otherwise a 60-s fresh threshold against a 30-s
+    horizon would never enter the log-decay branch.
     """
     if last_seen_ts is None or last_seen_ts <= 0:
         return _RECENCY_MIN_OPACITY
     if now_ts is None:
         now_ts = time.time()
     age = max(0.0, now_ts - last_seen_ts)
-    if age < _RECENCY_FRESH_S:
+
+    horizon = dormant_s if dormant_s is not None else _RECENCY_DORMANT_S
+    fresh = min(_RECENCY_FRESH_S, horizon * 0.2)
+    # Guard against a degenerate horizon (caller passed 0 or negative).
+    if horizon <= fresh:
+        return 1.0 if age < horizon else _RECENCY_MIN_OPACITY
+
+    if age < fresh:
         return 1.0
-    if age >= _RECENCY_DORMANT_S:
+    if age >= horizon:
         return _RECENCY_MIN_OPACITY
     import math
     log_age = math.log10(age)
-    log_min = math.log10(_RECENCY_FRESH_S)
-    log_max = math.log10(_RECENCY_DORMANT_S)
+    log_min = math.log10(fresh)
+    log_max = math.log10(horizon)
     frac = (log_age - log_min) / (log_max - log_min)
     return 1.0 - (1.0 - _RECENCY_MIN_OPACITY) * frac
 
@@ -1232,7 +1255,9 @@ class CanvasWindow(QMainWindow):
             # Dormancy fade: 100% if seen in last minute, decaying log-
             # linearly to 10% at 24 hours and beyond. Live capture's
             # periodic reload (~2s) keeps this current.
-            item.setOpacity(opacity_for_recency(d.last_seen, now_ts))
+            item.setOpacity(opacity_for_recency(
+                d.last_seen, now_ts, dormant_s=self._stale_window_s,
+            ))
             self.scene.addItem(item)
         # Status reflects what's actually on the canvas — `len(devs)` would
         # include hidden devices (rows with hidden=1 in device_layouts) that

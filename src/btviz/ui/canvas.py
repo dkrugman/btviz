@@ -28,6 +28,7 @@ from PySide6.QtGui import (
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -1468,6 +1469,20 @@ class CanvasWindow(QMainWindow):
         tb.addSeparator()
 
         self._live_action = tb.addAction("Start live", self._toggle_live)
+        # "Record packets" gates the per-packet write to the ``packets``
+        # table. Off by default because the table grows ~4 GB/day under
+        # active capture; opt in when running cluster signals that need
+        # per-packet timestamps or per-sniffer RSSI (rotation_cohort,
+        # rssi_signature). Locked during a live session — read once at
+        # ``_start_live`` and applied to the IngestContext.
+        self._keep_packets_checkbox = QCheckBox("Record packets")
+        self._keep_packets_checkbox.setToolTip(
+            "Write each decoded packet to the packets table.\n"
+            "Required for rotation_cohort and rssi_signature cluster\n"
+            "signals. Disabled by default — adds ~4 GB/day of DB growth\n"
+            "under active capture."
+        )
+        tb.addWidget(self._keep_packets_checkbox)
         tb.addSeparator()
 
         # Cluster controls. Manual button runs the aggregator on demand
@@ -1857,7 +1872,13 @@ class CanvasWindow(QMainWindow):
         self._live = LiveIngest(
             self._bus, self.repos, self.project_id,
             session_name=f"live-{int(time.time())}",
+            keep_packets=self._keep_packets_checkbox.isChecked(),
         )
+        # Lock the checkbox while a session is running so the user
+        # can't toggle it mid-stream — IngestContext.keep_packets is
+        # captured at LiveIngest.start() time and not consulted again,
+        # so a mid-session change wouldn't take effect anyway.
+        self._keep_packets_checkbox.setEnabled(False)
         self._live.set_packet_callback(self._on_live_packet)
         self._live.set_device_packet_callback(self._on_device_packet)
         self._live.start()
@@ -1918,6 +1939,9 @@ class CanvasWindow(QMainWindow):
         if self._live is not None:
             self._live.stop()
         self._live_action.setText("Start live")
+        # Re-enable the keep-packets toggle now that the session is
+        # ended — the user can flip it before the next Start.
+        self._keep_packets_checkbox.setEnabled(True)
         self._live = None
         self._coord = None
         self._bus = None

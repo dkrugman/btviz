@@ -1373,17 +1373,29 @@ class CanvasWindow(QMainWindow):
 
         # Sniffer panel + canvas view live side by side in a HBoxLayout
         # so expanding the panel pushes canvas content right rather than
-        # covering it. The panel reports its current width via sizeHint,
-        # the view takes the remaining space.
+        # covering it. Below them, the channel-spectrum strip spans the
+        # full width — collapsed it's a per-channel activity-indicator
+        # row, expanded it grows into a histogram. Wrapping the row in
+        # a VBoxLayout keeps both vertical neighbours' widths in sync.
+        from .channel_strip import ChannelStrip
         from .sniffer_panel import SnifferPanel
         self.sniffer_panel = SnifferPanel(store=store)
+        self.channel_strip = ChannelStrip()
 
         central = QWidget()
-        layout = QHBoxLayout(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        upper = QWidget()
+        layout = QHBoxLayout(upper)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.sniffer_panel)
         layout.addWidget(self.view, 1)  # stretch factor 1 → view fills the rest
+
+        outer.addWidget(upper, 1)
+        outer.addWidget(self.channel_strip, 0)
         self.setCentralWidget(central)
 
         # Live-capture state. Created on first Start; recycled across
@@ -2044,8 +2056,15 @@ class CanvasWindow(QMainWindow):
         self, source: str, channel: int | None, crc_ok: bool = True,
     ) -> None:
         """LiveIngest per-source notifier. Drives the panel's activity
-        dot, channel-tag highlight, and CRC-failed dropout flash.
+        dot, channel-tag highlight, the channel-spectrum strip's bars,
+        and CRC-failed dropout flashes on both.
         """
+        # Channel-strip aggregates across all sniffers, so feed it on
+        # every packet whether or not the source maps to a known
+        # serial. This also covers extcap source ids that haven't been
+        # joined to the sniffers table yet (they still produce decoded
+        # packets that belong on the spectrum view).
+        self.channel_strip.notify_packet(channel, crc_ok=crc_ok)
         serial = self._source_to_serial.get(source)
         if serial is None:
             return

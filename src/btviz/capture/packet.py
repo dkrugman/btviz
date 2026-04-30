@@ -20,3 +20,11 @@ class Packet:
     adv_data: bytes | None = None
     raw: bytes = b""
     extras: dict[str, Any] = field(default_factory=dict)
+    # Firmware-reported CRC validity. False means the radio received
+    # bytes but the LL-frame CRC check failed — bit-error corruption
+    # somewhere in the payload. The captured fields beyond ``channel``
+    # and ``rssi`` may not be trustworthy on a CRC-failed packet
+    # (the address bits in particular often differ from a real one
+    # by 1-4 positions). Used by the panel to render a distinct
+    # "dropout" flash without ever attributing the packet to a device.
+    crc_ok: bool = True

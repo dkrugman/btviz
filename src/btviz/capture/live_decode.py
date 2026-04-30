@@ -99,6 +99,26 @@ def decode_live_packet(
     if decoded is None:
         return None
 
+    # CRC-failed packets: emit a minimal Packet so the sniffer panel
+    # sees the dropout, but DON'T parse adv_addr / ad_entries — those
+    # bytes are corrupted. The downstream pipeline checks
+    # ``pkt.crc_ok`` and skips device attribution.
+    if not decoded.crc_ok:
+        return Packet(
+            ts=ts,
+            source=source,
+            channel=decoded.channel,
+            rssi=decoded.rssi,
+            phy=_DEFAULT_LIVE_PHY,
+            pdu_type=None,
+            adv_addr=None,
+            adv_addr_type=None,
+            adv_data=None,
+            raw=raw_bytes,
+            extras={},
+            crc_ok=False,
+        )
+
     adv_addr = decoded.adv_addr
     addr_type = (
         classify_address(adv_addr, decoded.tx_add_random)
@@ -122,6 +142,7 @@ def decode_live_packet(
         adv_data=decoded.adv_data,
         raw=raw_bytes,
         extras={"layers": layers},
+        crc_ok=True,
     )
 
 

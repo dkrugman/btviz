@@ -112,10 +112,17 @@ def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> "int | Non
     """Apply one packet's contribution to the DB.
 
     Returns the attributed ``device.id`` when the packet was recorded,
-    or ``None`` when skipped (no advertising address, etc.). Truthy/
-    falsy semantics are preserved — callers using ``if record_packet
-    (...)`` work unchanged. Does NOT manage transactions — callers are
-    responsible for tx scoping.
+    or ``None`` when skipped (no advertising address, CRC failed,
+    etc.). Truthy/falsy semantics are preserved — callers using
+    ``if record_packet(...)`` work unchanged. Does NOT manage
+    transactions — callers are responsible for tx scoping.
+
+    CRC-failed packets are explicitly skipped here. The address bytes
+    in a CRC-failed packet are corrupted — attributing them would
+    spawn ghost device rows whose addresses sit 1-4 bits away from a
+    real canonical advertiser. Live capture preserves the packet
+    upstream so the sniffer panel can render a dropout flash, but it
+    must NOT enter the DB-attribution path.
 
     Side effects on ``ctx``:
       * adds the device id to ``seen_device_ids``
@@ -124,6 +131,8 @@ def record_packet(repos: "Repos", ctx: IngestContext, pkt: Packet) -> "int | Non
       * adds Auracast broadcast ids when an ADV_EXT_IND with BAA service
         data is seen
     """
+    if not pkt.crc_ok:
+        return None
     if not pkt.adv_addr:
         return None
 

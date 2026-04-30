@@ -81,7 +81,7 @@ class LiveIngest:
         self._unsub: Callable[[], None] | None = None
         self._ctx: IngestContext | None = None
         self._session_id: int | None = None
-        self._on_source_packet: Callable[[str, int | None], None] | None = None
+        self._on_source_packet: Callable[[str, int | None, bool], None] | None = None
         # Optional per-device callback fired on each successfully-recorded
         # packet. Receives (device_id, channel) so the canvas can flash a
         # per-device channel indicator. Distinct from the source callback
@@ -116,15 +116,21 @@ class LiveIngest:
         return self._unsub is not None
 
     def set_packet_callback(
-        self, fn: Callable[[str, int | None], None] | None,
+        self, fn: Callable[[str, int | None, bool], None] | None,
     ) -> None:
         """Set a per-source notifier called on flush (main thread).
 
-        Receives ``(source, channel)`` for each decoded packet — source
-        is the dongle short id; channel is the BLE channel index (0-39)
-        from the decoded pseudo-header, or ``None`` when the decoder
-        couldn't determine it. Used to drive sniffer-panel activity
-        dots and the per-row channel-tag highlight.
+        Receives ``(source, channel, crc_ok)`` for each decoded packet:
+          * ``source`` — dongle short id
+          * ``channel`` — BLE channel index 0-39, or None if the decoder
+            couldn't determine it
+          * ``crc_ok`` — True for clean packets; False when the
+            firmware reported CRC failure (the packet was *received*
+            but corrupted). Used by the sniffer panel to render a
+            distinct "dropout" flash.
+
+        CRC-failed packets reach this callback but NEVER reach
+        ``record_packet`` — the address bits are unreliable.
         """
         self._on_source_packet = fn
 
@@ -253,7 +259,7 @@ class LiveIngest:
                 # frames, SCAN_RSP, hub-connected sniffers on non-primary chs).
                 if self._on_source_packet is not None:
                     try:
-                        self._on_source_packet(src, pkt.channel)
+                        self._on_source_packet(src, pkt.channel, pkt.crc_ok)
                     except Exception:  # noqa: BLE001
                         import traceback
                         traceback.print_exc()

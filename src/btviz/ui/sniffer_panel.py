@@ -38,40 +38,45 @@ from ..db.store import Store
 # Visual constants
 # ──────────────────────────────────────────────────────────────────────────
 
-_STRIP_W = 76                  # collapsed-panel width (px); widened from
-                               # 22 to fit the channel-tag column to the
-                               # right of each dot.
-_PANEL_W = 280                 # expanded-panel width (px)
+_STRIP_W = 100                 # collapsed-panel width (px); fits one
+                               # activity dot + a horizontal row of up
+                               # to three channel tags at 10pt bold.
+_PANEL_W = 320                 # expanded-panel width (px); widened from
+                               # 280 to keep the channel column intact
+                               # when the silhouette + text columns
+                               # slide into view.
 _DOT_SIZE = 12
 _ROW_H = 52                    # row pitch (same in both states so dots
                                # don't jump vertically when expanding)
 _TOP_PAD = 14
 _CHEVRON_W = 14
 _CHEVRON_H = 28
-_DOT_X = 11                    # dot column center stays at the original
-                               # narrow position, so existing tooltips and
-                               # hit-tests don't shift when we widened the
-                               # strip.
+_DOT_X = 11                    # dot center stays at the original narrow
+                               # position so tooltips / hit-tests don't
+                               # shift when the strip widened.
 
 # Channel-tag column. Sits right of the dot in both collapsed and
 # expanded modes. Renders the sniffer's listening set (1-3 advertising
-# channels, or one data channel for idle test mode) with the currently-
-# active one highlighted in a filled pill.
-_CH_COL_X = _DOT_X + _DOT_SIZE // 2 + 6
-_CH_COL_W = _STRIP_W - _CH_COL_X - 4
-_CH_TAG_H = 14
+# channels, or one data channel for idle test mode) horizontally —
+# tags are laid out left-to-right, centered in the column. The current
+# channel is highlighted in a filled blue pill.
+_CH_COL_X = 22
+_CH_COL_W = _STRIP_W - _CH_COL_X - 4   # = 74
+_CH_TAG_W = 22
+_CH_TAG_H = 18
+_CH_TAG_GAP = 2
 _CH_TAG_BG_IDLE = QColor(225, 225, 232)
-_CH_TAG_BG_ACTIVE = QColor(95, 165, 235)
-_CH_TAG_FG_IDLE = QColor(80, 80, 90)
+_CH_TAG_BG_ACTIVE = QColor(70, 130, 220)
+_CH_TAG_FG_IDLE = QColor(70, 70, 80)
 _CH_TAG_FG_ACTIVE = QColor(255, 255, 255)
-_CH_TAG_FONT_PT = 8
+_CH_TAG_FONT_PT = 10
 
 # Shape geometry (expanded mode). Dongles are 1:3, DKs ~1:2.15 — actual
 # aspect ratios of the hardware so the silhouettes read at a glance.
-# _SHAPE_X is offset enough from the activity-dot column (centered at
-# _STRIP_W / 2) that the dot doesn't crowd the silhouette in expanded
-# mode.
-_SHAPE_X = 38                  # left edge of the silhouette column
+# _SHAPE_X starts past the channel column (which extends to
+# _CH_COL_X + _CH_COL_W = 96) so silhouette + channels don't overlap
+# when the panel is expanded.
+_SHAPE_X = 110                 # left edge of the silhouette column
 _SHAPE_W = 54                  # silhouette width
 _DONGLE_H = int(_SHAPE_W / 3.0)        # = 18
 _DK_H = int(_SHAPE_W / 2.15)           # = 25
@@ -384,6 +389,10 @@ class SnifferPanel(QWidget):
         in a filled pill. When no channel info is set yet, paints
         nothing (avoids implying inactivity for sniffers that just
         haven't reported a packet yet).
+
+        Tags are laid out horizontally and centered in the channel
+        column so the row reads "[37] [38] [39]" left-to-right, with
+        the active one filled in.
         """
         if not s.is_active or s.removed:
             return
@@ -393,13 +402,10 @@ class SnifferPanel(QWidget):
             return
         active = self._current_channel.get(sn)
 
-        # Tag layout: stack vertically so 1-3 channels fit inside the
-        # row height without stealing horizontal space from the silhouette
-        # column in expanded mode.
         n = len(channels)
-        gap = 2
-        col_h = n * _CH_TAG_H + (n - 1) * gap if n else 0
-        top = cy - col_h // 2
+        total_w = n * _CH_TAG_W + (n - 1) * _CH_TAG_GAP
+        left = _CH_COL_X + max(0, (_CH_COL_W - total_w) // 2)
+        top = cy - _CH_TAG_H // 2
 
         font = QFont()
         font.setPointSize(_CH_TAG_FONT_PT)
@@ -410,12 +416,12 @@ class SnifferPanel(QWidget):
             bg = _CH_TAG_BG_ACTIVE if is_active else _CH_TAG_BG_IDLE
             fg = _CH_TAG_FG_ACTIVE if is_active else _CH_TAG_FG_IDLE
             rect = QRectF(
-                _CH_COL_X, top + i * (_CH_TAG_H + gap),
-                _CH_COL_W, _CH_TAG_H,
+                left + i * (_CH_TAG_W + _CH_TAG_GAP), top,
+                _CH_TAG_W, _CH_TAG_H,
             )
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(bg))
-            p.drawRoundedRect(rect, 3, 3)
+            p.drawRoundedRect(rect, 4, 4)
             p.setPen(QPen(fg))
             p.drawText(
                 rect,

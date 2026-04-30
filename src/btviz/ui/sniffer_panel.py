@@ -33,6 +33,10 @@ from PySide6.QtWidgets import QSizePolicy, QWidget
 from ..db.models import Sniffer
 from ..db.repos import Repos
 from ..db.store import Store
+from .channel_colors import (
+    color_for_channel as _channel_color,
+    text_color_for_channel as _channel_text_color,
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Visual constants
@@ -66,9 +70,13 @@ _CH_TAG_W = 22
 _CH_TAG_H = 18
 _CH_TAG_GAP = 2
 _CH_TAG_BG_IDLE = QColor(225, 225, 232)
-_CH_TAG_BG_ACTIVE = QColor(70, 130, 220)
 _CH_TAG_FG_IDLE = QColor(70, 70, 80)
-_CH_TAG_FG_ACTIVE = QColor(255, 255, 255)
+# Dropout-flash colors when the most recent hit on a tag was CRC-fail.
+# Near-black background with red text reads as "received but
+# corrupted" — distinct from both the channel-color active state and
+# the grey idle state.
+_CH_TAG_BG_CRC_FAIL = QColor(20, 20, 28)
+_CH_TAG_FG_CRC_FAIL = QColor(230, 70, 70)
 _CH_TAG_FONT_PT = 10
 
 # Shape geometry (expanded mode). Dongles are 1:3, DKs ~1:2.15 — actual
@@ -114,7 +122,7 @@ _BORDER = QColor(200, 200, 208)
 # Activity dot palette — keyed by visual state.
 _DOT_DETECTED = QColor(60, 190, 80)          # steady green
 _DOT_FLASH = QColor(160, 255, 160)           # brief flash on good packet
-_DOT_FLASH_CRC_FAIL = QColor(40, 40, 50)     # dropout flash — near-black
+_DOT_FLASH_CRC_FAIL = QColor(220, 40, 40)    # dropout flash — red
 _DOT_INACTIVE = QColor(155, 155, 160)        # gray
 _DOT_REMOVED = QColor(155, 155, 160, 70)     # very faint
 _DOT_OUTLINE = QColor(80, 80, 80)
@@ -198,6 +206,12 @@ class SnifferPanel(QWidget):
         # between channels keeps each visited tag warm if the hop
         # interval is shorter than the fade window.
         self._channel_hit_at: dict[str, dict[int, float]] = {}
+
+        # Parallel structure to _channel_hit_at: True iff the most-
+        # recent hit on this (serial, channel) tuple was a CRC-fail.
+        # Drives the per-tag dropout rendering — black flash with
+        # red text for the duration of that hit's fade window.
+        self._channel_hit_was_crc_fail: dict[str, dict[int, bool]] = {}
 
         # serial_number -> True iff the most-recent flash was a CRC-fail
         # packet. Drives the dropout-style dot rendering for the
@@ -309,6 +323,9 @@ class SnifferPanel(QWidget):
         if channel is not None:
             self._current_channel[serial_number] = channel
             self._channel_hit_at.setdefault(serial_number, {})[channel] = now
+            self._channel_hit_was_crc_fail.setdefault(
+                serial_number, {},
+            )[channel] = not crc_ok
         if crc_ok:
             self._good_packets[serial_number] = (
                 self._good_packets.get(serial_number, 0) + 1
@@ -382,8 +399,13 @@ class SnifferPanel(QWidget):
             for ch, t in list(hits.items()):
                 if now - t > _TAG_FADE_DURATION_S:
                     del hits[ch]
+                    # Drop the parallel CRC-state entry too.
+                    crc_map = self._channel_hit_was_crc_fail.get(sn)
+                    if crc_map is not None and ch in crc_map:
+                        del crc_map[ch]
             if not hits:
                 del self._channel_hit_at[sn]
+                self._channel_hit_was_crc_fail.pop(sn, None)
         if not self._last_packet_at and not self._channel_hit_at:
             self._anim.stop()
         self.update()
@@ -493,15 +515,19 @@ class SnifferPanel(QWidget):
         channels the sniffer is hopping over, 1..3 entries for adv-mode
         or 1 for follow / idle-stub).
 
-        Each tag carries an independent fade animation: a packet on
-        channel C relights the tag for that channel to bright blue and
-        starts a linear-alpha fade back to idle grey over
-        ``_TAG_FADE_DURATION_S``. Multiple tags can be in-flight at
-        once — a hopping sniffer keeps each visited tag warm if its
-        hop interval is shorter than the fade window.
+        Each tag carries an independent fade animation:
+          * Clean packet on channel C → tag lights up in C's canonical
+            color (from the channel-colors palette so 37/38/39 are
+            red/green/blue and data channels span the spectrum) and
+            fades back to idle grey over ``_TAG_FADE_DURATION_S``.
+          * CRC-failed packet on channel C → tag flashes near-black
+            with red text instead, visually communicating "dropout"
+            distinctly from both clean and idle states.
 
-        Tags are laid out horizontally and centered in the channel
-        column so the row reads "[37] [38] [39]" left-to-right.
+        Multiple tags can be in-flight at once — a hopping sniffer
+        keeps each visited tag warm if its hop interval is shorter
+        than the fade window. Tags are laid out horizontally and
+        centered in the channel column.
         """
         if not s.is_active or s.removed:
             return
@@ -510,6 +536,7 @@ class SnifferPanel(QWidget):
         if not channels:
             return
         hits = self._channel_hit_at.get(sn, {})
+        crc_fails = self._channel_hit_was_crc_fail.get(sn, {})
         now = time.monotonic()
 
         n = len(channels)
@@ -527,8 +554,20 @@ class SnifferPanel(QWidget):
                 age = now - hit_t
                 if age < _TAG_FADE_DURATION_S:
                     t = age / _TAG_FADE_DURATION_S  # 0 = just hit, 1 = fully faded
-                    bg = _interp(_CH_TAG_BG_ACTIVE, _CH_TAG_BG_IDLE, t)
-                    fg = _interp(_CH_TAG_FG_ACTIVE, _CH_TAG_FG_IDLE, t)
+                    if crc_fails.get(ch):
+                        # Dropout flash — black bg + red fg, both fading
+                        # back to the idle grey/text colors.
+                        bg = _interp(_CH_TAG_BG_CRC_FAIL, _CH_TAG_BG_IDLE, t)
+                        fg = _interp(_CH_TAG_FG_CRC_FAIL, _CH_TAG_FG_IDLE, t)
+                    else:
+                        # Clean flash — channel-color bg, contrasting
+                        # text. Color comes from the spectrum palette
+                        # so 37/38/39 are red/green/blue and data
+                        # channels span hue space.
+                        ch_bg = _channel_color(ch)
+                        ch_fg = _channel_text_color(ch)
+                        bg = _interp(ch_bg, _CH_TAG_BG_IDLE, t)
+                        fg = _interp(ch_fg, _CH_TAG_FG_IDLE, t)
                 else:
                     bg = _CH_TAG_BG_IDLE
                     fg = _CH_TAG_FG_IDLE

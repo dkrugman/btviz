@@ -165,9 +165,18 @@ class SnifferPanel(QWidget):
 
         # serial_number -> the most recently observed channel for that
         # sniffer (from pkt.channel of the last decoded packet).
-        # Highlighted in the channel-tag column. None until the first
-        # packet arrives, in which case no tag is bolded.
+        # Used for tooltips / debug; the *visual* highlight uses
+        # ``_channel_hit_at`` for a per-channel fade animation.
         self._current_channel: dict[str, int | None] = {}
+
+        # serial_number -> {channel -> monotonic time of last hit}.
+        # Each packet on a channel relights that specific tag to bright
+        # blue and starts a fade back to idle over the same window the
+        # activity dot uses (_FLASH_DURATION_S). Multiple tags in one
+        # row can be in-flight simultaneously — a ScanUnmonitored
+        # sniffer hopping between channels keeps both tags warm if
+        # the hop interval is shorter than the fade window.
+        self._channel_hit_at: dict[str, dict[int, float]] = {}
 
         # Hovered X-button index (sniffer row), if any. Used to render
         # the destructive button in red on hover.
@@ -235,18 +244,25 @@ class SnifferPanel(QWidget):
         """Tick the activity-flash timer for a sniffer.
 
         Wire this to your live-capture bus — each packet from a known
-        sniffer's interface should call this with its serial_number. The
-        dot will flash brighter for ~600 ms then decay back to steady.
+        sniffer's interface should call this with its serial_number.
 
-        ``channel`` is the BLE channel index (0-39) the packet was
-        received on, sourced from the decoded packet's pseudo-header.
-        When provided, the panel highlights the corresponding tag in
-        the channel-tag column. Sub-second update frequency is achieved
-        by piggybacking on the existing flash-decay timer's repaint.
+        Animations driven by this call:
+          * **Activity dot**: flashes brighter for ~600 ms then decays
+            back to steady (uses ``_last_packet_at``).
+          * **Channel tag** (when ``channel`` is provided): the matching
+            tag relights to bright blue and fades back to idle over the
+            same ~600 ms window. Multiple tags can be in-flight at the
+            same time — a hopping sniffer keeps each visited tag warm
+            until its individual fade expires.
+
+        Sub-second update frequency is achieved by piggybacking on the
+        existing flash-decay timer's repaint.
         """
-        self._last_packet_at[serial_number] = time.monotonic()
+        now = time.monotonic()
+        self._last_packet_at[serial_number] = now
         if channel is not None:
             self._current_channel[serial_number] = channel
+            self._channel_hit_at.setdefault(serial_number, {})[channel] = now
         if not self._anim.isActive():
             self._anim.start()
         # No update() here — the timer paints; calling update on every
@@ -300,11 +316,21 @@ class SnifferPanel(QWidget):
     def _tick(self) -> None:
         """Animation tick. Stops itself when no flashes are still decaying."""
         now = time.monotonic()
-        # Drop expired entries — keeps the dict from growing unboundedly.
+        # Drop expired dot-flash entries — keeps the dict bounded.
         for sn, t in list(self._last_packet_at.items()):
             if now - t > _FLASH_DURATION_S:
                 del self._last_packet_at[sn]
-        if not self._last_packet_at:
+        # Same for per-channel-tag fade entries. Done in two passes so
+        # we can also drop a sniffer's whole sub-dict when it goes
+        # empty (otherwise a temporarily-active sniffer leaves a
+        # permanent {serial: {}} entry).
+        for sn, hits in list(self._channel_hit_at.items()):
+            for ch, t in list(hits.items()):
+                if now - t > _FLASH_DURATION_S:
+                    del hits[ch]
+            if not hits:
+                del self._channel_hit_at[sn]
+        if not self._last_packet_at and not self._channel_hit_at:
             self._anim.stop()
         self.update()
 
@@ -384,15 +410,17 @@ class SnifferPanel(QWidget):
 
         Reads ``self._listening_channels[serial]`` (the configured set of
         channels the sniffer is hopping over, 1..3 entries for adv-mode
-        or 1 for follow / idle-stub). The currently-active channel —
-        from the most recent packet's ``pkt.channel`` — is highlighted
-        in a filled pill. When no channel info is set yet, paints
-        nothing (avoids implying inactivity for sniffers that just
-        haven't reported a packet yet).
+        or 1 for follow / idle-stub).
+
+        Each tag carries an independent fade animation: a packet on
+        channel C relights the tag for that channel to bright blue and
+        starts a linear-alpha fade back to idle grey over
+        ``_FLASH_DURATION_S``. Multiple tags can be in-flight at once
+        — a hopping sniffer keeps each visited tag warm if its hop
+        interval is shorter than the fade window.
 
         Tags are laid out horizontally and centered in the channel
-        column so the row reads "[37] [38] [39]" left-to-right, with
-        the active one filled in.
+        column so the row reads "[37] [38] [39]" left-to-right.
         """
         if not s.is_active or s.removed:
             return
@@ -400,7 +428,8 @@ class SnifferPanel(QWidget):
         channels = self._listening_channels.get(sn) or ()
         if not channels:
             return
-        active = self._current_channel.get(sn)
+        hits = self._channel_hit_at.get(sn, {})
+        now = time.monotonic()
 
         n = len(channels)
         total_w = n * _CH_TAG_W + (n - 1) * _CH_TAG_GAP
@@ -412,9 +441,19 @@ class SnifferPanel(QWidget):
         font.setBold(True)
         p.setFont(font)
         for i, ch in enumerate(channels):
-            is_active = (active == ch)
-            bg = _CH_TAG_BG_ACTIVE if is_active else _CH_TAG_BG_IDLE
-            fg = _CH_TAG_FG_ACTIVE if is_active else _CH_TAG_FG_IDLE
+            hit_t = hits.get(ch)
+            if hit_t is not None:
+                age = now - hit_t
+                if age < _FLASH_DURATION_S:
+                    t = age / _FLASH_DURATION_S  # 0 = just hit, 1 = fully faded
+                    bg = _interp(_CH_TAG_BG_ACTIVE, _CH_TAG_BG_IDLE, t)
+                    fg = _interp(_CH_TAG_FG_ACTIVE, _CH_TAG_FG_IDLE, t)
+                else:
+                    bg = _CH_TAG_BG_IDLE
+                    fg = _CH_TAG_FG_IDLE
+            else:
+                bg = _CH_TAG_BG_IDLE
+                fg = _CH_TAG_FG_IDLE
             rect = QRectF(
                 left + i * (_CH_TAG_W + _CH_TAG_GAP), top,
                 _CH_TAG_W, _CH_TAG_H,

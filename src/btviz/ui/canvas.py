@@ -1614,6 +1614,14 @@ class CanvasWindow(QMainWindow):
         period = self._cluster_period_ticks
         if period > 0 and self._reload_tick % period == 0:
             self._run_cluster_tick()
+        # Re-randomize idle sniffers' stub data channels every 2 s so
+        # the panel's channel-tag column visibly cycles during testing.
+        # Pinned / ScanUnmonitored rows are deterministic from their
+        # role and stay put; only the Idle test stub rotates. Drop
+        # this when the real "tune to expected stream" assignment
+        # logic replaces find_unmonitored_stream().
+        if self._reload_tick % 8 == 0:
+            self._publish_sniffer_channels()
 
     def _run_cluster_tick(self) -> None:
         """Hydrate devices, run the cluster aggregator, persist results.

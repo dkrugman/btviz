@@ -5,5 +5,7 @@
   "files.exclude": {
     "**/__pycache__": true,
     "**/*.egg-info": true
-  }
+  },
+  "github.copilot.chat.anthropic.tools.websearch.maxUses": 15,
+  "github.copilot.chat.anthropic.tools.websearch.enabled": true
 }

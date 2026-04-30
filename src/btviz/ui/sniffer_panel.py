@@ -124,7 +124,7 @@ _DOT_OUTLINE = QColor(80, 80, 80)
 # state. At ~150 pkts/sec this still looks "near-solid bright" because
 # the inter-packet interval (~6 ms) is smaller than this duration; at
 # slower rates individual flashes are visible.
-_FLASH_DURATION_S = 0.3
+_FLASH_DURATION_S = 0.1
 
 # Channel-tag fade decay. Longer than the dot flash so the colored
 # pill behind the channel number reads as "near-solid" and doesn't
@@ -132,7 +132,7 @@ _FLASH_DURATION_S = 0.3
 # subtly-animated activity rather than rapid flicker. When packets
 # stop entirely the tag still visibly fades to idle within this
 # window so silence is detectable.
-_TAG_FADE_DURATION_S = 1.5
+_TAG_FADE_DURATION_S = 1
 
 
 # ──────────────────────────────────────────────────────────────────────────

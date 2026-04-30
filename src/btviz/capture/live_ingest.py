@@ -78,11 +78,19 @@ class LiveIngest:
         *,
         session_name: str | None = None,
         queue_cap: int = _DEFAULT_QUEUE_CAP,
+        keep_packets: bool = False,
     ) -> None:
         self._bus = bus
         self._repos = repos
         self._project_id = project_id
         self._session_name = session_name
+        # When True, ``record_packet`` writes a row to the ``packets``
+        # table per decoded packet (gated by ``IngestContext.keep_packets``
+        # in ingest/pipeline.py). Off by default — packets are large
+        # and the table grows ~4 GB/day under active capture. Turn on
+        # when running cluster signals that need per-packet timestamps
+        # or per-sniffer RSSI (rotation_cohort, rssi_signature).
+        self._keep_packets = keep_packets
         self._queue: deque[Packet] = deque(maxlen=queue_cap)
         self._lock = threading.Lock()
         self._unsub: Callable[[], None] | None = None
@@ -200,7 +208,9 @@ class LiveIngest:
             name=self._session_name,
         )
         self._session_id = sess.id
-        self._ctx = IngestContext(session_id=sess.id)
+        self._ctx = IngestContext(
+            session_id=sess.id, keep_packets=self._keep_packets,
+        )
         self._unsub = self._bus.subscribe(TOPIC_PACKET, self._on_packet)
         return sess.id
 

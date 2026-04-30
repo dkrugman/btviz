@@ -1498,6 +1498,13 @@ class CanvasWindow(QMainWindow):
         # take a beat — the action becomes "Stop" so a second click stops.
         self._coord.start_discover()
 
+        # Push role-derived channel sets to the panel so each row's
+        # channel-tag column reflects what the sniffer is actually
+        # listening to. Idle sniffers (no role yet) get a stub data
+        # channel via find_unmonitored_stream() so the display has
+        # something visible during testing.
+        self._publish_sniffer_channels()
+
         self._live_timer = QTimer(self)
         self._live_timer.timeout.connect(self._live_tick)
         # 250ms flush cadence: low enough latency that the activity dot
@@ -1653,12 +1660,68 @@ class CanvasWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001 — never let cluster crash live capture
             self.status.setText(f"  cluster error: {e}")
 
-    def _on_live_packet(self, source: str) -> None:
-        """LiveIngest per-source notifier. Drives the panel's activity dot."""
+    def _on_live_packet(self, source: str, channel: int | None) -> None:
+        """LiveIngest per-source notifier. Drives the panel's activity
+        dot and the per-row channel-tag highlight.
+        """
         serial = self._source_to_serial.get(source)
         if serial is None:
             return
-        self.sniffer_panel.notify_packet(serial)
+        self.sniffer_panel.notify_packet(serial, channel=channel)
+
+    def _publish_sniffer_channels(self) -> None:
+        """Push each sniffer's listening-channel set to the panel.
+
+        Reads the coordinator's role assignments and translates them
+        into a per-serial tuple of channel ints:
+          - Pinned(channels)  -> the channel tuple as-is
+          - ScanUnmonitored   -> the channels NOT covered by other
+                                 pinned sniffers (recomputed each call)
+          - Follow            -> currently empty (data-channel hopping
+                                 sequence isn't tracked in btviz yet)
+          - Idle              -> a single random data channel from
+                                 find_unmonitored_stream() — testing
+                                 stub for the panel display until the
+                                 advertising-data-driven assignment
+                                 logic lands
+
+        Maps short_id -> serial via the same key shape as record_discovered
+        so the panel rows match. Called once at start_discover; future
+        role changes (Follow assigned, etc.) should call this again.
+        """
+        if self._coord is None:
+            return
+        from ..capture.roles import (
+            Idle, Pinned, ScanUnmonitored, Follow,
+            PRIMARY_ADV_CHANNELS, find_unmonitored_stream,
+        )
+
+        # Channels already pinned by some other sniffer — used to
+        # compute ScanUnmonitored's set and to spread idle stubs across
+        # data channels rather than colliding.
+        pinned_adv: set[int] = set()
+        for role in self._coord.roles.values():
+            if isinstance(role, Pinned):
+                pinned_adv.update(role.channels)
+
+        idle_data_used: set[int] = set()
+        for d in self._coord.dongles:
+            role = self._coord.roles.get(d.short_id, Idle())
+            if isinstance(role, Pinned):
+                channels = list(role.channels)
+            elif isinstance(role, ScanUnmonitored):
+                channels = [
+                    c for c in PRIMARY_ADV_CHANNELS if c not in pinned_adv
+                ]
+            elif isinstance(role, Follow):
+                channels = []
+            else:  # Idle / unknown — testing stub
+                ch = find_unmonitored_stream(idle_data_used)
+                idle_data_used.add(ch)
+                channels = [ch]
+            serial = self._source_to_serial.get(d.short_id)
+            if serial is not None:
+                self.sniffer_panel.set_sniffer_channels(serial, channels)
 
     # --- device context menu / follow --------------------------------
 

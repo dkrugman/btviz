@@ -409,6 +409,7 @@ def _build_tooltip(d: CanvasDevice) -> str:
     lines: list[str] = []
     lines.append(_pick_display_label(d))
     lines.append("─" * 36)
+    lines.append(f"Device ID:     {d.device_id}")
     lines.append(f"Stable key:    {d.stable_key}")
     lines.append(f"Kind:          {d.kind}")
     if d.device_class:

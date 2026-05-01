@@ -41,7 +41,9 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QToolBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -1494,30 +1496,15 @@ class CanvasWindow(QMainWindow):
 
         tb = QToolBar("main")
         self.addToolBar(tb)
-        tb.addAction("Reload", self.reload)
-        tb.addAction("Reset layout", self.reset_layout)
-        tb.addAction("Clear all data…", self.clear_all_data)
-        tb.addAction("Refresh sniffers", self._refresh_sniffers)
-        tb.addSeparator()
+        # Toolbar layout reads left-to-right as three logical groups
+        # separated by visual breaks: Capture (primary action) → View
+        # (canvas filters / sort) → Cluster (analysis). Low-frequency
+        # and destructive actions (Reload, Reset layout, Refresh
+        # sniffers, Clear all data) live in an overflow menu at the
+        # right edge so they don't compete for attention with the
+        # day-to-day controls.
 
-        tb.addWidget(QLabel("  Sort by: "))
-        self._sort_combo_primary = QComboBox()
-        self._sort_combo_primary.addItem("(saved positions)")
-        for label in _SORT_KEY_LABELS:
-            self._sort_combo_primary.addItem(label)
-        self._sort_combo_primary.currentTextChanged.connect(self._on_sort_changed)
-        tb.addWidget(self._sort_combo_primary)
-
-        tb.addWidget(QLabel("  then by: "))
-        self._sort_combo_secondary = QComboBox()
-        self._sort_combo_secondary.addItem("(none)")
-        for label in _SORT_KEY_LABELS:
-            self._sort_combo_secondary.addItem(label)
-        self._sort_combo_secondary.setEnabled(False)  # disabled until primary picked
-        self._sort_combo_secondary.currentTextChanged.connect(self._on_sort_changed)
-        tb.addWidget(self._sort_combo_secondary)
-        tb.addSeparator()
-
+        # ---- Capture group --------------------------------------------------
         # "Start Capture" is the primary action of this window — the
         # whole reason a user opens the canvas during a live session.
         # We render it as a coloured pill so it stands out from the
@@ -1547,10 +1534,44 @@ class CanvasWindow(QMainWindow):
         tb.addWidget(self._keep_packets_checkbox)
         tb.addSeparator()
 
-        # Cluster controls. Manual button runs the aggregator on demand
-        # (works whether or not capture is live — the aggregator only
-        # needs the DB). The dropdown picks how often the live-tick path
-        # auto-runs it. "off" makes capture-time analysis manual-only.
+        # ---- View group -----------------------------------------------------
+        # ``Show:`` first because the stale-window filter is the most-
+        # adjusted view control during cluster review. ``Sort by`` /
+        # ``then by`` follow with a fixed-width combo each so the
+        # dropdowns line up regardless of label length.
+        tb.addWidget(QLabel("  Show: "))
+        self._stale_window_combo = QComboBox()
+        for label in _STALE_WINDOW_LABELS:
+            self._stale_window_combo.addItem(label)
+        self._stale_window_combo.setCurrentText("1m")
+        self._stale_window_combo.currentTextChanged.connect(
+            self._on_stale_window_changed,
+        )
+        tb.addWidget(self._stale_window_combo)
+
+        tb.addWidget(QLabel("   Sort: "))
+        self._sort_combo_primary = QComboBox()
+        self._sort_combo_primary.addItem("(saved positions)")
+        for label in _SORT_KEY_LABELS:
+            self._sort_combo_primary.addItem(label)
+        self._sort_combo_primary.currentTextChanged.connect(self._on_sort_changed)
+        tb.addWidget(self._sort_combo_primary)
+
+        tb.addWidget(QLabel("   then: "))
+        self._sort_combo_secondary = QComboBox()
+        self._sort_combo_secondary.addItem("(none)")
+        for label in _SORT_KEY_LABELS:
+            self._sort_combo_secondary.addItem(label)
+        self._sort_combo_secondary.setEnabled(False)  # disabled until primary picked
+        self._sort_combo_secondary.currentTextChanged.connect(self._on_sort_changed)
+        tb.addWidget(self._sort_combo_secondary)
+        tb.addSeparator()
+
+        # ---- Cluster group --------------------------------------------------
+        # Manual button runs the aggregator on demand (works whether or
+        # not capture is live — the aggregator only needs the DB). The
+        # dropdown picks how often the live-tick path auto-runs it.
+        # "off" makes capture-time analysis manual-only.
         tb.addAction("Run cluster", self._run_cluster_tick)
         tb.addWidget(QLabel("  every: "))
         self._cluster_period_combo = QComboBox()
@@ -1569,18 +1590,36 @@ class CanvasWindow(QMainWindow):
             "Verbose cluster log", self._on_cluster_verbose_toggled,
         )
         self._cluster_verbose_action.setCheckable(True)
-        tb.addWidget(QLabel("  show: "))
-        self._stale_window_combo = QComboBox()
-        for label in _STALE_WINDOW_LABELS:
-            self._stale_window_combo.addItem(label)
-        self._stale_window_combo.setCurrentText("1m")
-        self._stale_window_combo.currentTextChanged.connect(
-            self._on_stale_window_changed,
-        )
-        tb.addWidget(self._stale_window_combo)
         tb.addSeparator()
+
+        # ---- Status + overflow ---------------------------------------------
+        # Status label first, then a stretching spacer that pushes the
+        # overflow button to the right edge. Overflow holds the low-
+        # frequency / destructive actions: Reload, Reset layout, Refresh
+        # sniffers, Clear all data. Using QToolButton + QMenu (rather
+        # than QToolBar's built-in extension) lets us control which
+        # items live there independent of available width.
         self.status = QLabel("")
         tb.addWidget(self.status)
+        spacer = QWidget()
+        spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred,
+        )
+        tb.addWidget(spacer)
+        self._overflow_button = QToolButton()
+        self._overflow_button.setText("⋯")
+        self._overflow_button.setToolTip("More actions")
+        self._overflow_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup,
+        )
+        overflow_menu = QMenu(self._overflow_button)
+        overflow_menu.addAction("Reload", self.reload)
+        overflow_menu.addAction("Reset layout", self.reset_layout)
+        overflow_menu.addAction("Refresh sniffers", self._refresh_sniffers)
+        overflow_menu.addSeparator()
+        overflow_menu.addAction("Clear all data…", self.clear_all_data)
+        self._overflow_button.setMenu(overflow_menu)
+        tb.addWidget(self._overflow_button)
 
         # Always-on canvas refresh. _live_tick reloads every 2s during
         # capture but stops firing on Stop, so without this timer

@@ -1019,6 +1019,7 @@ class DeviceItem(QGraphicsItem):
             f"{d.rssi_avg:.0f} dBm (min {d.rssi_min}, max {d.rssi_max})"
             if d.rssi_avg is not None else "—"
         )
+        line(f"id: {d.device_id}")
         line(f"kind: {d.kind}")
         # Class is what determines the icon and most of the label fallback —
         # users want to know where it came from. Show the class string and

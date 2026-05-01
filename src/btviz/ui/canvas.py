@@ -162,6 +162,45 @@ _QUALITY_YELLOW = QColor(220, 180, 50)
 _QUALITY_RED = QColor(220, 70, 70)
 _QUALITY_NEUTRAL = QColor(170, 170, 170)  # before any packets observed
 
+# Capture button styling — green pill when idle (Start), red pill when
+# capturing (Stop). Padding and rounded corners pull it out of the
+# row of plain QToolButton text labels around it so the user's eye
+# lands here first.
+_CAPTURE_BUTTON_STYLE_IDLE = """
+    QToolButton#captureButton {
+        background-color: #2d8f4a;
+        color: white;
+        font-weight: bold;
+        padding: 5px 16px;
+        margin: 2px 6px 2px 4px;
+        border-radius: 4px;
+        border: 1px solid #267e3e;
+    }
+    QToolButton#captureButton:hover {
+        background-color: #36a558;
+    }
+    QToolButton#captureButton:pressed {
+        background-color: #267e3e;
+    }
+"""
+_CAPTURE_BUTTON_STYLE_CAPTURING = """
+    QToolButton#captureButton {
+        background-color: #b53a3a;
+        color: white;
+        font-weight: bold;
+        padding: 5px 16px;
+        margin: 2px 6px 2px 4px;
+        border-radius: 4px;
+        border: 1px solid #993131;
+    }
+    QToolButton#captureButton:hover {
+        background-color: #c84545;
+    }
+    QToolButton#captureButton:pressed {
+        background-color: #993131;
+    }
+"""
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Data loading
@@ -1366,7 +1405,13 @@ class CanvasWindow(QMainWindow):
         self.project_id = project_id
         self.project = self.repos.projects.get(project_id)
         self.setWindowTitle(f"btviz canvas — {self.project.name}")
-        self.resize(1400, 900)
+        # 1600 px is the smallest width that fits the full toolbar
+        # (Start Capture + capture group + view group + cluster group)
+        # without truncating the trailing combos. Smaller widths still
+        # work — the toolbar provides its own overflow menu — but a
+        # default that fits everything saves the user from having to
+        # discover the overflow chevron.
+        self.resize(1600, 900)
 
         self.scene = QGraphicsScene()
         self.view = _CanvasView(self.scene)
@@ -1421,8 +1466,11 @@ class CanvasWindow(QMainWindow):
         # Stale-device cutoff in seconds. Devices whose latest
         # observation is older than this are hidden from the canvas AND
         # excluded from the cluster hydrator. ``None`` disables the
-        # filter. Default 30m matches the toolbar dropdown's default.
-        self._stale_window_s: float | None = 1800.0
+        # filter. Default 1m matches the toolbar dropdown's default —
+        # narrow enough that the canvas only shows what's actively on
+        # the air right now, which is what you want during cluster
+        # review work.
+        self._stale_window_s: float | None = 60.0
         # short_id (pkt.source) → serial_number, so the bus subscriber's
         # per-source notifications can drive the panel's serial-keyed
         # activity dot.
@@ -1470,7 +1518,19 @@ class CanvasWindow(QMainWindow):
         tb.addWidget(self._sort_combo_secondary)
         tb.addSeparator()
 
-        self._live_action = tb.addAction("Start live", self._toggle_live)
+        # "Start Capture" is the primary action of this window — the
+        # whole reason a user opens the canvas during a live session.
+        # We render it as a coloured pill so it stands out from the
+        # plain text actions surrounding it. Colour swaps to red when
+        # capture is running so "stop" reads as a distinct mode.
+        self._live_action = tb.addAction(
+            "Start Capture", self._toggle_live,
+        )
+        live_btn = tb.widgetForAction(self._live_action)
+        if live_btn is not None:
+            live_btn.setObjectName("captureButton")
+            live_btn.setStyleSheet(_CAPTURE_BUTTON_STYLE_IDLE)
+        self._live_button = live_btn
         # "Record packets" gates the per-packet write to the ``packets``
         # table. Off by default because the table grows ~4 GB/day under
         # active capture; opt in when running cluster signals that need
@@ -1513,7 +1573,7 @@ class CanvasWindow(QMainWindow):
         self._stale_window_combo = QComboBox()
         for label in _STALE_WINDOW_LABELS:
             self._stale_window_combo.addItem(label)
-        self._stale_window_combo.setCurrentText("30m")
+        self._stale_window_combo.setCurrentText("1m")
         self._stale_window_combo.currentTextChanged.connect(
             self._on_stale_window_changed,
         )
@@ -1554,7 +1614,7 @@ class CanvasWindow(QMainWindow):
         # Read whatever is already in the DB so the window draws immediately.
         # No auto-discovery here: a fast (ioreg-only) sweep at startup misses
         # hub-connected dongles and would mark them inactive. The user runs
-        # discovery via Refresh sniffers / Start live; previous-session state
+        # discovery via Refresh sniffers / Start Capture; previous-session state
         # (preserved across Stop) covers the common case of "I just relaunched".
         self.sniffer_panel.refresh()
         self.repos.meta.set(self.repos.meta.LAST_PROJECT, str(project_id))
@@ -1777,6 +1837,22 @@ class CanvasWindow(QMainWindow):
         else:
             self._start_live()
 
+    def _set_capture_button_state(self, *, capturing: bool) -> None:
+        """Sync the capture button's text and colour with session state.
+
+        Idle: green "Start Capture". Running: red "Stop Capture". The
+        colour swap signals the destructive direction (clicking now
+        ends the session) without needing a confirmation dialog.
+        """
+        self._live_action.setText(
+            "Stop Capture" if capturing else "Start Capture"
+        )
+        if self._live_button is not None:
+            self._live_button.setStyleSheet(
+                _CAPTURE_BUTTON_STYLE_CAPTURING if capturing
+                else _CAPTURE_BUTTON_STYLE_IDLE
+            )
+
     def _start_live(self) -> None:
         """Begin a live capture session for this project.
 
@@ -1917,7 +1993,7 @@ class CanvasWindow(QMainWindow):
         if reserved > 0:
             msg += f" ({reserved} reserved for follow)"
         msg += "…"
-        self._live_action.setText("Stop live")
+        self._set_capture_button_state(capturing=True)
         self.status.setText(msg)
 
     def _stop_live(self) -> None:
@@ -1940,7 +2016,7 @@ class CanvasWindow(QMainWindow):
                 pass
         if self._live is not None:
             self._live.stop()
-        self._live_action.setText("Start live")
+        self._set_capture_button_state(capturing=False)
         # Re-enable the keep-packets toggle now that the session is
         # ended — the user can flip it before the next Start.
         self._keep_packets_checkbox.setEnabled(True)
@@ -1953,7 +2029,7 @@ class CanvasWindow(QMainWindow):
         self.sniffer_panel.set_extcap_unreachable(set())
         # Leave sniffer rows as-is: stopping capture doesn't unplug them.
         # Dots stay green to reflect "detected, idle". A row only goes grey
-        # when a fresh discovery sweep (Refresh sniffers / next Start live)
+        # when a fresh discovery sweep (Refresh sniffers / next Start Capture)
         # fails to find it.
         # One last reload so the user sees the final state of the session.
         self.reload()
@@ -2230,7 +2306,7 @@ class CanvasWindow(QMainWindow):
         if self._coord is None or self._live is None or not self._live.running:
             follow_action.setEnabled(False)
             follow_action.setToolTip(
-                "Start live capture first (toolbar → Start live)."
+                "Start live capture first (toolbar → Start Capture)."
             )
         elif not device.addresses:
             follow_action.setEnabled(False)

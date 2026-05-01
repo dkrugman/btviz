@@ -28,7 +28,6 @@ from PySide6.QtGui import (
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -43,7 +42,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QToolBar,
-    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -173,6 +171,7 @@ _CAPTURE_BUTTON_STYLE_IDLE = """
         background-color: #2d8f4a;
         color: white;
         font-weight: bold;
+        font-size: 12pt;
         padding: 5px 16px;
         margin: 2px 6px 2px 4px;
         border-radius: 4px;
@@ -190,6 +189,7 @@ _CAPTURE_BUTTON_STYLE_CAPTURING = """
         background-color: #b53a3a;
         color: white;
         font-weight: bold;
+        font-size: 12pt;
         padding: 5px 16px;
         margin: 2px 6px 2px 4px;
         border-radius: 4px;
@@ -1430,6 +1430,11 @@ class CanvasWindow(QMainWindow):
         from .channel_strip import ChannelStrip
         from .sniffer_panel import SnifferPanel
         self.sniffer_panel = SnifferPanel(store=store)
+        # Refresh button at the top of the sniffer panel — fires when
+        # clicked. Wired here rather than inside the panel so the
+        # discovery side-effect (re-probing USB) stays in the canvas
+        # window where the rest of the capture wiring lives.
+        self.sniffer_panel.refreshRequested.connect(self._refresh_sniffers)
         self.channel_strip = ChannelStrip()
 
         central = QWidget()
@@ -1496,6 +1501,16 @@ class CanvasWindow(QMainWindow):
 
         tb = QToolBar("main")
         self.addToolBar(tb)
+        # Uniform 12 pt across every widget added to the toolbar so
+        # action labels, combos, and the QLabel separators all read
+        # at the same baseline. Without this Qt picks system defaults
+        # per-widget-type (action button text, combo, label) which
+        # don't always match — produces a "haphazard" look. The
+        # capture-pill stylesheet sets its own font-size to stay in
+        # sync; everything else inherits this.
+        _tb_font = QFont()
+        _tb_font.setPointSize(12)
+        tb.setFont(_tb_font)
         # Toolbar layout reads left-to-right as three logical groups
         # separated by visual breaks: Capture (primary action) → View
         # (canvas filters / sort) → Cluster (analysis). Low-frequency
@@ -1524,14 +1539,17 @@ class CanvasWindow(QMainWindow):
         # per-packet timestamps or per-sniffer RSSI (rotation_cohort,
         # rssi_signature). Locked during a live session — read once at
         # ``_start_live`` and applied to the IngestContext.
-        self._keep_packets_checkbox = QCheckBox("Record packets")
-        self._keep_packets_checkbox.setToolTip(
+        # Rendered as a checkable QAction (mirrors "Verbose cluster log"
+        # below) so the toolbar reads as a uniform row of buttons rather
+        # than a button row with a stray checkbox indicator.
+        self._keep_packets_action = tb.addAction("Record packets")
+        self._keep_packets_action.setCheckable(True)
+        self._keep_packets_action.setToolTip(
             "Write each decoded packet to the packets table.\n"
             "Required for rotation_cohort and rssi_signature cluster\n"
             "signals. Disabled by default — adds ~4 GB/day of DB growth\n"
             "under active capture."
         )
-        tb.addWidget(self._keep_packets_checkbox)
         tb.addSeparator()
 
         # ---- View group -----------------------------------------------------
@@ -1592,34 +1610,30 @@ class CanvasWindow(QMainWindow):
         self._cluster_verbose_action.setCheckable(True)
         tb.addSeparator()
 
-        # ---- Status + overflow ---------------------------------------------
-        # Status label first, then a stretching spacer that pushes the
-        # overflow button to the right edge. Overflow holds the low-
-        # frequency / destructive actions: Reload, Reset layout, Refresh
-        # sniffers, Clear all data. Using QToolButton + QMenu (rather
-        # than QToolBar's built-in extension) lets us control which
-        # items live there independent of available width.
-        self.status = QLabel("")
-        tb.addWidget(self.status)
+        # ---- Maintenance group (right side) --------------------------------
+        # Reload / Reset layout / Clear all data sit in their own group
+        # to the right of the cluster controls — visible at a glance
+        # but separated from the day-to-day capture/view/cluster flow.
+        # ``Clear all data…`` keeps its trailing ellipsis to signal it
+        # opens a confirmation dialog before destroying anything.
+        # ``Refresh sniffers`` moved out of the toolbar entirely — it
+        # lives at the top of the sniffer panel now (one click, in the
+        # same panel where its results land).
+        tb.addAction("Reload", self.reload)
+        tb.addAction("Reset layout", self.reset_layout)
+        tb.addAction("Clear all data…", self.clear_all_data)
+        tb.addSeparator()
+
+        # ---- Status (right edge) -------------------------------------------
+        # Spacer pushes the status label to the right edge so the
+        # main groups stay left-aligned regardless of window width.
         spacer = QWidget()
         spacer.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred,
         )
         tb.addWidget(spacer)
-        self._overflow_button = QToolButton()
-        self._overflow_button.setText("⋯")
-        self._overflow_button.setToolTip("More actions")
-        self._overflow_button.setPopupMode(
-            QToolButton.ToolButtonPopupMode.InstantPopup,
-        )
-        overflow_menu = QMenu(self._overflow_button)
-        overflow_menu.addAction("Reload", self.reload)
-        overflow_menu.addAction("Reset layout", self.reset_layout)
-        overflow_menu.addAction("Refresh sniffers", self._refresh_sniffers)
-        overflow_menu.addSeparator()
-        overflow_menu.addAction("Clear all data…", self.clear_all_data)
-        self._overflow_button.setMenu(overflow_menu)
-        tb.addWidget(self._overflow_button)
+        self.status = QLabel("")
+        tb.addWidget(self.status)
 
         # Always-on canvas refresh. _live_tick reloads every 2s during
         # capture but stops firing on Stop, so without this timer
@@ -1989,13 +2003,13 @@ class CanvasWindow(QMainWindow):
         self._live = LiveIngest(
             self._bus, self.repos, self.project_id,
             session_name=f"live-{int(time.time())}",
-            keep_packets=self._keep_packets_checkbox.isChecked(),
+            keep_packets=self._keep_packets_action.isChecked(),
         )
         # Lock the checkbox while a session is running so the user
         # can't toggle it mid-stream — IngestContext.keep_packets is
         # captured at LiveIngest.start() time and not consulted again,
         # so a mid-session change wouldn't take effect anyway.
-        self._keep_packets_checkbox.setEnabled(False)
+        self._keep_packets_action.setEnabled(False)
         self._live.set_packet_callback(self._on_live_packet)
         self._live.set_device_packet_callback(self._on_device_packet)
         self._live.start()
@@ -2058,7 +2072,7 @@ class CanvasWindow(QMainWindow):
         self._set_capture_button_state(capturing=False)
         # Re-enable the keep-packets toggle now that the session is
         # ended — the user can flip it before the next Start.
-        self._keep_packets_checkbox.setEnabled(True)
+        self._keep_packets_action.setEnabled(True)
         self._live = None
         self._coord = None
         self._bus = None

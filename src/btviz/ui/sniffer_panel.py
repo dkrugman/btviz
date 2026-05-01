@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QSizePolicy, QWidget
+from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget
 
 from ..db.models import Sniffer
 from ..db.repos import Repos
@@ -52,7 +52,16 @@ _PANEL_W = 320                 # expanded-panel width (px); widened from
 _DOT_SIZE = 12
 _ROW_H = 52                    # row pitch (same in both states so dots
                                # don't jump vertically when expanding)
-_TOP_PAD = 14
+# Refresh button at the top of the panel — moved here from the canvas
+# toolbar in 2026-04 because the action's results land in this panel
+# (sniffer rows reload), so co-locating control + result removes the
+# trip to the toolbar's overflow menu.
+_REFRESH_BTN_TOP = 6
+_REFRESH_BTN_H = 22
+_REFRESH_BTN_BOTTOM_PAD = 8
+_TOP_PAD = (
+    _REFRESH_BTN_TOP + _REFRESH_BTN_H + _REFRESH_BTN_BOTTOM_PAD
+)
 _CHEVRON_W = 14
 _CHEVRON_H = 28
 _DOT_X = 11                    # dot center stays at the original narrow
@@ -168,6 +177,11 @@ class SnifferPanel(QWidget):
     # Emitted when the user toggles expansion. The CanvasWindow can use
     # this to e.g. re-size the scene viewport, save state to DB, etc.
     expansionChanged = Signal(bool)
+    # Emitted when the user clicks the panel-top "Refresh" button.
+    # Wired to the canvas's ``_refresh_sniffers`` so a click re-runs
+    # USB discovery; co-locating the control with the panel that
+    # displays the result removes a trip to the toolbar.
+    refreshRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None,
                  store: Store | None = None) -> None:
@@ -250,6 +264,17 @@ class SnifferPanel(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
+
+        # Refresh button at the top — fires ``refreshRequested`` so
+        # the canvas can re-run USB discovery. Geometry is set in
+        # ``resizeEvent`` so it tracks the panel's collapsed/expanded
+        # width.
+        self._refresh_btn = QPushButton("Refresh", self)
+        self._refresh_btn.setToolTip(
+            "Re-run USB sniffer discovery and refresh the rows below."
+        )
+        self._refresh_btn.clicked.connect(self.refreshRequested.emit)
+
         self.refresh()
 
     # --- public API ---------------------------------------------------
@@ -773,6 +798,22 @@ class SnifferPanel(QWidget):
         p.drawPolygon(poly)
 
     # --- mouse handling ------------------------------------------------
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        """Keep the Refresh button spanning the panel width.
+
+        The panel width changes between collapsed (``_STRIP_W``) and
+        expanded (``_PANEL_W``); we resize the button on every event
+        rather than tracking expansion separately so it stays in sync
+        even on the initial show.
+        """
+        super().resizeEvent(event)
+        self._refresh_btn.setGeometry(
+            4,
+            _REFRESH_BTN_TOP,
+            self.width() - 8,
+            _REFRESH_BTN_H,
+        )
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:

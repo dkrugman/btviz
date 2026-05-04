@@ -535,24 +535,56 @@ def load_canvas_devices(
         if cd.broadcast_name is None:
             cd.broadcast_name = r["broadcast_name"]
 
-    # ---- Rename propagation ----------------------------------------------
-    # If the user renamed a device with a recognisable ``local_name``
-    # broadcast (e.g. "Douglas Hearing Aids"), apply that rename to
-    # any other device that broadcasts the same ``local_name`` but
-    # doesn't yet have its own ``user_name`` set. This makes a rename
-    # "stick" across power cycles: an HA that comes back up with a
-    # fresh RPA still shows the user's chosen name because the
-    # broadcast name didn't change.
+    # ---- Cluster membership -----------------------------------------------
+    # Loaded once and reused by both the rename-propagation pass below
+    # and the cluster-collapse pass that follows. The runner persists
+    # one row per (cluster, device) in ``device_cluster_members``; we
+    # group by cluster_id for both passes.
+    cm_rows = conn.execute(
+        f"""
+        SELECT cluster_id, device_id, score
+          FROM device_cluster_members
+         WHERE device_id IN ({placeholders})
+        """,
+        tuple(devices.keys()),
+    ).fetchall()
+    clusters: dict[int, list[tuple[int, float | None]]] = {}
+    for r in cm_rows:
+        clusters.setdefault(r["cluster_id"], []).append(
+            (r["device_id"], r["score"]),
+        )
+
+    # ---- Rename propagation (cluster-based, most accurate) ---------------
+    # For each cluster, propagate ``user_name`` from the most-recently-
+    # seen renamed member to other unnamed members of the same cluster.
+    # The runner has identified these devices as the same physical
+    # device, so this is more reliable than matching by local_name —
+    # left/right HAs in different clusters keep their distinct names
+    # because they're different physical devices.
+    for cluster_id, mems in clusters.items():
+        live_devs = [devices[did] for did, _ in mems if did in devices]
+        named = [
+            (d.last_seen, d.user_name) for d in live_devs if d.user_name
+        ]
+        if not named:
+            continue
+        chosen = max(named)[1]   # most-recently-seen renamed member wins
+        for d in live_devs:
+            if not d.user_name:
+                d.user_name = chosen
+
+    # ---- Rename propagation (local_name fallback) ------------------------
+    # For devices NOT in a cluster, fall back to matching the
+    # broadcast ``local_name``. Catches the "I just power-cycled the
+    # HA but the runner hasn't seen the rotation handoff yet" case —
+    # the new instance shares ``local_name`` with the renamed
+    # original even before the cluster ties them together.
     #
-    # Pick the most-recently-seen renamed device per local_name so
-    # the result is deterministic across reloads (otherwise dict
-    # iteration order would flip the chosen name). When multiple
-    # renamed devices share a local_name (e.g. "Doug HA (L)" and
-    # "Doug HA (R)" both with local_name "Douglas Hearing Aids"),
-    # we can't tell which physical device a new instance corresponds
-    # to from local_name alone — picking the most recent is a
-    # heuristic; cluster-based propagation (deferred follow-up)
-    # would be more accurate once the runner identifies a rotation.
+    # Most-recently-seen renamed device wins per local_name so the
+    # result is deterministic across reloads. When two devices share
+    # a local_name and have been renamed to different names (e.g.
+    # "Doug HA (L)" and "Doug HA (R)"), this picks one — the cluster
+    # propagation above is the more accurate fix once available.
     #
     # Display-only — never writes back to the DB, so a wrong match
     # never poisons the underlying ``devices.user_name`` column.
@@ -572,24 +604,11 @@ def load_canvas_devices(
                 cd.user_name = picked[1]
 
     # ---- Cluster collapse -------------------------------------------------
-    # Read cluster membership for the in-scope devices. Multi-member
-    # clusters whose weakest score clears the threshold collapse into
-    # one primary box that aggregates the absorbed siblings; weaker
-    # clusters keep all members visible (still tagged with cluster_id
-    # so the UI can surface "this is part of cluster N — verify it").
-    cm_rows = conn.execute(
-        f"""
-        SELECT cluster_id, device_id, score
-          FROM device_cluster_members
-         WHERE device_id IN ({placeholders})
-        """,
-        tuple(devices.keys()),
-    ).fetchall()
-    clusters: dict[int, list[tuple[int, float | None]]] = {}
-    for r in cm_rows:
-        clusters.setdefault(r["cluster_id"], []).append(
-            (r["device_id"], r["score"]),
-        )
+    # Multi-member clusters whose weakest score clears the threshold
+    # collapse into one primary box that aggregates the absorbed
+    # siblings; weaker clusters keep all members visible (still
+    # tagged with cluster_id so the UI can surface "this is part of
+    # cluster N — verify it").
     for cluster_id, mems in clusters.items():
         # Filter to members that survived the stale-window cut.
         live_mems = [(did, s) for did, s in mems if did in devices]

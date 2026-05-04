@@ -535,6 +535,42 @@ def load_canvas_devices(
         if cd.broadcast_name is None:
             cd.broadcast_name = r["broadcast_name"]
 
+    # ---- Rename propagation ----------------------------------------------
+    # If the user renamed a device with a recognisable ``local_name``
+    # broadcast (e.g. "Douglas Hearing Aids"), apply that rename to
+    # any other device that broadcasts the same ``local_name`` but
+    # doesn't yet have its own ``user_name`` set. This makes a rename
+    # "stick" across power cycles: an HA that comes back up with a
+    # fresh RPA still shows the user's chosen name because the
+    # broadcast name didn't change.
+    #
+    # Pick the most-recently-seen renamed device per local_name so
+    # the result is deterministic across reloads (otherwise dict
+    # iteration order would flip the chosen name). When multiple
+    # renamed devices share a local_name (e.g. "Doug HA (L)" and
+    # "Doug HA (R)" both with local_name "Douglas Hearing Aids"),
+    # we can't tell which physical device a new instance corresponds
+    # to from local_name alone — picking the most recent is a
+    # heuristic; cluster-based propagation (deferred follow-up)
+    # would be more accurate once the runner identifies a rotation.
+    #
+    # Display-only — never writes back to the DB, so a wrong match
+    # never poisons the underlying ``devices.user_name`` column.
+    rename_by_local: dict[str, tuple[float, str]] = {}
+    for cd in devices.values():
+        if not (cd.user_name and cd.local_name):
+            continue
+        existing = rename_by_local.get(cd.local_name)
+        if existing is None or cd.last_seen > existing[0]:
+            rename_by_local[cd.local_name] = (cd.last_seen, cd.user_name)
+    if rename_by_local:
+        for cd in devices.values():
+            if cd.user_name:
+                continue
+            picked = rename_by_local.get(cd.local_name or "")
+            if picked is not None:
+                cd.user_name = picked[1]
+
     # ---- Cluster collapse -------------------------------------------------
     # Read cluster membership for the in-scope devices. Multi-member
     # clusters whose weakest score clears the threshold collapse into

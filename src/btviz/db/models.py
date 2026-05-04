@@ -304,3 +304,22 @@ class Sniffer:
     first_seen: float = 0.0
     last_seen: float = 0.0
     notes: str | None = None
+
+    @property
+    def is_tx_capable(self) -> bool:
+        """True if the firmware on this device can transmit (TX/RX),
+        False if it's an RX-only sniffer firmware.
+
+        Derived from the firmware's identifying strings rather than
+        the hardware kind — the same nRF52840 chip is RX-only when
+        running Nordic's nRF Sniffer for BLE firmware and TX-capable
+        when running connectivity / SoftDevice / custom firmware.
+        Heuristic: the substring "sniffer" appearing in either the
+        extcap display string or the USB product descriptor implies
+        the sniffer firmware is loaded; anything else is assumed
+        TX-capable.
+
+        See ``btviz.capture.capability.is_firmware_tx_capable``.
+        """
+        from ..capture.capability import is_firmware_tx_capable
+        return is_firmware_tx_capable(self.usb_product, self.display)

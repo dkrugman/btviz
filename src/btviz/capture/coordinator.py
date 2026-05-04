@@ -70,7 +70,19 @@ class CaptureCoordinator:
             self.sniffers[dongle.short_id] = sp
             self.roles[dongle.short_id] = Idle()  # placeholder before plan
 
-        plan = default_roles([d.short_id for d in self.dongles])
+        # Capability-aware role assignment: when there are ≥ 4 dongles,
+        # ``default_roles`` reserves any TX-capable devices as Idle so
+        # they're available for interrogation / follow tasks; RX-only
+        # sniffer-firmware devices get the primary-channel pin roles.
+        # With ≤ 3 dongles every radio is needed for primary-channel
+        # coverage, so capability doesn't influence the assignment.
+        tx_capable_ids = {
+            d.short_id for d in self.dongles if d.is_tx_capable
+        }
+        plan = default_roles(
+            [d.short_id for d in self.dongles],
+            tx_capable_ids=tx_capable_ids,
+        )
         # Apply pinned/follow roles first, then ScanUnmonitored (so the
         # recompute sees a stable pinned set).
         for did, role in plan.items():

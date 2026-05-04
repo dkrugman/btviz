@@ -17,13 +17,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
     QPainter,
     QPen,
+    QPolygonF,
 )
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
@@ -153,14 +154,19 @@ _ADV_STRIP_TOP_Y = (
 _FLASH_DROPOUT_BG = QColor(20, 20, 28)
 _FLASH_DROPOUT_FG = QColor(230, 70, 70)
 
-# Quality gauge icon at the bottom-right of the collapsed body. Solid
-# coloured dot whose hue tracks the device's CRC-fail rate. Tracks the
-# same green/yellow/red bands the sniffer-panel summary uses.
-_QUALITY_DOT_R = 5
+# Quality bar at the bottom of the device-box body. Horizontal bar
+# whose left segment (green) is the cumulative good-packet share and
+# right segment (red) is the CRC-fail share. A small caret marks the
+# boundary; the good-percentage prints below the caret.
 _QUALITY_GREEN = QColor(60, 180, 90)
-_QUALITY_YELLOW = QColor(220, 180, 50)
 _QUALITY_RED = QColor(220, 70, 70)
 _QUALITY_NEUTRAL = QColor(170, 170, 170)  # before any packets observed
+_QUALITY_BAR_H = 8
+_QUALITY_BAR_RADIUS = 2
+_QUALITY_LABEL_W = 44      # width reserved for the "Quality" label
+_QUALITY_CARET_W = 6       # base width of the upward-pointing caret
+_QUALITY_CARET_H = 4
+_QUALITY_CARET_FILL = QColor(40, 40, 50)
 
 # Cluster-collapse confidence threshold. The canvas hydrator only
 # collapses a multi-device cluster into one primary box when *every*
@@ -1221,48 +1227,115 @@ class DeviceItem(QGraphicsItem):
         self._paint_quality_line(painter, _HEADER_H + 22)
 
     def _paint_quality_line(self, painter: QPainter, y: float) -> None:
-        """Render the per-device CRC-quality line + gauge dot.
+        """Render the per-device CRC-quality bar.
 
-        Same format as the sniffer panel summary: ``X good · Y CRC-fail
-        (Z%)`` followed by a small filled circle whose colour tracks the
-        error rate (green / yellow / red). When no packets have flowed
-        through this device since the canvas opened we show a neutral
-        dot so the user still knows the gauge is there.
+        Layout:
+
+            [Quality] [████████████░░░░]
+                                  ▲
+                                 95%
+
+        Cumulative bar across all packets seen since the canvas
+        opened. Green segment width = good_packet_share; red segment
+        width = CRC-fail share. The caret marks the boundary; the
+        percentage below it is the good-share rounded to a whole
+        number. When no packets have arrived yet, the bar shows a
+        neutral grey fill with no caret.
         """
         good = self._good_packets
         bad = self._bad_packets
         total = good + bad
-        if total == 0:
-            txt = "Quality: — (no packets yet)"
-            color = _QUALITY_NEUTRAL
-        else:
-            bad_pct = 100.0 * bad / total
-            txt = (
-                f"{good:,} good · {bad:,} CRC-fail ({bad_pct:.1f}%)"
-            )
-            if bad_pct < 1.0:
-                color = _QUALITY_GREEN
-            elif bad_pct < 5.0:
-                color = _QUALITY_YELLOW
-            else:
-                color = _QUALITY_RED
-        # Reserve space on the right for the gauge dot, then draw the
-        # text in the remaining width so a long count never collides
-        # with the indicator.
-        dot_cx = _BOX_W - 12
-        dot_cy = y + 8
-        text_rect = QRectF(8, y, _BOX_W - 28, 16)
+
+        # Layout — left label, bar to its right, caret + % beneath.
+        label_x = 8
+        bar_left = label_x + _QUALITY_LABEL_W + 6
+        bar_right = _BOX_W - 8
+        bar_w = bar_right - bar_left
+        bar_top = y + 1
+
+        # "Quality" label, vertically centered against the bar.
+        label_font = QFont()
+        label_font.setPointSize(8)
+        label_font.setBold(True)
+        painter.setFont(label_font)
         painter.setPen(QColor(50, 50, 50))
         painter.drawText(
-            text_rect, Qt.AlignVCenter | Qt.AlignLeft, txt,
+            QRectF(label_x, y, _QUALITY_LABEL_W, _QUALITY_BAR_H + 2),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            "Quality",
         )
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QBrush(color))
-        painter.drawEllipse(
-            QRectF(
-                dot_cx - _QUALITY_DOT_R, dot_cy - _QUALITY_DOT_R,
-                _QUALITY_DOT_R * 2, _QUALITY_DOT_R * 2,
+
+        if total == 0:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(_QUALITY_NEUTRAL))
+            painter.drawRoundedRect(
+                QRectF(bar_left, bar_top, bar_w, _QUALITY_BAR_H),
+                _QUALITY_BAR_RADIUS, _QUALITY_BAR_RADIUS,
             )
+            return
+
+        good_frac = good / total
+        boundary_x = bar_left + good_frac * bar_w
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        # Green segment (good). Always painted because a 0%-good edge
+        # case still wants a faint green sliver to indicate "this is
+        # the good-side of the bar."
+        if good_frac > 0:
+            painter.setBrush(QBrush(_QUALITY_GREEN))
+            painter.drawRoundedRect(
+                QRectF(
+                    bar_left, bar_top,
+                    boundary_x - bar_left, _QUALITY_BAR_H,
+                ),
+                _QUALITY_BAR_RADIUS, _QUALITY_BAR_RADIUS,
+            )
+        # Red segment (CRC-fail).
+        if good_frac < 1.0:
+            painter.setBrush(QBrush(_QUALITY_RED))
+            painter.drawRoundedRect(
+                QRectF(
+                    boundary_x, bar_top,
+                    bar_right - boundary_x, _QUALITY_BAR_H,
+                ),
+                _QUALITY_BAR_RADIUS, _QUALITY_BAR_RADIUS,
+            )
+
+        # Caret pointing UP to the boundary, sitting just under the bar.
+        caret_top_y = bar_top + _QUALITY_BAR_H + 1
+        caret_poly = QPolygonF([
+            QPointF(boundary_x, caret_top_y),
+            QPointF(
+                boundary_x - _QUALITY_CARET_W / 2.0,
+                caret_top_y + _QUALITY_CARET_H,
+            ),
+            QPointF(
+                boundary_x + _QUALITY_CARET_W / 2.0,
+                caret_top_y + _QUALITY_CARET_H,
+            ),
+        ])
+        painter.setBrush(QBrush(_QUALITY_CARET_FILL))
+        painter.drawPolygon(caret_poly)
+
+        # Percentage label, centered under the caret. Clipped to the
+        # bar's horizontal bounds so it stays visible at extremes.
+        pct_str = f"{int(round(good_frac * 100))}%"
+        pct_font = QFont()
+        pct_font.setPointSize(7)
+        painter.setFont(pct_font)
+        metrics = painter.fontMetrics()
+        pct_w = metrics.horizontalAdvance(pct_str)
+        pct_x = boundary_x - pct_w / 2.0
+        if pct_x < bar_left:
+            pct_x = bar_left
+        elif pct_x + pct_w > bar_right:
+            pct_x = bar_right - pct_w
+        pct_y = caret_top_y + _QUALITY_CARET_H + 1
+        painter.setPen(QColor(50, 50, 50))
+        painter.drawText(
+            QRectF(pct_x, pct_y, pct_w + 1, 10),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            pct_str,
         )
 
     def _paint_expanded_body(self, painter: QPainter) -> None:
@@ -1330,11 +1403,12 @@ class DeviceItem(QGraphicsItem):
         if len(d.addresses) > 4:
             line(f"  +{len(d.addresses) - 4} more")
 
-        # CRC-quality line + gauge dot at the bottom of the body. Same
-        # rendering as the collapsed view so the indicator's location
-        # stays consistent when the user expands a box.
+        # CRC-quality bar at the bottom of the body. Same rendering
+        # as the collapsed view so the indicator's location stays
+        # consistent when the user expands a box. 26 px reserves room
+        # for the bar + caret + percentage label below it.
         body_h = _BOX_H_EXPANDED - _HEADER_H
-        self._paint_quality_line(painter, _HEADER_H + body_h - 18)
+        self._paint_quality_line(painter, _HEADER_H + body_h - 26)
 
     @staticmethod
     def _truncate(s: str, n: int) -> str:

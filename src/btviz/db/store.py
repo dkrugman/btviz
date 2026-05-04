@@ -9,12 +9,24 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH_ENV = "BTVIZ_DB_PATH"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 # Incremental migrations applied to existing DBs to bring them up to
 # ``SCHEMA_VERSION``. Fresh DBs get the full schema.sql (which already
 # contains everything through SCHEMA_VERSION) and skip these.
+
+# v5 — device_clusters.confirmed. When True (the default for new
+# auto-runs), the cluster runner treats the cluster as "decided" —
+# future runs add members but never tear it down or remove members
+# absent explicit negative evidence. Implements the user's "merges
+# should be monotonic" intuition: once we say A and B are the same
+# device, the cluster doesn't shrink just because the pair-edge
+# weakens (e.g., Continuity payload rotated).
+_V4_TO_V5_SQL = """
+ALTER TABLE device_clusters ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0;
+UPDATE device_clusters SET confirmed = 1;
+"""
 
 # v4 — observations.bad_packet_count. Per-(session, device) cumulative
 # count of CRC-failed packets that the live-ingest cache attributed
@@ -144,6 +156,10 @@ class Store:
             self.conn.executescript(_V3_TO_V4_SQL)
             self.conn.execute("PRAGMA user_version = 4")
             version = 4
+        if version == 4:
+            self.conn.executescript(_V4_TO_V5_SQL)
+            self.conn.execute("PRAGMA user_version = 5")
+            version = 5
         if version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unknown db schema version {version}; app expects {SCHEMA_VERSION}"

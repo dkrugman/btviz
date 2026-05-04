@@ -1208,75 +1208,186 @@ class Clusters:
         *,
         source: str = "auto",
     ) -> int:
-        """Replace all clusters of ``source`` with the runner's merge decisions.
+        """Apply the runner's merge decisions ADDITIVELY to the cluster table.
+
+        Sticky-cluster semantics: confirmed clusters (``confirmed=1``)
+        are preserved across runs. New merge edges either:
+
+          * extend an existing confirmed cluster (one or both devices
+            already members → the other is added), or
+          * merge two confirmed clusters together (both devices are
+            in different confirmed clusters → unioned), or
+          * create a new cluster (neither device in any cluster).
+
+        Confirmed clusters are NEVER torn down or shrunk by this
+        method. Only ``confirmed=0`` "speculative" clusters get
+        rebuilt — but the runner doesn't currently produce those, so
+        in practice every auto-run is purely additive.
 
         ``decisions`` is the ``RunResult.merge_decisions`` list:
-        ``[(device_id_a, device_id_b, Decision), ...]``. Returns the number
-        of clusters written.
+        ``[(device_id_a, device_id_b, Decision), ...]``. Returns the
+        number of cluster INSERTs (clusters created), not the total
+        count of clusters touched.
         """
+        if not decisions:
+            return 0
+
         with self.s.tx():
+            # Build a quick lookup: device_id -> existing cluster_id
+            # (across ALL existing clusters, regardless of source —
+            # we don't want to double-cluster a device that the user
+            # has manually grouped).
+            existing = self.s.conn.execute(
+                "SELECT cluster_id, device_id FROM device_cluster_members"
+            ).fetchall()
+            device_to_cluster: dict[int, int] = {}
+            for r in existing:
+                cid = r[0] if isinstance(r, tuple) else r["cluster_id"]
+                did = r[1] if isinstance(r, tuple) else r["device_id"]
+                device_to_cluster[did] = cid
+
+            # Wipe ONLY unconfirmed clusters of this source — they're
+            # speculative and get re-derived from this run. Confirmed
+            # clusters stay (sticky). After the wipe, existing
+            # device_to_cluster mapping for those devices is stale,
+            # so re-build it.
             self.s.conn.execute(
-                "DELETE FROM device_clusters WHERE source = ?", (source,),
+                "DELETE FROM device_clusters"
+                " WHERE source = ? AND confirmed = 0",
+                (source,),
             )
-            if not decisions:
-                return 0
+            existing_after = self.s.conn.execute(
+                "SELECT cluster_id, device_id FROM device_cluster_members"
+            ).fetchall()
+            device_to_cluster = {}
+            for r in existing_after:
+                cid = r[0] if isinstance(r, tuple) else r["cluster_id"]
+                did = r[1] if isinstance(r, tuple) else r["device_id"]
+                device_to_cluster[did] = cid
 
-            parent: dict[int, int] = {}
+            # Build decision lookup for evidence rendering.
             decision_for: dict[tuple[int, int], object] = {}
-
-            def find(x: int) -> int:
-                while parent[x] != x:
-                    parent[x] = parent[parent[x]]
-                    x = parent[x]
-                return x
-
-            def union(x: int, y: int) -> None:
-                rx, ry = find(x), find(y)
-                if rx != ry:
-                    parent[rx] = ry
-
             for a_id, b_id, decision in decisions:
-                parent.setdefault(a_id, a_id)
-                parent.setdefault(b_id, b_id)
                 key = (min(a_id, b_id), max(a_id, b_id))
                 decision_for[key] = decision
-                union(a_id, b_id)
 
-            groups: dict[int, list[int]] = {}
-            for did in parent:
-                groups.setdefault(find(did), []).append(did)
-
+            # Process each merge edge. Three cases:
+            #   1. Both devices already in same cluster → no-op.
+            #   2. Exactly one device already in a cluster → add the
+            #      other to that cluster.
+            #   3. Both in DIFFERENT clusters → merge clusters: move
+            #      members of the smaller cluster into the larger,
+            #      delete the now-empty cluster row.
+            #   4. Neither in any cluster → create a new cluster
+            #      with both as members.
             written = 0
-            for members in groups.values():
-                if len(members) < 2:
+            for a_id, b_id, decision in decisions:
+                ca = device_to_cluster.get(a_id)
+                cb = device_to_cluster.get(b_id)
+
+                if ca is not None and ca == cb:
+                    # Already grouped — touch ``last_decided_at``.
+                    self.s.conn.execute(
+                        "UPDATE device_clusters SET last_decided_at = ?"
+                        " WHERE id = ?", (now, ca),
+                    )
                     continue
+
+                if ca is not None and cb is not None and ca != cb:
+                    # Merge two existing clusters: keep the older
+                    # (lower id) and absorb the newer.
+                    keep, drop = (ca, cb) if ca < cb else (cb, ca)
+                    self.s.conn.execute(
+                        "UPDATE device_cluster_members SET cluster_id = ?"
+                        " WHERE cluster_id = ?", (keep, drop),
+                    )
+                    self.s.conn.execute(
+                        "DELETE FROM device_clusters WHERE id = ?", (drop,),
+                    )
+                    self.s.conn.execute(
+                        "UPDATE device_clusters SET last_decided_at = ?"
+                        " WHERE id = ?", (now, keep),
+                    )
+                    # Update the in-memory map for any future
+                    # decisions in this run that reference the
+                    # absorbed cluster.
+                    for did, cid in list(device_to_cluster.items()):
+                        if cid == drop:
+                            device_to_cluster[did] = keep
+                    continue
+
+                if ca is not None:
+                    # b is unattached — add to a's cluster.
+                    self._add_member(ca, b_id, decision_for, now, source)
+                    device_to_cluster[b_id] = ca
+                    self.s.conn.execute(
+                        "UPDATE device_clusters SET last_decided_at = ?"
+                        " WHERE id = ?", (now, ca),
+                    )
+                    continue
+
+                if cb is not None:
+                    # a is unattached — add to b's cluster.
+                    self._add_member(cb, a_id, decision_for, now, source)
+                    device_to_cluster[a_id] = cb
+                    self.s.conn.execute(
+                        "UPDATE device_clusters SET last_decided_at = ?"
+                        " WHERE id = ?", (now, cb),
+                    )
+                    continue
+
+                # Neither attached — create a new confirmed cluster.
                 cur = self.s.conn.execute(
                     """
                     INSERT INTO device_clusters
-                        (label, created_at, last_decided_at, source)
-                    VALUES (NULL, ?, ?, ?)
+                        (label, created_at, last_decided_at, source, confirmed)
+                    VALUES (NULL, ?, ?, ?, 1)
                     """,
                     (now, now, source),
                 )
-                cluster_id = cur.lastrowid
-                for did in members:
-                    score, contributions, profile = _member_evidence(
-                        did, members, decision_for,
-                    )
-                    self.s.conn.execute(
-                        """
-                        INSERT INTO device_cluster_members
-                            (cluster_id, device_id, score, contributions,
-                             profile, decided_at, decided_by)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            cluster_id, did, score, contributions, profile,
-                            now, source,
-                        ),
-                    )
+                new_cid = cur.lastrowid
+                self._add_member(new_cid, a_id, decision_for, now, source)
+                self._add_member(new_cid, b_id, decision_for, now, source)
+                device_to_cluster[a_id] = new_cid
+                device_to_cluster[b_id] = new_cid
                 written += 1
             return written
+
+    def _add_member(
+        self, cluster_id: int, device_id: int,
+        decision_for: "dict[tuple[int, int], object]",
+        now: float, source: str,
+    ) -> None:
+        """Insert one (cluster_id, device_id) row with the strongest
+        decision evidence we have for this device.
+        """
+        # Find the highest-score decision involving this device.
+        best_decision = None
+        best_score = -2.0
+        for (a, b), dec in decision_for.items():
+            if device_id not in (a, b):
+                continue
+            if dec.score > best_score:
+                best_score = dec.score
+                best_decision = dec
+        if best_decision is not None:
+            score = best_decision.score
+            contributions = json.dumps({
+                k: list(v) for k, v in best_decision.signals.items()
+            })
+            profile = best_decision.profile
+        else:
+            score, contributions, profile = None, None, None
+        self.s.conn.execute(
+            """
+            INSERT OR IGNORE INTO device_cluster_members
+                (cluster_id, device_id, score, contributions,
+                 profile, decided_at, decided_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (cluster_id, device_id, score, contributions, profile,
+             now, source),
+        )
 
     def list_for_device(self, device_id: int) -> "list[dict]":
         """All cluster rows the given device participates in (typically <=1)."""

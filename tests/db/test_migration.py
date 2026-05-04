@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from btviz.db.store import Store, _V1_TO_V2_SQL, _V2_TO_V3_SQL
+# Ensure this checkout's src/ takes precedence over any sibling-checkout
+# btviz package that may already be on sys.path (e.g. from a venv that
+# was created in a different working tree).
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+from btviz.db.store import Store, _V1_TO_V2_SQL, _V2_TO_V3_SQL  # noqa: E402
 
 # SQL needed to build a v1 fixture DB.
 _SCHEMA_V1 = """
@@ -170,7 +177,7 @@ class FreshDbTests(unittest.TestCase):
             store = Store(Path(d) / "fresh.db")
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 4)
+            self.assertEqual(version, 5)
 
     def test_fresh_db_has_v4_column(self):
         # observations.bad_packet_count was added in v4 to back the
@@ -205,6 +212,11 @@ class FreshDbTests(unittest.TestCase):
                   FROM observations;
                 DROP TABLE observations;
                 ALTER TABLE _obs_v3 RENAME TO observations;
+                CREATE TABLE _dc_v3 AS SELECT
+                    id, label, created_at, last_decided_at, source
+                  FROM device_clusters;
+                DROP TABLE device_clusters;
+                ALTER TABLE _dc_v3 RENAME TO device_clusters;
                 PRAGMA user_version = 3;
             """)
             conn.commit()
@@ -217,7 +229,7 @@ class FreshDbTests(unittest.TestCase):
             }
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 4)
+            self.assertEqual(version, 5)
             self.assertIn("bad_packet_count", cols)
 
 
@@ -231,7 +243,7 @@ class V1UpgradeTests(unittest.TestCase):
             tables = _tables(store.conn)
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 4)
+            self.assertEqual(version, 5)
             self.assertIn("sniffers", tables)
             for t in _V3_TABLES:
                 self.assertIn(t, tables, f"missing after v1→v3: {t}")
@@ -265,7 +277,7 @@ class V2UpgradeTests(unittest.TestCase):
             tables = _tables(store.conn)
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 4)
+            self.assertEqual(version, 5)
             for t in _V3_TABLES:
                 self.assertIn(t, tables, f"missing after v2→v3: {t}")
 

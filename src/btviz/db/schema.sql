@@ -321,7 +321,14 @@ CREATE TABLE device_clusters (
     label           TEXT,
     created_at      REAL NOT NULL,
     last_decided_at REAL NOT NULL,
-    source          TEXT NOT NULL DEFAULT 'auto'
+    source          TEXT NOT NULL DEFAULT 'auto',
+    -- Sticky-cluster flag. When True (default for new auto-runs),
+    -- the cluster persists across runner ticks; future runs ADD
+    -- members but never tear it down or remove members absent
+    -- explicit negative evidence. Once user-confirmed via the UI,
+    -- this also stays True. Manual splits set this to 0 to allow
+    -- the next run to re-evaluate from scratch.
+    confirmed       INTEGER NOT NULL DEFAULT 1
 );
 
 -- Cluster membership. A device belongs to at most one cluster; enforced by the

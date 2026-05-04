@@ -1,15 +1,22 @@
-"""Discover the Nordic nRF Sniffer extcap binary and enumerate dongles.
+"""Discover sniffer dongles via direct USB enumeration.
 
-The Wireshark extcap mechanism advertises capture interfaces via:
-    <extcap_binary> --extcap-interfaces
+Historically btviz invoked the Nordic ``nrf_sniffer_ble.py`` extcap
+binary in ``--extcap-interfaces`` mode and parsed its output. That
+probe turned out to be unreliable: on multi-dongle setups the
+binary silently dropped most of the connected dongles (e.g.
+returning 2 of 7 plugged-in sniffer-firmware devices), apparently
+serializing per-port probes with timeouts that didn't scale.
 
-Output format (one line per interface):
-    interface {value=<id>}{display=<name>}
-    ...
+This module now enumerates sniffer dongles directly via ``pyserial``
+(which reads USB descriptors), then synthesizes the extcap
+``interface_id`` from the macOS-allocated device path. The Nordic
+extcap is only invoked at *capture* time, with a single
+``--extcap-interface <id>`` per dongle — no broad enumeration
+probe is needed.
 
-We invoke the Nordic extcap directly so the app does not need a running
-Wireshark/tshark for enumeration. Capture itself uses the same binary
-in --capture mode (see sniffer.py).
+The interface_id format Nordic's extcap accepts at capture time is
+``<device_path>-None`` (the trailing ``-None`` is the unset
+"address" field). E.g. ``/dev/cu.usbmodem223101-None``.
 """
 from __future__ import annotations
 
@@ -18,6 +25,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from serial.tools import list_ports
 
 from ..config import NRF_EXTCAP_CANDIDATE_PATHS
 from . import usb_info
@@ -80,89 +89,103 @@ def list_dongles(
     *,
     timeout: float = 60.0,
 ) -> list[Dongle]:
-    """Return all currently connected nRF Sniffer dongles.
+    """Return all currently connected sniffer dongles.
 
-    Filters out macOS `/dev/tty.*` duplicates of `/dev/cu.*` devices.
-
-    The Nordic extcap probes every serial-class USB device on the host
-    looking for the sniffer protocol. Pass-through devices like the
-    Silicon Labs CP2104 (used on the Adafruit Bluefruit LE Sniffer) can
-    push the probe over 10s, so the default timeout is conservative.
+    Implementation note: ``extcap`` and ``timeout`` are accepted for
+    backward compatibility with the pre-pyserial signature but are no
+    longer used. The Nordic extcap binary's ``--extcap-interfaces``
+    probe was found to silently drop most dongles on multi-device
+    setups (returning 2 of 7 in the user's case). We now read USB
+    descriptors directly via ``pyserial.tools.list_ports.comports``
+    and synthesize the extcap interface_id from the device path.
     """
-    extcap = extcap or find_extcap_binary()
-    out = subprocess.run(
-        [str(extcap), "--extcap-interfaces"],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    ).stdout
+    return _enumerate_via_pyserial()
 
-    found: list[Dongle] = []
-    for line in out.splitlines():
-        m = _INTERFACE_LINE.match(line.strip())
-        if not m:
+
+# Kept as a separate function for backward compatibility — the canvas
+# imports both. Now that the slow path is fast, both call the same
+# implementation and the fast/slow distinction is vestigial.
+def list_dongles_fast() -> list[Dongle]:
+    """Same as ``list_dongles`` — both paths are now USB-descriptor-only."""
+    return _enumerate_via_pyserial()
+
+
+def _enumerate_via_pyserial() -> list[Dongle]:
+    """Enumerate sniffer dongles via pyserial USB-descriptor introspection.
+
+    Includes:
+      * Nordic-VID devices whose ``product`` advertises the nRF Sniffer
+        firmware (any case).
+      * SEGGER-VID devices likewise (DK running sniffer firmware
+        appears as a SEGGER J-Link bridge).
+
+    Each unique physical device contributes one ``Dongle``. SEGGER
+    bridges expose two vcom interfaces (one is the application UART,
+    the other is RTT/SWO); we dedup by ``serial_number`` and keep the
+    lowest device path lexically — that's vcom 0 on macOS, which is
+    where the sniffer firmware exposes its protocol.
+
+    The extcap ``interface_id`` is constructed as ``"<device>-None"``
+    to match the format Nordic's ``nrf_sniffer_ble.py`` accepts at
+    capture time (the trailing ``-None`` is the unset address field
+    in their internal value scheme).
+    """
+    by_serial: dict[str, Dongle] = {}
+    seen_no_serial: list[Dongle] = []
+    for p in list_ports.comports():
+        if not p.vid:
             continue
-        iface_id, display = m.group(1), m.group(2)
-        # Nordic uses the serial device path as the interface value.
-        serial_path = iface_id
-        # Drop the macOS tty.* twin; keep cu.*
-        if "/tty.usbmodem" in serial_path:
+        kind, display_default = _hint_for_vid(p.vid)
+        if kind is None:
             continue
-        found.append(Dongle(
-            interface_id=iface_id,
-            display=display,
-            serial_path=serial_path,
-        ))
+        product = p.product or ""
+        if "sniffer" not in product.lower():
+            # Skip non-sniffer firmware (e.g. SEGGER J-Link with
+            # connectivity firmware on the DK). The active-probing
+            # path will pick those up via a separate enumeration when
+            # that infrastructure lands.
+            continue
+        device_path = p.device  # /dev/cu.usbmodem<short>
+        if "/tty.usbmodem" in device_path:
+            # pyserial usually returns /dev/cu.* on macOS, but be safe.
+            continue
+        # Nordic extcap accepts <device>-None as its interface_id.
+        interface_id = f"{device_path}-None"
+        dongle = Dongle(
+            interface_id=interface_id,
+            display=product or display_default or "Sniffer",
+            serial_path=device_path,
+            serial_number=p.serial_number or None,
+            location_id_hex=None,  # pyserial's location field is a
+                                    # hub-path string ("0-1.4") not a
+                                    # macOS Location ID; we drop it
+                                    # and sort by serial_path instead.
+            usb_product=product or None,
+            kind=kind,
+        )
+        if p.serial_number:
+            existing = by_serial.get(p.serial_number)
+            # Keep the lexically-lowest device_path per serial — that's
+            # vcom 0 on a SEGGER J-Link bridge (the application UART,
+            # which is where sniffer firmware exposes its protocol;
+            # vcom 1 is RTT/SWO).
+            if existing is None or device_path < existing.serial_path:
+                by_serial[p.serial_number] = dongle
+        else:
+            seen_no_serial.append(dongle)
 
-    # Drop SLAB_USBtoUART duplicates when an equivalent /dev/cu.usbserial-
-    # node exists for the same physical device. macOS exposes both names
-    # for Silicon Labs USB-to-UART chips (the Adafruit Bluefruit LE Sniffer
-    # uses one). Silicon Labs's driver creates /dev/cu.SLAB_USBtoUART as a
-    # convenience alias for the canonical /dev/cu.usbserial-XXXX node;
-    # both nodes point at the same chip and the extcap binary lists each
-    # one, so without this filter every Silicon-Labs-bridged sniffer
-    # double-counts in the panel.
-    found = _dedupe_slab_usbtouart_aliases(found)
-
-    # Enrich with USB descriptors when we can — gets us the real serial
-    # number and Location ID (stable physical-port sort key). On platforms
-    # where usb_info isn't supported, the dongles stay at the base fields.
-    found = _enrich_with_usb(found)
-
-    # Stable order so UI assignments don't shuffle between scans. Prefer
-    # location_id when available (physical position in the hub); fall back
-    # to serial_path for stable ordering on platforms without USB info.
-    found.sort(key=lambda d: (
-        d.location_id_hex is None,
-        d.location_id_hex or "",
-        d.serial_path,
-    ))
+    found = list(by_serial.values()) + seen_no_serial
+    # Stable order so UI assignments don't shuffle between scans.
+    found.sort(key=lambda d: (d.serial_number or "", d.serial_path))
     return found
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Fast discovery path — pure USB descriptor enumeration, no extcap probe.
+# VID/kind table — used by the pyserial enumerator to filter to candidates
+# we recognize. The pyserial probe is fast enough that the historical
+# fast/slow split is no longer needed.
 # ──────────────────────────────────────────────────────────────────────────
-#
-# Why this exists: ``list_dongles()`` calls the Nordic extcap binary's
-# ``--extcap-interfaces`` mode, which probes every serial-class USB device
-# on the system looking for the sniffer protocol. Probes serialize, and
-# non-Nordic devices (USB-to-UART bridges, Thunderbolt audio, USB cameras
-# with serial endpoints) make the probe wait for replies that never come.
-# In practice the call hangs indefinitely on busy hubs.
-#
-# For *display* purposes — populating the sniffer panel so the user knows
-# what's plugged in — we don't need to validate sniffer-protocol response.
-# We just need the list of plugged-in USB devices that LOOK like sniffers.
-# ``ioreg`` answers that instantly.
-#
-# At capture time, when the user actually wants to start sniffing, we'd
-# still call the extcap (though that's a single-target invocation with
-# ``--extcap-interface <id>``, not the full enumerate-everything probe).
 
-# VID/product hints that identify a sniffer candidate at the USB level.
-# Order matters: more-specific hints first.
 _SNIFFER_VID_HINTS: tuple[tuple[int, str, str], ...] = (
     # (vendor_id, kind, default_display)
     (usb_info.SEGGER_VID,    "dk",     "SEGGER J-Link (nRF5340 DK)"),
@@ -172,63 +195,6 @@ _SNIFFER_VID_HINTS: tuple[tuple[int, str, str], ...] = (
     (usb_info.PROLIFIC_VID,  "dongle", "Prolific USB-to-UART"),
     (usb_info.CH340_VID,     "dongle", "CH340 USB-to-UART"),
 )
-
-
-def list_dongles_fast() -> list[Dongle]:
-    """Enumerate sniffer candidates from USB descriptors only (no extcap).
-
-    Fast path used by the canvas's panel refresh — completes in tens of
-    milliseconds and never hangs. Returns one ``Dongle`` per recognized
-    USB device (Nordic / SEGGER / common USB-to-UART bridges).
-
-    The ``serial_path`` field is set to the device-node path when we can
-    construct it (``/dev/cu.usbmodem<iSerial>1`` for iSerial-bearing
-    devices), or to a synthetic ``ioreg:loc=<location>`` token when not.
-    The extcap interface_id is left blank — only needed at capture time,
-    when the slow ``list_dongles()`` is used to resolve it via the real
-    extcap probe.
-
-    Sort order matches ``list_dongles()``: by Location ID, then serial.
-    """
-    usb_devices = usb_info.query()
-    if not usb_devices:
-        return []
-
-    found: list[Dongle] = []
-    for u in usb_devices:
-        kind, display = _hint_for_vid(u.vendor_id)
-        if kind is None:
-            continue
-        # Refine kind for SEGGER/Nordic via product name; classify_kind
-        # lifts "dk" out of the Nordic-VID bucket if needed (and vice versa).
-        kind = _classify_kind(u)
-        # Synthesize a device-node-like serial_path. Real extcap-derived
-        # paths look like /dev/cu.usbmodem<serial>1; we follow the same
-        # shape when we have an iSerial, and fall back to a deterministic
-        # ioreg-based identifier for serial-less devices so the row is
-        # still uniquely keyed.
-        if u.serial_number:
-            serial_path = f"/dev/cu.usbmodem{u.serial_number}1"
-        elif u.location_id_hex:
-            serial_path = f"ioreg:loc={u.location_id_hex}"
-        else:
-            serial_path = f"ioreg:vid={u.vendor_id:04x}:pid={u.product_id:04x}"
-        found.append(Dongle(
-            interface_id="",  # resolved at capture time
-            display=u.product_name or display,
-            serial_path=serial_path,
-            serial_number=u.serial_number or None,
-            location_id_hex=u.location_id_hex,
-            usb_product=u.product_name,
-            kind=kind,
-        ))
-
-    found.sort(key=lambda d: (
-        d.location_id_hex is None,
-        d.location_id_hex or "",
-        d.serial_path,
-    ))
-    return found
 
 
 def _hint_for_vid(vid: int) -> tuple[str | None, str | None]:

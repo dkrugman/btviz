@@ -5,6 +5,7 @@ description = "Bluetooth traffic visualizer and troubleshooting tool"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6>=6.7",
+    "pyserial>=3.5",
 ]
 # Note: tshark (the Wireshark CLI dissector) is invoked as a subprocess and
 # is *not* a Python package dependency. It must be installed separately —

@@ -554,52 +554,79 @@ def load_canvas_devices(
             (r["device_id"], r["score"]),
         )
 
+    # ---- Rename lookup tables (NOT stale-filtered) -----------------------
+    # Pull rename evidence from the WHOLE devices table, not just the
+    # in-window subset, so that a fresh HA RPA arriving after the
+    # renamed instance has aged out still inherits the rename. Without
+    # this, "Show: 1m" caused new RPAs to display as the bare
+    # ``local_name`` because the renamed device with the same
+    # ``local_name`` had fallen out of the stale window and wasn't
+    # available as a propagation source.
+    rename_by_local_all: dict[str, tuple[float, str]] = {}
+    for r in conn.execute(
+        "SELECT user_name, local_name, last_seen FROM devices"
+        " WHERE user_name IS NOT NULL AND local_name IS NOT NULL"
+    ).fetchall():
+        un = r["user_name"] if not isinstance(r, tuple) else r[0]
+        ln = r["local_name"] if not isinstance(r, tuple) else r[1]
+        ls = r["last_seen"] if not isinstance(r, tuple) else r[2]
+        existing = rename_by_local_all.get(ln)
+        if existing is None or ls > existing[0]:
+            rename_by_local_all[ln] = (ls, un)
+
+    # Same for cluster-based propagation: pull renamed members of any
+    # cluster, even if those members aren't in the current
+    # stale-filtered ``devices`` dict.
+    rename_by_cluster_all: dict[int, tuple[float, str]] = {}
+    if clusters:
+        cluster_ids = list(clusters.keys())
+        cph = ",".join("?" * len(cluster_ids))
+        for r in conn.execute(
+            f"SELECT m.cluster_id, d.user_name, d.last_seen"
+            f" FROM device_cluster_members m JOIN devices d ON d.id = m.device_id"
+            f" WHERE d.user_name IS NOT NULL AND m.cluster_id IN ({cph})",
+            cluster_ids,
+        ).fetchall():
+            cid = r["cluster_id"] if not isinstance(r, tuple) else r[0]
+            un = r["user_name"] if not isinstance(r, tuple) else r[1]
+            ls = r["last_seen"] if not isinstance(r, tuple) else r[2]
+            existing = rename_by_cluster_all.get(cid)
+            if existing is None or ls > existing[0]:
+                rename_by_cluster_all[cid] = (ls, un)
+
     # ---- Rename propagation (cluster-based, most accurate) ---------------
-    # For each cluster, propagate ``user_name`` from the most-recently-
-    # seen renamed member to other unnamed members of the same cluster.
-    # The runner has identified these devices as the same physical
-    # device, so this is more reliable than matching by local_name —
-    # left/right HAs in different clusters keep their distinct names
-    # because they're different physical devices.
+    # For each cluster represented in this canvas reload, propagate the
+    # ``user_name`` of the cluster's most-recently-renamed member to
+    # any unnamed member also visible in this reload. Source draws on
+    # ALL clustered devices (via ``rename_by_cluster_all``) so the
+    # rename survives even when the originally-renamed RPA has fallen
+    # out of the stale window.
     for cluster_id, mems in clusters.items():
         live_devs = [devices[did] for did, _ in mems if did in devices]
-        named = [
-            (d.last_seen, d.user_name) for d in live_devs if d.user_name
-        ]
-        if not named:
+        if not live_devs:
             continue
-        chosen = max(named)[1]   # most-recently-seen renamed member wins
+        picked = rename_by_cluster_all.get(cluster_id)
+        if picked is None:
+            continue
+        chosen = picked[1]
         for d in live_devs:
             if not d.user_name:
                 d.user_name = chosen
 
     # ---- Rename propagation (local_name fallback) ------------------------
     # For devices NOT in a cluster, fall back to matching the
-    # broadcast ``local_name``. Catches the "I just power-cycled the
-    # HA but the runner hasn't seen the rotation handoff yet" case —
-    # the new instance shares ``local_name`` with the renamed
-    # original even before the cluster ties them together.
-    #
-    # Most-recently-seen renamed device wins per local_name so the
-    # result is deterministic across reloads. When two devices share
-    # a local_name and have been renamed to different names (e.g.
-    # "Doug HA (L)" and "Doug HA (R)"), this picks one — the cluster
-    # propagation above is the more accurate fix once available.
+    # broadcast ``local_name``. Most-recently-renamed device per
+    # local_name wins. Source is the WHOLE devices table so a fresh
+    # RPA arriving after the renamed instance has aged out still
+    # inherits the rename.
     #
     # Display-only — never writes back to the DB, so a wrong match
     # never poisons the underlying ``devices.user_name`` column.
-    rename_by_local: dict[str, tuple[float, str]] = {}
-    for cd in devices.values():
-        if not (cd.user_name and cd.local_name):
-            continue
-        existing = rename_by_local.get(cd.local_name)
-        if existing is None or cd.last_seen > existing[0]:
-            rename_by_local[cd.local_name] = (cd.last_seen, cd.user_name)
-    if rename_by_local:
+    if rename_by_local_all:
         for cd in devices.values():
             if cd.user_name:
                 continue
-            picked = rename_by_local.get(cd.local_name or "")
+            picked = rename_by_local_all.get(cd.local_name or "")
             if picked is not None:
                 cd.user_name = picked[1]
 
@@ -2033,21 +2060,25 @@ class CanvasWindow(QMainWindow):
             live_btn.setStyleSheet(_CAPTURE_BUTTON_STYLE_IDLE)
         self._live_button = live_btn
         # "Record packets" gates the per-packet write to the ``packets``
-        # table. Off by default because the table grows ~4 GB/day under
-        # active capture; opt in when running cluster signals that need
-        # per-packet timestamps or per-sniffer RSSI (rotation_cohort,
-        # rssi_signature). Locked during a live session — read once at
-        # ``_start_live`` and applied to the IngestContext.
+        # table. ON by default — required for ``rotation_cohort`` and
+        # the future ``rssi_signature`` cluster signals, both of which
+        # silently abstain without it. Locked during a live session —
+        # read once at ``_start_live`` and applied to the IngestContext.
+        # Cost: ~4 GB/day of DB growth under active capture; users who
+        # don't want that can untoggle before clicking Start.
         # Rendered as a checkable QAction (mirrors "Verbose cluster log"
         # below) so the toolbar reads as a uniform row of buttons rather
         # than a button row with a stray checkbox indicator.
         self._keep_packets_action = tb.addAction("Record packets")
         self._keep_packets_action.setCheckable(True)
+        self._keep_packets_action.setChecked(True)
         self._keep_packets_action.setToolTip(
             "Write each decoded packet to the packets table.\n"
             "Required for rotation_cohort and rssi_signature cluster\n"
-            "signals. Disabled by default — adds ~4 GB/day of DB growth\n"
-            "under active capture."
+            "signals — leaving this on lets the cluster runner merge\n"
+            "RPA rotations across ~15-min boundaries. Cost: ~4 GB/day\n"
+            "of DB growth under active capture; untoggle before Start\n"
+            "if you don't want the per-packet history."
         )
         tb.addSeparator()
 

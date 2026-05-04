@@ -33,7 +33,9 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QGraphicsItem,
+    QGraphicsLineItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
     QHBoxLayout,
     QInputDialog,
@@ -97,6 +99,24 @@ _BOX_RADIUS = 10
 _GRID_DX = _BOX_W + 24               # column pitch (box + gutter)
 _GRID_DY = _BOX_H_COLLAPSED + 22     # row pitch (collapsed-box + gutter)
 _GRID_MARGIN_X = 20                  # left margin before the first column
+
+# Two-section canvas: the top "Devices" zone holds stable identities
+# (public/static MACs, IRK-resolved devices, cluster primaries that
+# absorbed RPAs, user-named devices) and the bottom "Unidentified
+# Advertisements" zone holds everything else (unresolved RPAs,
+# nrpas, unknowns). Both are always rendered with their labels even
+# when empty so the user always knows where new devices will appear.
+_SECTION_TOP_LABEL = "Devices"
+_SECTION_BOTTOM_LABEL = "Unidentified Advertisements"
+_SECTION_LABEL_FONT_PT = 11
+_SECTION_LABEL_H = 22
+_SECTION_LABEL_LEFT = 20
+_SECTION_GAP_BEFORE_DIVIDER = 14
+_SECTION_GAP_AFTER_DIVIDER = 10
+_SECTION_PLACEHOLDER_H = _BOX_H_COLLAPSED  # min content area when empty
+_SECTION_DIVIDER_COLOR = QColor(170, 170, 180)
+_SECTION_LABEL_COLOR = QColor(60, 60, 80)
+_SECTION_PLACEHOLDER_COLOR = QColor(150, 150, 160)
 # Viewport-responsive column counts are clamped between these so a
 # pathologically narrow window still places one column per row, and a
 # wide one doesn't spread devices so far apart that they're tedious to
@@ -889,6 +909,61 @@ def apply_grid_layout(
         row = i // cols
         d.pos_x = _GRID_MARGIN_X + col * _GRID_DX
         d.pos_y = _GRID_MARGIN_X + row * _GRID_DY
+
+
+def is_stable_device(d: CanvasDevice) -> bool:
+    """True if this device belongs in the top "Devices" section.
+
+    A device is "stable" — and gets its own permanent box in the top
+    section — when any of these holds:
+
+      * ``kind`` is a stable address kind (public_mac, random_static_mac,
+        or irk_identity). The address itself is the device's identity;
+        no rotation or guesswork required.
+      * ``cluster_member_count > 1``. The cluster runner has merged at
+        least one RPA into this primary, so we trust the merge enough
+        to call it one device.
+      * ``user_name`` is set. The user has manually identified it.
+
+    Everything else — unresolved RPAs not yet merged, nrpas, anons,
+    unknowns — falls into the bottom "Unidentified Advertisements"
+    section, which churns naturally as RPAs rotate and as the cluster
+    runner figures out who is who.
+    """
+    if d.kind in {"public_mac", "random_static_mac", "irk_identity"}:
+        return True
+    if d.cluster_member_count > 1:
+        return True
+    if d.user_name:
+        return True
+    return False
+
+
+def section_grid_layout(
+    devices: list[CanvasDevice],
+    *,
+    cols: int,
+    top_y: float,
+) -> float:
+    """Place ``devices`` in a grid starting at ``top_y``; return next y.
+
+    Always overrides ``pos_x`` / ``pos_y`` (no saved-position respect)
+    because the section assignment is structural — when a device
+    migrates between top and bottom (e.g. cluster runner promotes an
+    RPA into a multi-member cluster) it should appear in the right
+    section regardless of any saved coordinates from before.
+
+    Returns the y-coordinate just past the last row (top_y when empty
+    so the caller can still reserve placeholder space).
+    """
+    if not devices:
+        return top_y
+    for i, d in enumerate(devices):
+        col = i % cols
+        row = i // cols
+        d.pos_x = _GRID_MARGIN_X + col * _GRID_DX
+        d.pos_y = top_y + row * _GRID_DY
+    return max(d.pos_y for d in devices) + _BOX_H_COLLAPSED
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1773,6 +1848,15 @@ class CanvasWindow(QMainWindow):
         self._live: LiveIngest | None = None
         self._live_timer: QTimer | None = None
         self._reload_tick = 0       # increments per timer fire; reload() runs every Nth
+        # Wall-clock at the moment the most recent capture session ended,
+        # or None while a session is active (or before the first Start).
+        # Used by the top "Devices" section to FREEZE opacity-fade — top
+        # devices use this as ``now`` instead of time.time(), so a device
+        # at 60% opacity at the moment of Stop stays at 60% until the
+        # next Start. Bottom section ignores this and always uses real
+        # time so its boxes continue to age out as if capture never
+        # ended.
+        self._capture_stopped_at: float | None = None
         # Cluster-runner state. ``_cluster_ctx`` is built lazily on the
         # first cluster tick; profiles + signals are static so we cache
         # the context for the lifetime of the window. ``_cluster_tick``
@@ -1997,11 +2081,21 @@ class CanvasWindow(QMainWindow):
         devs = load_canvas_devices(
             self.store, self.project_id, stale_cutoff=cutoff,
         )
-        # Sort mode (toolbar dropdowns) overrides saved positions: zero
-        # out positions, sort the list, and re-grid. Saved layouts in
-        # the DB are untouched, so toggling back to "(saved positions)"
-        # restores them unmodified. Two-level: primary key first, then
-        # secondary as a tiebreaker.
+
+        # Partition into the two sections. Section assignment is
+        # structural (see ``is_stable_device``) — when a device
+        # migrates between sections (typically because the cluster
+        # runner promoted an RPA into a multi-member cluster) we
+        # auto-place it in the new section, overriding any saved
+        # position from before. Saved positions WITHIN a section are
+        # also overwritten in this PR — the previous "drop where I
+        # left it" UX is deferred until the section split has settled.
+        visible_devs = [d for d in devs if not d.hidden]
+        top_devs = [d for d in visible_devs if is_stable_device(d)]
+        bottom_devs = [d for d in visible_devs if not is_stable_device(d)]
+
+        # Sort mode (toolbar dropdowns) sorts within each section.
+        # Saved positions don't apply when sort is set.
         if self._current_sort_primary:
             p_fn = _SORT_KEYS.get(self._current_sort_primary)
             if p_fn is not None:
@@ -2009,52 +2103,140 @@ class CanvasWindow(QMainWindow):
                     _SORT_KEYS.get(self._current_sort_secondary)
                     if self._current_sort_secondary else None
                 )
-                for d in devs:
-                    d.pos_x = 0.0
-                    d.pos_y = 0.0
-                if s_fn is not None:
-                    devs.sort(key=lambda d: (p_fn(d), s_fn(d)))
-                else:
-                    devs.sort(key=p_fn)
-        # Lay out unplaced devices using a column count derived from the
-        # current viewport so a wider window flows them across more
-        # columns and a narrower one wraps sooner. Already-placed
-        # devices keep their saved positions regardless.
+                key_fn = (
+                    (lambda d: (p_fn(d), s_fn(d)))
+                    if s_fn is not None else p_fn
+                )
+                top_devs.sort(key=key_fn)
+                bottom_devs.sort(key=key_fn)
+
         cols = cols_for_viewport(self.view.viewport().width())
-        apply_grid_layout(devs, cols=cols)
+
+        # ---- Top "Devices" section ------------------------------------
+        y_cursor = _SECTION_LABEL_H + 4
+        self._add_section_label(_SECTION_TOP_LABEL, _SECTION_LABEL_H - 4)
+        top_content_top = y_cursor
+        next_y = section_grid_layout(top_devs, cols=cols, top_y=top_content_top)
+        if not top_devs:
+            self._add_placeholder_text(
+                "(no stable devices yet)",
+                top_content_top + _SECTION_PLACEHOLDER_H / 2,
+            )
+            next_y = top_content_top + _SECTION_PLACEHOLDER_H
+
+        # ---- Divider --------------------------------------------------
+        divider_y = next_y + _SECTION_GAP_BEFORE_DIVIDER
+        self._add_section_divider(divider_y)
+        y_cursor = divider_y + _SECTION_GAP_AFTER_DIVIDER
+
+        # ---- Bottom "Unidentified Advertisements" section --------------
+        self._add_section_label(_SECTION_BOTTOM_LABEL, y_cursor)
+        bottom_content_top = y_cursor + _SECTION_LABEL_H + 4
+        bottom_next_y = section_grid_layout(
+            bottom_devs, cols=cols, top_y=bottom_content_top,
+        )
+        if not bottom_devs:
+            self._add_placeholder_text(
+                "(no unidentified RPAs)",
+                bottom_content_top + _SECTION_PLACEHOLDER_H / 2,
+            )
+            bottom_next_y = bottom_content_top + _SECTION_PLACEHOLDER_H
+
+        # ---- Add the device items with section-aware opacity ----------
         # Single ``now`` reference so all opacities computed in this
         # reload pass see consistent ages — avoids tearing if reload
         # is triggered mid-tick.
         now_ts = time.time()
-        for d in devs:
-            if d.hidden:
-                continue
-            item = DeviceItem(d, self._persist_device,
-                              context_cb=self._device_context_menu)
-            # Dormancy fade: 100% if seen in last minute, decaying log-
-            # linearly to 10% at 24 hours and beyond. Live capture's
-            # periodic reload (~2s) keeps this current.
+        # Top section freezes at capture-stop time. When capture is
+        # active (or has never run), use real time.
+        capture_active = self._live is not None and self._live.running
+        top_now = (
+            self._capture_stopped_at
+            if (not capture_active and self._capture_stopped_at is not None)
+            else now_ts
+        )
+
+        for d in top_devs:
+            item = DeviceItem(
+                d, self._persist_device,
+                context_cb=self._device_context_menu,
+            )
+            item.setOpacity(opacity_for_recency(
+                d.last_seen, top_now, dormant_s=self._stale_window_s,
+            ))
+            self.scene.addItem(item)
+        for d in bottom_devs:
+            item = DeviceItem(
+                d, self._persist_device,
+                context_cb=self._device_context_menu,
+            )
             item.setOpacity(opacity_for_recency(
                 d.last_seen, now_ts, dormant_s=self._stale_window_s,
             ))
             self.scene.addItem(item)
-        # Status reflects what's actually on the canvas — `len(devs)` would
-        # include hidden devices (rows with hidden=1 in device_layouts) that
-        # we skipped above, leaving an off-by-one between the count and the
-        # visible grid (one column ends a row earlier than the other).
-        visible_devs = [d for d in devs if not d.hidden]
+
+        # ---- Status + scene size --------------------------------------
         hidden_count = len(devs) - len(visible_devs)
         total_pkts = sum(d.packet_count for d in visible_devs)
         hidden_note = f" ({hidden_count} hidden)" if hidden_count else ""
-        self.status.setText(
-            f"  {len(visible_devs)} devices{hidden_note} · "
-            f"{total_pkts:,} pkts · project id {self.project_id}"
+        freeze_note = (
+            "  (top frozen)"
+            if not capture_active and self._capture_stopped_at is not None
+            else ""
         )
-        # Size the scene to contain all items with margin.
-        if visible_devs:
-            max_x = max(d.pos_x for d in visible_devs) + _BOX_W + 40
-            max_y = max(d.pos_y for d in visible_devs) + _BOX_H_EXPANDED + 40
-            self.scene.setSceneRect(0, 0, max_x, max_y)
+        self.status.setText(
+            f"  {len(top_devs)} stable · {len(bottom_devs)} unidentified"
+            f"{hidden_note} · {total_pkts:,} pkts · "
+            f"project id {self.project_id}{freeze_note}"
+        )
+        # Size the scene to contain everything with bottom margin.
+        max_x = (
+            max((d.pos_x for d in visible_devs), default=_GRID_MARGIN_X)
+            + _BOX_W + 40
+        )
+        max_y = bottom_next_y + 40
+        self.scene.setSceneRect(0, 0, max_x, max_y)
+
+    def _add_section_label(self, text: str, y: float) -> None:
+        """Add a small heading label to the scene at the given y."""
+        label = QGraphicsSimpleTextItem(text)
+        font = QFont()
+        font.setPointSize(_SECTION_LABEL_FONT_PT)
+        font.setBold(True)
+        label.setFont(font)
+        label.setBrush(QBrush(_SECTION_LABEL_COLOR))
+        label.setPos(_SECTION_LABEL_LEFT, y)
+        # Z below devices so a dragged item floats over the label
+        # without flicker; well above the divider line so the heading
+        # stays visible.
+        label.setZValue(_Z_NORMAL - 1)
+        self.scene.addItem(label)
+
+    def _add_section_divider(self, y: float) -> None:
+        """Add a horizontal divider line spanning the visible width."""
+        # Use the current scene rect width as a baseline, falling back
+        # to viewport width when the rect hasn't been computed yet.
+        scene_w = (
+            self.scene.sceneRect().width()
+            or self.view.viewport().width() or 1400
+        )
+        line = QGraphicsLineItem(0, y, scene_w, y)
+        pen = QPen(_SECTION_DIVIDER_COLOR, 1)
+        line.setPen(pen)
+        line.setZValue(_Z_NORMAL - 2)
+        self.scene.addItem(line)
+
+    def _add_placeholder_text(self, text: str, y: float) -> None:
+        """Centered italic placeholder for an empty section."""
+        placeholder = QGraphicsSimpleTextItem(text)
+        font = QFont()
+        font.setPointSize(_SECTION_LABEL_FONT_PT - 1)
+        font.setItalic(True)
+        placeholder.setFont(font)
+        placeholder.setBrush(QBrush(_SECTION_PLACEHOLDER_COLOR))
+        placeholder.setPos(_SECTION_LABEL_LEFT + 8, y - 8)
+        placeholder.setZValue(_Z_NORMAL - 1)
+        self.scene.addItem(placeholder)
 
     def reset_layout(self) -> None:
         with self.store.tx():
@@ -2228,6 +2410,9 @@ class CanvasWindow(QMainWindow):
         """
         if self._live is not None and self._live.running:
             return
+        # Clear the freeze: top section resumes real-time fade now that
+        # capture is live again.
+        self._capture_stopped_at = None
         self._bus = EventBus()
         self._coord = CaptureCoordinator(self._bus)
 
@@ -2383,6 +2568,10 @@ class CanvasWindow(QMainWindow):
         if self._live is not None:
             self._live.stop()
         self._set_capture_button_state(capturing=False)
+        # Snapshot the moment-of-stop so the top "Devices" section
+        # freezes its opacity-fade at this point. Bottom section keeps
+        # ageing on real time so RPAs continue to fade out as before.
+        self._capture_stopped_at = time.time()
         # Re-enable the keep-packets toggle now that the session is
         # ended — the user can flip it before the next Start.
         self._keep_packets_action.setEnabled(True)

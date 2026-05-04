@@ -134,6 +134,10 @@ _GRID_COLS_DEFAULT = 6
 _Z_NORMAL = 1
 _Z_EXPANDED = 10
 _Z_DRAGGING = 100
+# Section labels and the divider line sit ABOVE all device boxes so
+# they're never occluded — even by an expanded box that extends up
+# into the heading area.
+_Z_SECTION_DECOR = 200
 
 # Colors by address kind. Muted so text stays readable.
 _KIND_FILL = {
@@ -911,6 +915,27 @@ def apply_grid_layout(
         d.pos_y = _GRID_MARGIN_X + row * _GRID_DY
 
 
+_STABLE_KINDS = frozenset({
+    "public_mac", "random_static_mac", "irk_identity",
+})
+
+# Device classes specific enough that classification + meaningful
+# observation history is itself an identification. Excludes the
+# generic catch-alls ``apple_device`` and ``unknown`` which fire on
+# any Apple-vendor mfg_data or anything we couldn't classify
+# specifically — those would pull churn into the top section.
+_SPECIFIC_DEVICE_CLASSES = frozenset({
+    "airtag", "airpods", "apple_watch", "hearing_aid",
+    "auracast_source", "phone", "mac",
+})
+
+# Minimum packets needed before a classified-but-RPA device earns a
+# slot in the top section. Filters out one-off appearances; an AirTag
+# we've heard from for a few minutes (~thousands of packets) clears
+# this; a brief blip during a rotation does not.
+_STABLE_CLASS_MIN_PACKETS = 500
+
+
 def is_stable_device(d: CanvasDevice) -> bool:
     """True if this device belongs in the top "Devices" section.
 
@@ -924,17 +949,31 @@ def is_stable_device(d: CanvasDevice) -> bool:
         least one RPA into this primary, so we trust the merge enough
         to call it one device.
       * ``user_name`` is set. The user has manually identified it.
+      * ``local_name`` is set. The device chooses to broadcast a
+        friendly name (e.g. "Douglas Hearing Aids") — that's strong
+        self-identification regardless of address kind.
+      * ``device_class`` is in the specific-class list AND the device
+        has been seen for at least ``_STABLE_CLASS_MIN_PACKETS``
+        packets. Catches AirTags / Apple Watches / hearing aids that
+        the cluster runner hasn't yet had time to merge across
+        rotations.
 
     Everything else — unresolved RPAs not yet merged, nrpas, anons,
-    unknowns — falls into the bottom "Unidentified Advertisements"
-    section, which churns naturally as RPAs rotate and as the cluster
-    runner figures out who is who.
+    unknowns, and brief classified blips — falls into the bottom
+    "Unidentified Advertisements" section.
     """
-    if d.kind in {"public_mac", "random_static_mac", "irk_identity"}:
+    if d.kind in _STABLE_KINDS:
         return True
     if d.cluster_member_count > 1:
         return True
     if d.user_name:
+        return True
+    if d.local_name:
+        return True
+    if (
+        d.device_class in _SPECIFIC_DEVICE_CLASSES
+        and d.packet_count >= _STABLE_CLASS_MIN_PACKETS
+    ):
         return True
     return False
 
@@ -1808,6 +1847,14 @@ class CanvasWindow(QMainWindow):
         self.view.setRenderHints(
             QPainter.Antialiasing | QPainter.TextAntialiasing
         )
+        # Anchor scene to the top-left so device boxes stay at the
+        # left edge regardless of viewport width. QGraphicsView's
+        # default ``Qt.AlignCenter`` floats the scene to the middle
+        # when it's narrower than the viewport, which made small
+        # device counts look "centered" rather than left-aligned.
+        self.view.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
 
         # Sniffer panel + canvas view live side by side in a HBoxLayout
         # so expanding the panel pushes canvas content right rather than
@@ -2113,9 +2160,13 @@ class CanvasWindow(QMainWindow):
         cols = cols_for_viewport(self.view.viewport().width())
 
         # ---- Top "Devices" section ------------------------------------
-        y_cursor = _SECTION_LABEL_H + 4
-        self._add_section_label(_SECTION_TOP_LABEL, _SECTION_LABEL_H - 4)
-        top_content_top = y_cursor
+        # Heading sits at the very top with a small margin; the device
+        # row begins below it with enough gap that the label is never
+        # occluded — even if the row above migrates upward across
+        # reloads.
+        top_label_y = 6
+        top_content_top = top_label_y + _SECTION_LABEL_H + 6
+        self._add_section_label(_SECTION_TOP_LABEL, top_label_y)
         next_y = section_grid_layout(top_devs, cols=cols, top_y=top_content_top)
         if not top_devs:
             self._add_placeholder_text(
@@ -2124,14 +2175,15 @@ class CanvasWindow(QMainWindow):
             )
             next_y = top_content_top + _SECTION_PLACEHOLDER_H
 
-        # ---- Divider --------------------------------------------------
+        # ---- Divider position + bottom "Unidentified" section ----------
+        # The divider line itself is drawn AFTER the scene rect is
+        # computed below — that's the only point where we know how
+        # wide it should be (full scene width, not just enough for
+        # the device columns we placed).
         divider_y = next_y + _SECTION_GAP_BEFORE_DIVIDER
-        self._add_section_divider(divider_y)
-        y_cursor = divider_y + _SECTION_GAP_AFTER_DIVIDER
-
-        # ---- Bottom "Unidentified Advertisements" section --------------
-        self._add_section_label(_SECTION_BOTTOM_LABEL, y_cursor)
-        bottom_content_top = y_cursor + _SECTION_LABEL_H + 4
+        bottom_label_y = divider_y + _SECTION_GAP_AFTER_DIVIDER
+        self._add_section_label(_SECTION_BOTTOM_LABEL, bottom_label_y)
+        bottom_content_top = bottom_label_y + _SECTION_LABEL_H + 6
         bottom_next_y = section_grid_layout(
             bottom_devs, cols=cols, top_y=bottom_content_top,
         )
@@ -2190,15 +2242,27 @@ class CanvasWindow(QMainWindow):
             f"project id {self.project_id}{freeze_note}"
         )
         # Size the scene to contain everything with bottom margin.
-        max_x = (
+        # Divider must span at least the viewport width so it reaches
+        # the right edge regardless of how far devices flow horizontally.
+        viewport_w = self.view.viewport().width()
+        content_w = (
             max((d.pos_x for d in visible_devs), default=_GRID_MARGIN_X)
             + _BOX_W + 40
         )
+        max_x = max(content_w, viewport_w)
         max_y = bottom_next_y + 40
         self.scene.setSceneRect(0, 0, max_x, max_y)
+        # Now that the scene width is known, draw the divider so it
+        # spans the full canvas width — not just the placed device
+        # columns.
+        self._add_section_divider(divider_y, max_x)
 
     def _add_section_label(self, text: str, y: float) -> None:
-        """Add a small heading label to the scene at the given y."""
+        """Add a small heading label to the scene at the given y.
+
+        Z is high so the label is never occluded by a device box
+        (which can extend upward into the heading band when expanded).
+        """
         label = QGraphicsSimpleTextItem(text)
         font = QFont()
         font.setPointSize(_SECTION_LABEL_FONT_PT)
@@ -2206,28 +2270,19 @@ class CanvasWindow(QMainWindow):
         label.setFont(font)
         label.setBrush(QBrush(_SECTION_LABEL_COLOR))
         label.setPos(_SECTION_LABEL_LEFT, y)
-        # Z below devices so a dragged item floats over the label
-        # without flicker; well above the divider line so the heading
-        # stays visible.
-        label.setZValue(_Z_NORMAL - 1)
+        label.setZValue(_Z_SECTION_DECOR)
         self.scene.addItem(label)
 
-    def _add_section_divider(self, y: float) -> None:
-        """Add a horizontal divider line spanning the visible width."""
-        # Use the current scene rect width as a baseline, falling back
-        # to viewport width when the rect hasn't been computed yet.
-        scene_w = (
-            self.scene.sceneRect().width()
-            or self.view.viewport().width() or 1400
-        )
-        line = QGraphicsLineItem(0, y, scene_w, y)
+    def _add_section_divider(self, y: float, width: float) -> None:
+        """Add a horizontal divider line of the given width at y."""
+        line = QGraphicsLineItem(0, y, width, y)
         pen = QPen(_SECTION_DIVIDER_COLOR, 1)
         line.setPen(pen)
-        line.setZValue(_Z_NORMAL - 2)
+        line.setZValue(_Z_SECTION_DECOR)
         self.scene.addItem(line)
 
     def _add_placeholder_text(self, text: str, y: float) -> None:
-        """Centered italic placeholder for an empty section."""
+        """Italic placeholder for an empty section."""
         placeholder = QGraphicsSimpleTextItem(text)
         font = QFont()
         font.setPointSize(_SECTION_LABEL_FONT_PT - 1)
@@ -2235,7 +2290,7 @@ class CanvasWindow(QMainWindow):
         placeholder.setFont(font)
         placeholder.setBrush(QBrush(_SECTION_PLACEHOLDER_COLOR))
         placeholder.setPos(_SECTION_LABEL_LEFT + 8, y - 8)
-        placeholder.setZValue(_Z_NORMAL - 1)
+        placeholder.setZValue(_Z_SECTION_DECOR)
         self.scene.addItem(placeholder)
 
     def reset_layout(self) -> None:

@@ -4,12 +4,17 @@
 # and the cost of a false-merge is high.
 threshold = 0.85
 min_total_weight = 0.50
+# Even the catch-all gets the decisive-signal pathway — a perfect
+# Continuity-payload match or a near-identical observation window
+# is decisive evidence regardless of class. The negative-block guard
+# still applies, so a contradicting signal blocks the short-circuit.
+decisive_signals = ["apple_continuity", "co_lifespan_match"]
 
 [default.weights]
-service_uuid_match = 0.25
+service_uuid_match = 0.20
 mfg_data_prefix    = 0.20
 apple_continuity   = 0.20   # helps mac / apple_watch / etc. that fall here
+co_lifespan_match  = 0.15
 adv_interval       = 0.10
 rssi_signature     = 0.10
-pdu_distribution   = 0.10
 tx_power_match     = 0.05

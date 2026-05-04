@@ -1,0 +1,18 @@
+[apple_watch]
+# Apple Watches broadcast Continuity TLVs like other Apple devices,
+# but the relevant types differ (more NearbyInfo + Pairing variants
+# than ProximityPairing). Same overall structure as apple_device's
+# profile though: Continuity is the strongest signal, supported by
+# observation-window alignment.
+threshold = 0.75
+min_total_weight = 0.40
+decisive_signals = ["apple_continuity", "co_lifespan_match"]
+
+[apple_watch.weights]
+apple_continuity  = 0.50
+co_lifespan_match = 0.20
+mfg_data_prefix   = 0.20
+service_uuid_match = 0.10
+
+[apple_watch.params.apple_continuity]
+min_fingerprint_bytes = 8

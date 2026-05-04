@@ -2,11 +2,19 @@
 threshold = 0.70
 min_total_weight = 0.50
 required_eventually = ["rotation_cohort"]
+# Either a near-perfect rotation_cohort handoff OR a near-identical
+# observation window decides the merge on its own. The decisive path
+# also rescues airtag pairs that today abstain on
+# missing_eventually:rotation_cohort when packets-table writes are
+# off — co_lifespan_match needs only the observations table, so a
+# clear handoff (one ends, one begins) is now enough.
+decisive_signals = ["rotation_cohort", "co_lifespan_match"]
 
 [airtag.weights]
-rotation_cohort   = 0.35
-rssi_signature    = 0.25
-status_byte_match = 0.20
+rotation_cohort   = 0.30
+co_lifespan_match = 0.15
+rssi_signature    = 0.20
+status_byte_match = 0.15
 apple_continuity  = 0.10
 adv_interval      = 0.05
 pdu_distribution  = 0.05

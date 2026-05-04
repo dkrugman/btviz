@@ -37,6 +37,11 @@ def _build_profile(name: str, body: dict) -> ClassProfile:
     )
     req_for_merge = frozenset(body.get("required_for_merge", []))
     params = dict(body.get("params", {}))
+    decisive_signals = frozenset(body.get("decisive_signals", []))
+    decisive_threshold = float(body.get("decisive_threshold", 0.95))
+    negative_block_threshold = float(
+        body.get("negative_block_threshold", -0.3),
+    )
     return ClassProfile(
         name=name,
         weights=weights,
@@ -45,4 +50,7 @@ def _build_profile(name: str, body: dict) -> ClassProfile:
         required_eventually=req_eventually,
         required_for_merge=req_for_merge,
         params=params,
+        decisive_signals=decisive_signals,
+        decisive_threshold=decisive_threshold,
+        negative_block_threshold=negative_block_threshold,
     )

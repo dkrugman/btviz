@@ -57,6 +57,17 @@ class ClassProfile:
     required_eventually: frozenset[str] = field(default_factory=frozenset)
     required_for_merge: frozenset[str] = field(default_factory=frozenset)
     params: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    # Signals listed here can decide a merge on their own — if any of
+    # them scores at or above ``decisive_threshold`` AND no signal
+    # returns below ``negative_block_threshold``, the aggregator
+    # short-circuits and merges, bypassing both ``min_total_weight``
+    # and the weighted-sum ``threshold``. Built for the user-named
+    # heuristic "one strong signal + no conflicts → merge" — solves
+    # the common case where a near-perfect handoff or co-emission is
+    # itself enough but happens to be the only signal that fired.
+    decisive_signals: frozenset[str] = field(default_factory=frozenset)
+    decisive_threshold: float = 0.95
+    negative_block_threshold: float = -0.3
 
 
 @dataclass

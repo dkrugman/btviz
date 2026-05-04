@@ -1,7 +1,25 @@
 [hearing_aid]
 threshold = 0.75
 min_total_weight = 0.55
-required_for_merge = ["service_uuid_match"]
+# ``required_for_merge = ["service_uuid_match"]`` previously sat
+# here as a hard gate. In practice it didn't end up blocking pairs
+# in the user's data (UUID16 history was actually present), but
+# it's a footgun: when an HA model doesn't broadcast UUID16s
+# specifically, every pair would silently abstain regardless of
+# how strong the other evidence was. Removing the hard gate makes
+# the profile more robust without changing behaviour for HAs that
+# DO advertise service UUIDs (the score remains weighted by 0.40
+# below).
+#
+# Adding ``co_lifespan_match`` was tried and rejected: the user's
+# left and right HAs broadcast concurrently with identical service
+# UUIDs (same model), so adding any positive lifespan-overlap
+# weight tips the L+R pair past the 0.75 threshold — a false
+# positive. Distinguishing physical-L from physical-R requires
+# either ``rotation_cohort``'s concurrent-rejection (needs Record
+# packets ON) or ``rssi_signature``'s different-distance signal
+# (also needs the packets table). Both are deferred until Record
+# packets is on by default.
 
 [hearing_aid.weights]
 service_uuid_match = 0.40

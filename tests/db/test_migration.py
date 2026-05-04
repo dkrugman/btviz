@@ -170,7 +170,55 @@ class FreshDbTests(unittest.TestCase):
             store = Store(Path(d) / "fresh.db")
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
+
+    def test_fresh_db_has_v4_column(self):
+        # observations.bad_packet_count was added in v4 to back the
+        # canvas's cumulative quality bar.
+        with tempfile.TemporaryDirectory() as d:
+            store = Store(Path(d) / "fresh.db")
+            cols = {
+                r[1] for r in
+                store.conn.execute("PRAGMA table_info(observations)").fetchall()
+            }
+            store.close()
+            self.assertIn("bad_packet_count", cols)
+
+    def test_v3_upgrades_to_v4_column(self):
+        # Existing DB at v3 (before this migration) gets the new
+        # column added without losing existing data.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "v3.db"
+            # Build a fresh DB then artificially mark it as v3 so
+            # the migrator has to apply v3→v4. Easiest path because
+            # the v3 schema isn't kept anywhere as a string constant.
+            Store(p).close()
+            conn = sqlite3.connect(str(p))
+            # Drop the v4 column + reset version so we exercise the
+            # incremental path.
+            # SQLite < 3.35 can't DROP COLUMN; rebuild instead.
+            conn.executescript("""
+                CREATE TABLE _obs_v3 AS SELECT
+                    session_id, device_id, packet_count, adv_count, data_count,
+                    rssi_min, rssi_max, rssi_sum, rssi_samples,
+                    first_seen, last_seen, pdu_types_json, channels_json, phy_json
+                  FROM observations;
+                DROP TABLE observations;
+                ALTER TABLE _obs_v3 RENAME TO observations;
+                PRAGMA user_version = 3;
+            """)
+            conn.commit()
+            conn.close()
+
+            store = Store(p)
+            cols = {
+                r[1] for r in
+                store.conn.execute("PRAGMA table_info(observations)").fetchall()
+            }
+            version = store.conn.execute("PRAGMA user_version").fetchone()[0]
+            store.close()
+            self.assertEqual(version, 4)
+            self.assertIn("bad_packet_count", cols)
 
 
 class V1UpgradeTests(unittest.TestCase):
@@ -183,7 +231,7 @@ class V1UpgradeTests(unittest.TestCase):
             tables = _tables(store.conn)
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
             self.assertIn("sniffers", tables)
             for t in _V3_TABLES:
                 self.assertIn(t, tables, f"missing after v1→v3: {t}")
@@ -217,7 +265,7 @@ class V2UpgradeTests(unittest.TestCase):
             tables = _tables(store.conn)
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 3)
+            self.assertEqual(version, 4)
             for t in _V3_TABLES:
                 self.assertIn(t, tables, f"missing after v2→v3: {t}")
 

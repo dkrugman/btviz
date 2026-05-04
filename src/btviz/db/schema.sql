@@ -83,20 +83,27 @@ CREATE INDEX idx_sessions_project ON sessions(project_id);
 
 -- Per-device aggregates within a session. Updated in place as packets arrive.
 CREATE TABLE observations (
-    session_id      INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    device_id       INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
-    packet_count    INTEGER NOT NULL DEFAULT 0,
-    adv_count       INTEGER NOT NULL DEFAULT 0,
-    data_count      INTEGER NOT NULL DEFAULT 0,
-    rssi_min        INTEGER,
-    rssi_max        INTEGER,
-    rssi_sum        INTEGER NOT NULL DEFAULT 0,   -- avg = rssi_sum / rssi_samples
-    rssi_samples    INTEGER NOT NULL DEFAULT 0,
-    first_seen      REAL NOT NULL,
-    last_seen       REAL NOT NULL,
-    pdu_types_json  TEXT NOT NULL DEFAULT '{}',   -- {"ADV_IND": 42, ...}
-    channels_json   TEXT NOT NULL DEFAULT '{}',   -- {"37": 100, "38": 80, ...}
-    phy_json        TEXT NOT NULL DEFAULT '{}',   -- {"1M": 90, "2M": 10, ...}
+    session_id        INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    device_id         INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    packet_count      INTEGER NOT NULL DEFAULT 0,
+    adv_count         INTEGER NOT NULL DEFAULT 0,
+    data_count        INTEGER NOT NULL DEFAULT 0,
+    -- CRC-failed packets attributed to this device by the live-ingest
+    -- last-clean-device cache. NEVER incremented by ``record_packet``
+    -- (those packets have unreliable address bits and are skipped).
+    -- Kept here so the canvas quality bar can show cumulative
+    -- good/bad ratios across capture sessions, including before
+    -- capture starts and after it stops.
+    bad_packet_count  INTEGER NOT NULL DEFAULT 0,
+    rssi_min          INTEGER,
+    rssi_max          INTEGER,
+    rssi_sum          INTEGER NOT NULL DEFAULT 0,   -- avg = rssi_sum / rssi_samples
+    rssi_samples      INTEGER NOT NULL DEFAULT 0,
+    first_seen        REAL NOT NULL,
+    last_seen         REAL NOT NULL,
+    pdu_types_json    TEXT NOT NULL DEFAULT '{}',   -- {"ADV_IND": 42, ...}
+    channels_json     TEXT NOT NULL DEFAULT '{}',   -- {"37": 100, "38": 80, ...}
+    phy_json          TEXT NOT NULL DEFAULT '{}',   -- {"1M": 90, "2M": 10, ...}
     PRIMARY KEY (session_id, device_id)
 );
 

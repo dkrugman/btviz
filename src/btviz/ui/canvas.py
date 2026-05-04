@@ -275,6 +275,11 @@ class CanvasDevice:
     packet_count: int = 0
     adv_count: int = 0
     data_count: int = 0
+    # Cumulative CRC-failed packets attributed to this device across
+    # all observed sessions (via the live-ingest last-clean-device
+    # cache). Drives the right segment of the quality bar; survives
+    # capture stop because it's persisted to ``observations``.
+    bad_packet_count: int = 0
     rssi_min: int | None = None
     rssi_max: int | None = None
     rssi_avg: float | None = None
@@ -360,6 +365,7 @@ def _absorb_cluster_member(
     primary.packet_count += member.packet_count
     primary.adv_count += member.adv_count
     primary.data_count += member.data_count
+    primary.bad_packet_count += member.bad_packet_count
     primary.last_seen = max(primary.last_seen, member.last_seen)
     for ch, n in member.channels.items():
         primary.channels[ch] = primary.channels.get(ch, 0) + n
@@ -402,9 +408,10 @@ def load_canvas_devices(
             d.user_name, d.gatt_device_name, d.local_name,
             d.vendor, d.vendor_id, d.oui_vendor, d.model, d.device_class,
             d.appearance, d.last_seen,
-            SUM(o.packet_count) AS packet_count,
-            SUM(o.adv_count)    AS adv_count,
-            SUM(o.data_count)   AS data_count,
+            SUM(o.packet_count)     AS packet_count,
+            SUM(o.adv_count)        AS adv_count,
+            SUM(o.data_count)       AS data_count,
+            SUM(o.bad_packet_count) AS bad_packet_count,
             MIN(o.rssi_min)     AS rssi_min,
             MAX(o.rssi_max)     AS rssi_max,
             SUM(o.rssi_sum)     AS rssi_sum_total,
@@ -444,6 +451,7 @@ def load_canvas_devices(
             packet_count=r["packet_count"] or 0,
             adv_count=r["adv_count"] or 0,
             data_count=r["data_count"] or 0,
+            bad_packet_count=r["bad_packet_count"] or 0,
             rssi_min=r["rssi_min"],
             rssi_max=r["rssi_max"],
             rssi_avg=rssi_avg,
@@ -919,12 +927,14 @@ class DeviceItem(QGraphicsItem):
         self._data_flash_recent: list[tuple[float, int, bool]] = []
         self._adv_flash: dict[int, tuple[float, bool]] = {}
         # Per-device CRC quality counters mirror the sniffer-panel
-        # ones. ``_good_packets`` increments on every clean attribution;
-        # ``_bad_packets`` increments on each CRC-failed packet credited
-        # to this device by the LiveIngest last-clean-device cache.
-        # Surfaced in the collapsed body's quality line and gauge.
-        self._good_packets: int = 0
-        self._bad_packets: int = 0
+        # ones. Seeded from the cumulative DB totals (``packet_count``
+        # and ``bad_packet_count`` columns on observations) so the
+        # quality bar reflects history across capture sessions and
+        # remains correct after capture stops. Live attributions
+        # increment from there during an active session, and the
+        # next reload re-seeds from the now-updated DB.
+        self._good_packets: int = device.packet_count
+        self._bad_packets: int = device.bad_packet_count
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)

@@ -9,12 +9,21 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH_ENV = "BTVIZ_DB_PATH"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 # Incremental migrations applied to existing DBs to bring them up to
 # ``SCHEMA_VERSION``. Fresh DBs get the full schema.sql (which already
 # contains everything through SCHEMA_VERSION) and skip these.
+
+# v4 — observations.bad_packet_count. Per-(session, device) cumulative
+# count of CRC-failed packets that the live-ingest cache attributed
+# to this device. Lets the canvas show cumulative quality across
+# capture sessions and after capture stops, not just live counters.
+_V3_TO_V4_SQL = """
+ALTER TABLE observations ADD COLUMN bad_packet_count INTEGER NOT NULL DEFAULT 0;
+"""
+
 _V2_TO_V3_SQL = """
 CREATE TABLE device_ad_history (
     device_id   INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
@@ -131,6 +140,10 @@ class Store:
             self.conn.executescript(_V2_TO_V3_SQL)
             self.conn.execute("PRAGMA user_version = 3")
             version = 3
+        if version == 3:
+            self.conn.executescript(_V3_TO_V4_SQL)
+            self.conn.execute("PRAGMA user_version = 4")
+            version = 4
         if version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unknown db schema version {version}; app expects {SCHEMA_VERSION}"

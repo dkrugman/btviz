@@ -322,29 +322,41 @@ class LiveIngest:
                         except Exception:  # noqa: BLE001
                             import traceback
                             traceback.print_exc()
-                elif (
-                    not pkt.crc_ok
-                    and pkt.channel is not None
-                    and self._on_device_packet is not None
-                ):
+                elif not pkt.crc_ok and pkt.channel is not None:
                     # CRC-failed packets cannot record (address bits are
                     # unreliable), but we want a per-device dropout flash
-                    # on the canvas. Credit the device that was most
-                    # recently transmitting cleanly on this same
-                    # (source, channel) pairing — that's the device the
-                    # sniffer's radio was tracking when the dropout hit.
+                    # on the canvas AND a cumulative bad-count credit so
+                    # the quality bar reflects history across capture
+                    # sessions. Credit the device that was most recently
+                    # transmitting cleanly on this same (source, channel)
+                    # pairing — the device the sniffer's radio was
+                    # tracking when the dropout hit.
                     cached = self._last_clean_device.get((src, pkt.channel))
                     if (
                         cached is not None
                         and pkt.ts - cached[0] <= _CRC_ATTRIB_WINDOW_S
                     ):
+                        # Persist the dropout to observations.bad_packet_count
+                        # so the quality bar is correct on the next reload
+                        # and after capture stops. We're inside the
+                        # ``store.tx()`` block so this rolls in with the
+                        # surrounding write batch.
                         try:
-                            self._on_device_packet(
-                                cached[1], pkt.channel, False,
+                            self._repos.observations.increment_bad(
+                                self._ctx.session_id, cached[1],
+                                ts=pkt.ts,
                             )
                         except Exception:  # noqa: BLE001
                             import traceback
                             traceback.print_exc()
+                        if self._on_device_packet is not None:
+                            try:
+                                self._on_device_packet(
+                                    cached[1], pkt.channel, False,
+                                )
+                            except Exception:  # noqa: BLE001
+                                import traceback
+                                traceback.print_exc()
         self.stats.packets_recorded += recorded
         self.stats.flushes += 1
         self.stats.last_flush_size = len(batch)

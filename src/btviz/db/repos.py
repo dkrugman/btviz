@@ -491,6 +491,43 @@ class Observations:
             ),
         )
 
+    def increment_bad(
+        self, session_id: int, device_id: int, n: int = 1, *,
+        ts: float | None = None,
+    ) -> None:
+        """Bump the CRC-failed-packet count for one (session, device).
+
+        CRC-failed packets never reach ``record_packet`` (their address
+        bits are unreliable), so they don't get a normal observations
+        row created on their own. This helper either updates the
+        existing row or inserts a minimal one whose only contribution
+        is the bad count — that's enough for the canvas's quality
+        bar to reflect cumulative dropouts even when the device has
+        never been cleanly attributed in this session.
+        """
+        cur = self.s.conn.execute(
+            "UPDATE observations SET bad_packet_count = bad_packet_count + ?,"
+            " last_seen = COALESCE(?, last_seen)"
+            " WHERE session_id = ? AND device_id = ?",
+            (n, ts, session_id, device_id),
+        )
+        if cur.rowcount > 0:
+            return
+        # No prior row — insert a minimal observation row whose only
+        # contribution is this bad-packet credit. ``packet_count`` is 0
+        # because the packet didn't actually attribute to this device
+        # in the normal record_packet path; only the cache credited it.
+        ts_val = ts if ts is not None else 0.0
+        self.s.conn.execute(
+            "INSERT INTO observations(session_id, device_id,"
+            " packet_count, adv_count, data_count, bad_packet_count,"
+            " rssi_min, rssi_max, rssi_sum, rssi_samples,"
+            " first_seen, last_seen,"
+            " pdu_types_json, channels_json, phy_json)"
+            " VALUES(?, ?, 0, 0, 0, ?, NULL, NULL, 0, 0, ?, ?, '{}', '{}', '{}')",
+            (session_id, device_id, n, ts_val, ts_val),
+        )
+
     def get(self, session_id: int, device_id: int) -> Observation | None:
         row = self.s.conn.execute(
             "SELECT * FROM observations WHERE session_id = ? AND device_id = ?",

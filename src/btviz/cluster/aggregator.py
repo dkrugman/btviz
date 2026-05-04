@@ -126,6 +126,36 @@ def cluster_pair_with_reason(
             abort_reason=f"missing_required_for_merge:{','.join(missing_for_merge)}",
         ), None, None
 
+    # Decisive-signal short circuit. If any signal listed in
+    # ``profile.decisive_signals`` scored at or above
+    # ``decisive_threshold`` AND no signal returned a strong
+    # negative (below ``negative_block_threshold``), merge regardless
+    # of total weight or weighted-sum threshold. Implements the
+    # user-named heuristic "one strong signal + no conflicts → merge"
+    # so a near-perfect handoff or co-emission can decide on its own
+    # even when it's the only signal that fired in a given pair.
+    #
+    # Ordering matters: this runs before missing_eventually so a
+    # decisive signal can rescue a pair that would otherwise abstain
+    # for lack of (e.g.) rotation_cohort data — when the decisive
+    # signal already proves same-device, the missing-eventually
+    # signal would have nothing to add.
+    if profile.decisive_signals and contributions:
+        worst_score = min(s for s, _ in contributions.values())
+        if worst_score >= profile.negative_block_threshold:
+            decisive_scores = [
+                s for sig, (s, _) in contributions.items()
+                if sig in profile.decisive_signals
+                and s >= profile.decisive_threshold
+            ]
+            if decisive_scores:
+                return Decision(
+                    merge=True,
+                    score=max(decisive_scores),
+                    signals=contributions,
+                    profile=profile.name,
+                ), None, None
+
     if missing_eventually:
         return (
             None,

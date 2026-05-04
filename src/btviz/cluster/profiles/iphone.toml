@@ -1,17 +1,22 @@
 [iphone]
 threshold = 0.75
 min_total_weight = 0.50
+decisive_signals = ["apple_continuity", "co_lifespan_match", "rotation_cohort"]
 
 [iphone.weights]
-apple_continuity  = 0.40
-rssi_signature    = 0.25
+apple_continuity  = 0.35
+co_lifespan_match = 0.15
+rssi_signature    = 0.20
 rotation_cohort   = 0.15
 mfg_data_prefix   = 0.10
 adv_interval      = 0.05
-pdu_distribution  = 0.05
 
 [iphone.params.rotation_cohort]
-expected_rotation = 900.0
+# iPhones rotate RPAs every ~15 min (900 s). Same gotcha as airtag.toml:
+# the score formula uses ``expected_rotation`` as the *handoff-gap*
+# centerpoint, NOT the rotation period — set to 30 s so the score's
+# peak lands in the middle of the plausible handoff window.
+expected_rotation = 30.0
 window_min        = 0.05
 window_max        = 180.0
 

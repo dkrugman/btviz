@@ -2,13 +2,14 @@
 threshold = 0.75
 min_total_weight = 0.50
 required_for_merge = ["apple_continuity"]
+decisive_signals = ["apple_continuity", "co_lifespan_match"]
 
 [airpods.weights]
-apple_continuity  = 0.50
-rssi_signature    = 0.20
+apple_continuity  = 0.45
+co_lifespan_match = 0.15
+rssi_signature    = 0.15
 rotation_cohort   = 0.15
 mfg_data_prefix   = 0.10
-adv_interval      = 0.05
 
 [airpods.params.rotation_cohort]
 expected_rotation = 900.0

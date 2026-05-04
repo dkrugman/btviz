@@ -162,6 +162,40 @@ _QUALITY_YELLOW = QColor(220, 180, 50)
 _QUALITY_RED = QColor(220, 70, 70)
 _QUALITY_NEUTRAL = QColor(170, 170, 170)  # before any packets observed
 
+# Cluster-collapse confidence threshold. The canvas hydrator only
+# collapses a multi-device cluster into one primary box when *every*
+# member's score is at or above this value; weaker clusters keep all
+# members visible so the user can verify before the merge becomes
+# permanent in their mental model. 0.9 matches the runner's "very
+# high confidence" tier — apple_continuity exact-match (1.0) and
+# rotation_cohort handoffs near the expected gap clear it; weaker
+# evidence does not.
+_CLUSTER_COLLAPSE_THRESHOLD = 0.9
+
+# Rank ordering for picking the most-stable identity in a cluster
+# as its canvas primary. Public MACs are always preferred (they're
+# the real device identity); among RPAs we prefer the longest-lived,
+# most-observed row. ``unknown``/``nrpa`` are last-resort.
+_CLUSTER_KIND_RANK: dict[str, int] = {
+    "public_mac": 0,
+    "random_static_mac": 1,
+    "irk_identity": 1,
+    "rs": 1,
+    "unresolved_rpa": 2,
+    "nrpa": 3,
+    "unknown": 4,
+}
+
+# Cluster badge — small "↔ N" chip painted in the top-left corner of
+# any device box that's a cluster primary with absorbed siblings.
+# Visible across the canvas at a glance so the user can pick out
+# "this is one device represented by 4 RPAs" without reading the body.
+_CLUSTER_BADGE_BG = QColor(50, 90, 170)      # blue, distinct from kind tints
+_CLUSTER_BADGE_FG = QColor(245, 245, 250)
+_CLUSTER_BADGE_H = 16
+_CLUSTER_BADGE_PAD_X = 5
+_CLUSTER_BADGE_MARGIN = 4
+
 # Capture button styling — green pill when idle (Start), red pill when
 # capturing (Stop). Padding and rounded corners pull it out of the
 # row of plain QToolButton text labels around it so the user's eye
@@ -241,11 +275,98 @@ class CanvasDevice:
     last_seen: float = 0.0
     channels: dict[int, int] = field(default_factory=dict)
     pdu_types: dict[str, int] = field(default_factory=dict)
+    # Cluster membership. ``cluster_id`` is set whenever this device
+    # belongs to a row in ``device_cluster_members``; the canvas
+    # primary that absorbed N RPAs has ``cluster_member_ids`` populated
+    # with the device_ids of the absorbed siblings (counts/channels/
+    # addresses below already include their contributions). For
+    # low-confidence clusters or unclustered devices the badge fields
+    # stay empty so the box renders as a standalone identity.
+    cluster_id: int | None = None
+    cluster_member_ids: list[int] = field(default_factory=list)
+    cluster_min_score: float | None = None
     # Layout
     pos_x: float = 0.0
     pos_y: float = 0.0
     collapsed: bool = True
     hidden: bool = False
+
+    @property
+    def cluster_member_count(self) -> int:
+        """Total devices in this cluster including the primary."""
+        return 1 + len(self.cluster_member_ids)
+
+
+def _pick_cluster_primary(members: list[CanvasDevice]) -> CanvasDevice:
+    """Return the cluster member that should own the canvas box.
+
+    Selection is by stability of identity, then by observation depth:
+      1. Lowest ``_CLUSTER_KIND_RANK`` (public MAC > random static > RPA …)
+      2. Most packets seen
+      3. Most recent ``last_seen`` (a tiebreaker so newly-rotated
+         identities don't stick around as primary just because they
+         happened to be first to score in the cluster)
+    """
+    return max(
+        members,
+        key=lambda d: (
+            -_CLUSTER_KIND_RANK.get(d.kind, 99),
+            d.packet_count,
+            d.last_seen,
+        ),
+    )
+
+
+def _absorb_cluster_member(
+    primary: CanvasDevice, member: CanvasDevice,
+) -> None:
+    """Merge ``member``'s observations into ``primary`` in-place.
+
+    RSSI is blended as a packet-count-weighted average so the
+    primary's mean RSSI tracks the combined population (an
+    approximation — packet_count over-counts the rssi_samples
+    denominator slightly, but the existing per-device rssi_avg has
+    the same approximation, so consistency wins).
+
+    Channels and PDU-type histograms sum element-wise; the addresses
+    list concatenates with dedup. The primary's ``cluster_member_ids``
+    grows by one — that's how the badge later knows the count.
+    """
+    if primary.rssi_avg is not None and member.rssi_avg is not None:
+        total = primary.packet_count + member.packet_count
+        if total > 0:
+            primary.rssi_avg = (
+                primary.rssi_avg * primary.packet_count
+                + member.rssi_avg * member.packet_count
+            ) / total
+    elif member.rssi_avg is not None:
+        primary.rssi_avg = member.rssi_avg
+    if primary.rssi_min is None or (
+        member.rssi_min is not None
+        and member.rssi_min < primary.rssi_min
+    ):
+        primary.rssi_min = member.rssi_min
+    if primary.rssi_max is None or (
+        member.rssi_max is not None
+        and member.rssi_max > primary.rssi_max
+    ):
+        primary.rssi_max = member.rssi_max
+    primary.packet_count += member.packet_count
+    primary.adv_count += member.adv_count
+    primary.data_count += member.data_count
+    primary.last_seen = max(primary.last_seen, member.last_seen)
+    for ch, n in member.channels.items():
+        primary.channels[ch] = primary.channels.get(ch, 0) + n
+    for pdu, n in member.pdu_types.items():
+        primary.pdu_types[pdu] = primary.pdu_types.get(pdu, 0) + n
+    seen_addrs = {addr for addr, _ in primary.addresses}
+    for addr, kind in member.addresses:
+        if addr not in seen_addrs:
+            primary.addresses.append((addr, kind))
+            seen_addrs.add(addr)
+    if member.broadcast_name and not primary.broadcast_name:
+        primary.broadcast_name = member.broadcast_name
+    primary.cluster_member_ids.append(member.device_id)
 
 
 def load_canvas_devices(
@@ -376,10 +497,62 @@ def load_canvas_devices(
         if cd.broadcast_name is None:
             cd.broadcast_name = r["broadcast_name"]
 
-    # Saved layout per project.
+    # ---- Cluster collapse -------------------------------------------------
+    # Read cluster membership for the in-scope devices. Multi-member
+    # clusters whose weakest score clears the threshold collapse into
+    # one primary box that aggregates the absorbed siblings; weaker
+    # clusters keep all members visible (still tagged with cluster_id
+    # so the UI can surface "this is part of cluster N — verify it").
+    cm_rows = conn.execute(
+        f"""
+        SELECT cluster_id, device_id, score
+          FROM device_cluster_members
+         WHERE device_id IN ({placeholders})
+        """,
+        tuple(devices.keys()),
+    ).fetchall()
+    clusters: dict[int, list[tuple[int, float | None]]] = {}
+    for r in cm_rows:
+        clusters.setdefault(r["cluster_id"], []).append(
+            (r["device_id"], r["score"]),
+        )
+    for cluster_id, mems in clusters.items():
+        # Filter to members that survived the stale-window cut.
+        live_mems = [(did, s) for did, s in mems if did in devices]
+        if not live_mems:
+            continue
+        scores = [s for _, s in live_mems if s is not None]
+        min_score = min(scores) if scores else None
+        if (
+            len(live_mems) < 2
+            or min_score is None
+            or min_score < _CLUSTER_COLLAPSE_THRESHOLD
+        ):
+            # Tag membership but don't collapse — the badge can still
+            # appear on individual boxes ("part of cluster N") but
+            # they keep their own canvas positions.
+            for did, _ in live_mems:
+                devices[did].cluster_id = cluster_id
+                devices[did].cluster_min_score = min_score
+            continue
+        # Collapse: pick primary, absorb others, drop them.
+        member_devs = [devices[did] for did, _ in live_mems]
+        primary = _pick_cluster_primary(member_devs)
+        primary.cluster_id = cluster_id
+        primary.cluster_min_score = min_score
+        for member in member_devs:
+            if member.device_id == primary.device_id:
+                continue
+            _absorb_cluster_member(primary, member)
+            del devices[member.device_id]
+
+    # Saved layout per project. Run AFTER cluster collapse so we don't
+    # waste a layout lookup on absorbed device_ids that won't render.
+    surviving_ids = list(devices.keys())
+    surviving_placeholders = ",".join("?" * len(surviving_ids))
     layout_rows = conn.execute(
-        f"SELECT * FROM device_layouts WHERE project_id = ? AND device_id IN ({placeholders})",
-        (project_id, *devices.keys()),
+        f"SELECT * FROM device_layouts WHERE project_id = ? AND device_id IN ({surviving_placeholders})",
+        (project_id, *surviving_ids),
     ).fetchall()
     for r in layout_rows:
         cd = devices[r["device_id"]]
@@ -454,6 +627,19 @@ def _build_tooltip(d: CanvasDevice) -> str:
     lines.append(f"Device ID:     {d.device_id}")
     lines.append(f"Stable key:    {d.stable_key}")
     lines.append(f"Kind:          {d.kind}")
+    if d.cluster_id is not None:
+        score = (
+            f" (min score {d.cluster_min_score:.2f})"
+            if d.cluster_min_score is not None else ""
+        )
+        lines.append(
+            f"Cluster:       {d.cluster_id} · "
+            f"{d.cluster_member_count} member"
+            f"{'s' if d.cluster_member_count != 1 else ''}{score}"
+        )
+        if d.cluster_member_ids:
+            ids = ", ".join(str(i) for i in d.cluster_member_ids)
+            lines.append(f"  absorbed:    {ids}")
     if d.device_class:
         lines.append(f"Class:         {d.device_class}")
     if d.user_name:
@@ -844,6 +1030,8 @@ class DeviceItem(QGraphicsItem):
             self._paint_expanded_body(painter)
 
         self._paint_channel_flash(painter)
+        if self.device.cluster_member_count > 1:
+            self._paint_cluster_badge(painter)
 
     def _paint_channel_flash(self, painter: QPainter) -> None:
         """Render the per-device channel-activity indicators.
@@ -981,6 +1169,38 @@ class DeviceItem(QGraphicsItem):
             str(channel),
         )
 
+    def _paint_cluster_badge(self, painter: QPainter) -> None:
+        """Render the ↔N badge in the box's top-left corner.
+
+        Only called when the device represents a collapsed cluster
+        (more than one member). The badge sits *over* the upper-left
+        of the kind-fill body, distinct in colour from any kind tint
+        so it scans across a grid of boxes regardless of kind.
+        """
+        text = f"↔ {self.device.cluster_member_count}"
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(8)
+        painter.setFont(font)
+        # Width sized to text + padding; height fixed so badges all
+        # line up vertically across boxes.
+        metrics = painter.fontMetrics()
+        text_w = metrics.horizontalAdvance(text)
+        badge_w = text_w + 2 * _CLUSTER_BADGE_PAD_X
+        badge_rect = QRectF(
+            _CLUSTER_BADGE_MARGIN,
+            _CLUSTER_BADGE_MARGIN,
+            badge_w,
+            _CLUSTER_BADGE_H,
+        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(_CLUSTER_BADGE_BG))
+        painter.drawRoundedRect(badge_rect, 4, 4)
+        painter.setPen(QPen(_CLUSTER_BADGE_FG))
+        painter.drawText(
+            badge_rect, Qt.AlignmentFlag.AlignCenter, text,
+        )
+
     def _paint_collapsed_body(self, painter: QPainter) -> None:
         d = self.device
         rssi = f"{d.rssi_avg:.0f}" if d.rssi_avg is not None else "—"
@@ -1061,6 +1281,15 @@ class DeviceItem(QGraphicsItem):
             if d.rssi_avg is not None else "—"
         )
         line(f"id: {d.device_id}")
+        if d.cluster_id is not None:
+            score = (
+                f" (min {d.cluster_min_score:.2f})"
+                if d.cluster_min_score is not None else ""
+            )
+            line(
+                f"cluster: {d.cluster_id} · "
+                f"{d.cluster_member_count} mem{score}"
+            )
         line(f"kind: {d.kind}")
         # Class is what determines the icon and most of the label fallback —
         # users want to know where it came from. Show the class string and

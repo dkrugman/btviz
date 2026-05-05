@@ -932,6 +932,13 @@ class Broadcasts:
 
 
 def _row_to_sniffer(r) -> Sniffer:
+    # ``stall_count`` / ``last_stall_at`` arrived in v6; older callers
+    # that hand-build sqlite rows (tests, mocks) may not have them.
+    # ``r.keys()`` is a sqlite3.Row method; .get() doesn't exist on
+    # Row, so use index-with-default via key-membership check.
+    keys = r.keys() if hasattr(r, "keys") else ()
+    stall_count = r["stall_count"] if "stall_count" in keys else 0
+    last_stall_at = r["last_stall_at"] if "last_stall_at" in keys else None
     return Sniffer(
         id=r["id"],
         serial_number=r["serial_number"],
@@ -947,6 +954,8 @@ def _row_to_sniffer(r) -> Sniffer:
         first_seen=r["first_seen"],
         last_seen=r["last_seen"],
         notes=r["notes"],
+        stall_count=int(stall_count or 0),
+        last_stall_at=last_stall_at,
     )
 
 
@@ -1091,6 +1100,33 @@ class Sniffers:
         self.s.conn.execute(
             "UPDATE sniffers SET removed = 0 WHERE serial_number = ?",
             (serial_number,),
+        )
+
+    def bump_stall_counter(self, sniffer_id: int, when: float) -> None:
+        """Increment ``stall_count`` and update ``last_stall_at``.
+
+        Called by the capture stall watchdog when a sniffer's data
+        path goes silent for the threshold and we restart its
+        subprocess. Lifetime counter (not session-scoped) so chronic
+        stalls are visible across runs.
+        """
+        self.s.conn.execute(
+            "UPDATE sniffers SET stall_count = stall_count + 1, "
+            "last_stall_at = ? WHERE id = ?",
+            (when, sniffer_id),
+        )
+
+    def clear_stall_counter(self, sniffer_id: int) -> None:
+        """Reset stall_count + last_stall_at on this sniffer.
+
+        For a future right-click "Acknowledge" action so users can
+        zero the indicator after replug / firmware reflash without
+        DB surgery.
+        """
+        self.s.conn.execute(
+            "UPDATE sniffers SET stall_count = 0, last_stall_at = NULL "
+            "WHERE id = ?",
+            (sniffer_id,),
         )
 
 

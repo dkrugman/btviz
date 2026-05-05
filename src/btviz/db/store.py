@@ -9,12 +9,24 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH_ENV = "BTVIZ_DB_PATH"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 # Incremental migrations applied to existing DBs to bring them up to
 # ``SCHEMA_VERSION``. Fresh DBs get the full schema.sql (which already
 # contains everything through SCHEMA_VERSION) and skip these.
+
+# v6 — sniffers.stall_count + sniffers.last_stall_at. The capture
+# stall watchdog (src/btviz/capture/watchdog.py) increments these
+# whenever a sniffer's data path goes silent for the threshold and
+# we restart its subprocess. The counter is lifetime (not session)
+# so users can spot chronic per-dongle stalls across capture runs.
+# Surfaced in the panel as a "STALL ×N" badge — the literal token
+# matches the log output for grep-friendliness.
+_V5_TO_V6_SQL = """
+ALTER TABLE sniffers ADD COLUMN stall_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sniffers ADD COLUMN last_stall_at REAL;
+"""
 
 # v5 — device_clusters.confirmed. When True (the default for new
 # auto-runs), the cluster runner treats the cluster as "decided" —
@@ -160,6 +172,10 @@ class Store:
             self.conn.executescript(_V4_TO_V5_SQL)
             self.conn.execute("PRAGMA user_version = 5")
             version = 5
+        if version == 5:
+            self.conn.executescript(_V5_TO_V6_SQL)
+            self.conn.execute("PRAGMA user_version = 6")
+            version = 6
         if version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unknown db schema version {version}; app expects {SCHEMA_VERSION}"

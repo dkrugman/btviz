@@ -304,6 +304,12 @@ class Sniffer:
     first_seen: float = 0.0
     last_seen: float = 0.0
     notes: str | None = None
+    # Lifetime count of capture-stall events on this dongle. Surfaced
+    # in the panel as a "STALL ×N" badge so chronic per-dongle
+    # wedges are visible across capture sessions and btviz restarts.
+    # Bumped by ``btviz.capture.watchdog.StallWatchdog``.
+    stall_count: int = 0
+    last_stall_at: float | None = None
 
     @property
     def is_tx_capable(self) -> bool:

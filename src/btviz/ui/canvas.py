@@ -2275,6 +2275,9 @@ class CanvasWindow(QMainWindow):
         self._coord: CaptureCoordinator | None = None
         self._live: LiveIngest | None = None
         self._live_timer: QTimer | None = None
+        # Stall watchdog — set up on _start_live, torn down on
+        # _stop_live. None outside of an active capture session.
+        self._stall_watchdog = None
         self._reload_tick = 0       # increments per timer fire; reload() runs every Nth
         # Wall-clock at the moment the most recent capture session ended,
         # or None while a session is active (or before the first Start).
@@ -2998,6 +3001,19 @@ class CanvasWindow(QMainWindow):
         # under heavy adv traffic.
         self._live_timer.start(250)
 
+        # Stall watchdog. Detects a wedged USB-CDC endpoint within
+        # ~60s of silence and restarts the wedged subprocess. Bumps
+        # ``sniffers.stall_count`` in the DB so chronic per-dongle
+        # stalls show up as a "STALL ×N" badge in the panel — both
+        # within a session and across btviz restarts.
+        from ..capture.watchdog import StallWatchdog
+        self._stall_watchdog = StallWatchdog(
+            sniffers=lambda: list(self._coord.sniffers.values())
+                              if self._coord is not None else [],
+            repos=self.repos,
+            restart=self._coord.restart_one,
+        )
+
         # Count what actually started — with N dongles and 3 primary
         # advertising channels, default_roles pins 3 and parks the rest
         # as ScanUnmonitored, which only spin up if a primary frees
@@ -3047,6 +3063,10 @@ class CanvasWindow(QMainWindow):
         self._coord = None
         self._bus = None
         self._source_to_serial = {}
+        # Drop the watchdog so per-session attempt state doesn't leak
+        # into the next capture run. Lifetime ``stall_count`` lives in
+        # the DB and survives.
+        self._stall_watchdog = None
         # Clear the panel's "extcap-unreachable" hint — the next live
         # start will recompute it from a fresh discovery sweep.
         self.sniffer_panel.set_extcap_unreachable(set())
@@ -3084,6 +3104,30 @@ class CanvasWindow(QMainWindow):
             return
         self._live.flush()
         self._reload_tick += 1
+        # Stall watchdog tick at ~10 s cadence (40 ticks * 250 ms).
+        # Cheap operation — walks the sniffers dict and compares
+        # timestamps. Lifetime DB bumps + log writes only fire on
+        # actual stall detection.
+        if self._reload_tick % 40 == 0 and self._stall_watchdog is not None:
+            try:
+                self._stall_watchdog.tick()
+                # Push stuck-set into the panel so red "replug" badge
+                # surfaces when the watchdog has given up on a
+                # sniffer. Resolve short_id → serial via the
+                # coordinator's dongles list (panel keys by serial).
+                if self._coord is not None:
+                    short_to_serial = {
+                        d.short_id: (d.serial_number or d.serial_path)
+                        for d in self._coord.dongles
+                    }
+                    stuck_serials = {
+                        short_to_serial[sid]
+                        for sid in self._stall_watchdog.stuck_short_ids()
+                        if sid in short_to_serial
+                    }
+                    self.sniffer_panel.set_stuck_serials(stuck_serials)
+            except Exception as e:  # noqa: BLE001 — never break live capture
+                self.status.setText(f"  watchdog error: {e}")
         # Reload the scene every ~2s (8 ticks * 250ms). Full rebuild is
         # heavy (re-runs the project-aggregate query and rebuilds every
         # DeviceItem) — incremental updates can replace this later.

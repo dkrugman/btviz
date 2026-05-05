@@ -7,8 +7,11 @@ import sys
 
 def main() -> int:
     from .cluster import configure_cluster_log, get_cluster_logger
+    from .capture_log import configure_capture_log, get_capture_logger
     configure_cluster_log()
+    configure_capture_log()
     get_cluster_logger().info("btviz startup")
+    get_capture_logger().info("btviz startup")
 
     p = argparse.ArgumentParser(prog="btviz")
     sub = p.add_subparsers(dest="cmd")

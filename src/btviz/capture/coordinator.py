@@ -98,6 +98,35 @@ class CaptureCoordinator:
         self.sniffers.clear()
         self.roles.clear()
 
+    def restart_one(self, dongle_id: str) -> bool:
+        """Stop and re-start one sniffer's subprocess in place.
+
+        Used by the capture stall watchdog when a sniffer's data
+        path has gone silent. Preserves the dongle's role
+        assignment so the restarted subprocess resumes the same
+        Pinned / Follow / ScanUnmonitored work it was doing.
+
+        Returns True if the new subprocess spawned, False if the
+        dongle is unknown to the coordinator (e.g. removed from
+        the discovery set since the watchdog last looked).
+        """
+        if dongle_id not in self.sniffers:
+            return False
+        role = self.roles.get(dongle_id, Idle())
+        sp = self.sniffers[dongle_id]
+        try:
+            sp.stop()
+        except Exception:  # noqa: BLE001
+            # Stop is best-effort; subprocess may already be dead.
+            pass
+        # ``Idle`` role: nothing to restart. The watchdog shouldn't
+        # ask us to restart an Idle dongle (it filters on role !=
+        # idle), but be defensive.
+        if isinstance(role, Idle):
+            return False
+        self._apply_role(dongle_id, role)
+        return self.sniffers[dongle_id].state.running
+
     # --- roles -----------------------------------------------------------
 
     def get_role(self, dongle_id: str) -> SnifferRole:

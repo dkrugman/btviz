@@ -114,6 +114,7 @@ class SnifferProcess:
         self._ctrl_in_lock = threading.Lock()
         self._reader: threading.Thread | None = None
         self._ctrl_reader: threading.Thread | None = None
+        self._stderr_reader: threading.Thread | None = None
         self._stop = threading.Event()
         self.state = SnifferState(dongle=dongle)
 
@@ -174,6 +175,11 @@ class SnifferProcess:
         # Open capture FIFO for read non-blocking, before spawning writer.
         cap_fd = os.open(cap_fifo, os.O_RDONLY | os.O_NONBLOCK)
 
+        # Capture stderr so Nordic script tracebacks (e.g. SnifferAPI
+        # import failures, serial-open errors) surface as last_error
+        # rather than vanishing into an unread pipe buffer. Without
+        # the drain, a full pipe blocks the subprocess and we'd see
+        # only the pcap header before silence.
         self._proc = subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -202,8 +208,13 @@ class SnifferProcess:
             target=self._ctrl_out_loop, args=(ctrl_out_fd,),
             name=f"sniffer-ctrl-{self._dongle.short_id}", daemon=True,
         )
+        self._stderr_reader = threading.Thread(
+            target=self._stderr_loop,
+            name=f"sniffer-err-{self._dongle.short_id}", daemon=True,
+        )
         self._reader.start()
         self._ctrl_reader.start()
+        self._stderr_reader.start()
 
         # Send initial control values, then the INIT terminator so the extcap
         # finishes consuming init values and starts capturing.
@@ -235,11 +246,12 @@ class SnifferProcess:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
             self._proc = None
-        for t in (self._reader, self._ctrl_reader):
+        for t in (self._reader, self._ctrl_reader, self._stderr_reader):
             if t is not None:
                 t.join(timeout=1)
         self._reader = None
         self._ctrl_reader = None
+        self._stderr_reader = None
         if self._fifo_dir and self._fifo_dir.exists():
             for p in (self._capture_fifo, self._ctrl_in_fifo, self._ctrl_out_fifo):
                 if p and p.exists():
@@ -394,6 +406,39 @@ class SnifferProcess:
             self.state.last_error = payload.decode("utf-8", errors="replace")
             self._on_state(self.state)
 
+    # --- stderr drainer -------------------------------------------------
+
+    def _stderr_loop(self) -> None:
+        """Drain the subprocess's stderr.
+
+        Without this, a subprocess that prints (Python tracebacks,
+        SnifferAPI errors, the Nordic launcher's benign shell warnings)
+        eventually fills the OS pipe buffer (~64 KB on macOS) and
+        blocks on its next stderr write — typically right after the
+        pcap header is emitted, which leaves us with "header but no
+        packets" and no clue why.
+
+        The most recent non-blank line is stashed on ``state.last_error``
+        so the panel / status bar can surface it. We read line-by-line
+        rather than chunked so partial buffers don't hide a one-line
+        traceback.
+        """
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in iter(proc.stderr.readline, b""):
+                if self._stop.is_set():
+                    return
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if not text or _is_benign_extcap_stderr(text):
+                    continue
+                self.state.last_error = text
+                self._on_state(self.state)
+        except (OSError, ValueError):
+            # ValueError fires when the file is closed mid-read by stop().
+            return
+
 
 # --- helpers ---------------------------------------------------------------
 
@@ -411,6 +456,18 @@ def _adv_hop_str(channels: list[int]) -> str:
 def _format_addr(mac: str, is_random: bool) -> str:
     """Format for CTRL_ARG_KEY_VAL / --device: 'aa:bb:cc:dd:ee:ff public|random'."""
     return f"{mac.lower()} {'random' if is_random else 'public'}"
+
+
+def _is_benign_extcap_stderr(line: str) -> bool:
+    """True for stderr lines we know aren't real failures.
+
+    Nordic's launcher script (nrf_sniffer_ble.sh) ships with a
+    shell-syntax bug at the ``$VIRTUAL_ENV`` test (missing space
+    before ``]``) that prints ``[: missing ']'`` on every spawn.
+    Execution still succeeds, so surfacing it as last_error would
+    make every healthy capture look broken.
+    """
+    return "missing `]'" in line
 
 
 def _validate_hex(value: str, want_bytes: int) -> None:

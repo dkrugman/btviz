@@ -62,6 +62,18 @@ class Dongle:
         m = re.search(r"usbmodem([\w.\-]+)", self.serial_path)
         return m.group(1) if m else self.serial_path.rsplit("/", 1)[-1]
 
+    @property
+    def is_tx_capable(self) -> bool:
+        """True if the firmware on this dongle can transmit.
+
+        See ``btviz.capture.capability`` for the heuristic. RX-only
+        sniffer firmware identifies itself with ``"sniffer"`` in the
+        extcap display string or USB product descriptor; everything
+        else is assumed TX-capable.
+        """
+        from ..capture.capability import is_firmware_tx_capable
+        return is_firmware_tx_capable(self.usb_product, self.display)
+
 
 def find_extcap_binary() -> Path:
     """Locate the Nordic extcap binary. Honors $BTVIZ_NRF_EXTCAP override."""

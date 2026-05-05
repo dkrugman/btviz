@@ -739,9 +739,14 @@ class SnifferPanel(QWidget):
         p.setFont(regular)
         kind_str = s.kind or "unknown"
         sn_short = (s.serial_number or "")[-10:]
+        # Capability tag — RX-only sniffer firmware vs TX-capable
+        # (connectivity / SoftDevice / custom). Lets the user tell at
+        # a glance which device(s) can be used for active GATT probing
+        # vs which are scanning duty.
+        cap_str = "TX/RX" if s.is_tx_capable else "RX"
         p.drawText(QRectF(x, top + line_h, _TEXT_W, line_h),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                   _truncate(f"{kind_str} · …{sn_short}", 32))
+                   _truncate(f"{kind_str} · {cap_str} · …{sn_short}", 32))
 
         port_str = s.usb_port_id or "(no port)"
         # Strip the platform prefix to save room ("/dev/cu.usbmodem" → "")

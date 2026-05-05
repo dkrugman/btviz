@@ -133,13 +133,35 @@ def short_name(role: SnifferRole) -> str:
     return str(role)  # unreachable with correct types
 
 
-def default_roles(dongle_ids: list[str]) -> dict[str, SnifferRole]:
+def default_roles(
+    dongle_ids: list[str],
+    *,
+    tx_capable_ids: set[str] | None = None,
+) -> dict[str, SnifferRole]:
     """Initial role assignment given N connected dongles.
+
+    With ≤ 3 dongles the policy is unchanged: every dongle gets a
+    sniffing role because we need every radio scanning the primary
+    advertising channels. A TX-capable device in this regime gets a
+    sniffing role too — it can be momentarily borrowed for an
+    interrogation TX action.
+
+    With ≥ 4 dongles we have spare radios, so we deliberately reserve
+    TX-capable devices as ``Idle``; RX-only sniffer-firmware devices
+    are preferred for the three primary-channel pin roles. The
+    reserved TX device is then available for follow / interrogation
+    tasks without disturbing primary-channel coverage.
+
+    ``tx_capable_ids`` is the set of ``dongle_ids`` whose firmware is
+    TX-capable. Pass ``None`` (the default) to treat every dongle as
+    interchangeable, which preserves the pre-capability behaviour.
 
       1 dongle   -> d0=ScanUnmonitored                       (hops 37/38/39)
       2 dongles  -> d0=Pinned([37]),  d1=ScanUnmonitored     (-> hops [38,39])
       3 dongles  -> d0=Pinned([37]),  d1=Pinned([38]),  d2=Pinned([39])
-      4+ dongles -> first 3 pinned as above; extras Idle.
+      4+ dongles -> 3 RX-only pinned to 37/38/39 (when available);
+                     TX-capable devices Idle (reserved); remaining
+                     RX-only devices Idle.
     """
     n = len(dongle_ids)
     if n == 0:
@@ -151,10 +173,21 @@ def default_roles(dongle_ids: list[str]) -> dict[str, SnifferRole]:
             dongle_ids[0]: Pinned((37,)),
             dongle_ids[1]: ScanUnmonitored(),
         }
+    if n == 3:
+        return {
+            did: Pinned((ch,))
+            for did, ch in zip(dongle_ids, PRIMARY_ADV_CHANNELS)
+        }
+
+    # n >= 4. Sort dongles so RX-only come first (preferred for the
+    # three pin roles); TX-capable trail (preferred for the Idle
+    # reservation pool).
+    tx_set = tx_capable_ids or set()
+    rx_first = sorted(dongle_ids, key=lambda d: (d in tx_set,))
     result: dict[str, SnifferRole] = {
         did: Pinned((ch,))
-        for did, ch in zip(dongle_ids[:3], PRIMARY_ADV_CHANNELS)
+        for did, ch in zip(rx_first[:3], PRIMARY_ADV_CHANNELS)
     }
-    for did in dongle_ids[3:]:
+    for did in rx_first[3:]:
         result[did] = Idle()
     return result

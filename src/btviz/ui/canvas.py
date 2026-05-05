@@ -2258,11 +2258,13 @@ class CanvasWindow(QMainWindow):
         from .channel_strip import ChannelStrip
         from .sniffer_panel import SnifferPanel
         self.sniffer_panel = SnifferPanel(store=store)
-        # Refresh button at the top of the sniffer panel — fires when
-        # clicked. Wired here rather than inside the panel so the
-        # discovery side-effect (re-probing USB) stays in the canvas
-        # window where the rest of the capture wiring lives.
-        self.sniffer_panel.refreshRequested.connect(self._refresh_sniffers)
+        # The panel's top slot used to host a "Refresh" button that
+        # re-ran USB discovery. After PR #76's pyserial-based
+        # discovery, fast and slow paths converged and Start Capture
+        # already triggers a fresh sweep — so the button became
+        # redundant. The slot now hosts the session timer
+        # (start_session_timer / stop_session_timer) driven from
+        # _start_live / _stop_live.
         self.channel_strip = ChannelStrip()
 
         central = QWidget()
@@ -3068,6 +3070,10 @@ class CanvasWindow(QMainWindow):
             msg += f" ({reserved} reserved for follow)"
         msg += "…"
         self._set_capture_button_state(capturing=True)
+        # Start the panel's session timer. Reads the live system
+        # clock so it matches whatever epoch the session row in the
+        # DB was stamped with (within one tick).
+        self.sniffer_panel.start_session_timer(time.time())
         self.status.setText(msg)
 
     def _stop_live(self) -> None:
@@ -3091,6 +3097,10 @@ class CanvasWindow(QMainWindow):
         if self._live is not None:
             self._live.stop()
         self._set_capture_button_state(capturing=False)
+        # Freeze the panel's session timer at the just-elapsed value
+        # so the user sees how long their session ran. Resets on
+        # the next Start Capture.
+        self.sniffer_panel.stop_session_timer()
         # Snapshot the moment-of-stop so the top "Devices" section
         # freezes its opacity-fade at this point. Bottom section keeps
         # ageing on real time so RPAs continue to fade out as before.
@@ -3583,53 +3593,6 @@ class CanvasWindow(QMainWindow):
             self._cluster_thread.quit()
             self._cluster_thread.wait(2000)
         super().closeEvent(event)
-
-    def _refresh_sniffers(self) -> None:
-        """Re-run discovery, persist into the sniffers table, refresh panel.
-
-        Each detection path has blind spots — fast (ioreg) misses
-        hub-connected dongles on some systems; slow (extcap) intermittently
-        misses the DK. We always pass the union to record_discovered so a
-        row is only deactivated when *neither* path saw it.
-
-        When capturing we reuse the cached slow result from capture start
-        rather than re-probing — extcap can't see device nodes that are
-        currently held open by SnifferProcess, so a fresh probe would
-        return a false-incomplete set. When not capturing we run the slow
-        probe synchronously; the user clicked the button, they expect it
-        to actually rediscover.
-
-        Discovery failure (e.g. extcap binary missing) shouldn't crash the
-        canvas — log it via the status bar and keep DB state on screen.
-        """
-        try:
-            from ..extcap.discovery import (
-                discovered_to_db_records, list_dongles, list_dongles_fast,
-            )
-            fast_dongles = list_dongles_fast()
-            if self._coord is not None:
-                slow_dongles = list(self._coord.dongles)
-            elif self._last_coord_dongles:
-                slow_dongles = list(self._last_coord_dongles)
-            else:
-                self.status.setText("  discovering sniffers…")
-                # Force the status repaint before the (multi-second) probe
-                # so the user gets feedback rather than a frozen toolbar.
-                from PySide6.QtWidgets import QApplication
-                QApplication.processEvents()
-                slow_dongles = list_dongles()
-                self.status.setText("")
-            fast_keys = {(d.serial_number or d.serial_path) for d in fast_dongles}
-            extra_slow = [
-                d for d in slow_dongles
-                if (d.serial_number or d.serial_path) not in fast_keys
-            ]
-            records = discovered_to_db_records(fast_dongles + extra_slow)
-            self.repos.sniffers.record_discovered(records)
-        except Exception as e:  # noqa: BLE001
-            self.status.setText(f"  sniffer discovery failed: {e}")
-        self.sniffer_panel.refresh()
-
 
 # ──────────────────────────────────────────────────────────────────────────
 # Entry point

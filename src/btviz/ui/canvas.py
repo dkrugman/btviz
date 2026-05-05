@@ -28,6 +28,7 @@ from PySide6.QtCore import (
     Slot,
 )
 from PySide6.QtGui import (
+    QAction,
     QBrush,
     QColor,
     QFont,
@@ -702,10 +703,16 @@ def load_canvas_devices(
             continue
         scores = [s for _, s in live_mems if s is not None]
         min_score = min(scores) if scores else None
+        # Read threshold per call so a live preference change takes
+        # effect on the next reload without restart.
+        from ..preferences import get_prefs
+        collapse_threshold = float(
+            get_prefs().get("cluster.collapse_threshold")
+        )
         if (
             len(live_mems) < 2
             or min_score is None
-            or min_score < _CLUSTER_COLLAPSE_THRESHOLD
+            or min_score < collapse_threshold
         ):
             # Tag membership but don't collapse — the badge can still
             # appear on individual boxes ("part of cluster N") but
@@ -2165,13 +2172,18 @@ class _ClusterWorker(QObject):
     finished = Signal(object)   # RunResult
     failed = Signal(str)        # error message
 
-    @Slot(object, object, object)
-    def run_request(self, ctx_proto, db_path, devices) -> None:
+    @Slot(object, object, object, int)
+    def run_request(
+        self, ctx_proto, db_path, devices, max_per_class: int,
+    ) -> None:
         """Execute one cluster pass. Runs on the worker thread.
 
         Receives all inputs as queued-signal arguments rather than
         reading instance state — keeps the worker stateless between
         runs and avoids any cross-thread reads of mutable state.
+        ``max_per_class`` arrives per-call so a live preferences
+        change takes effect on the next cluster tick (no worker
+        restart needed).
         """
         try:
             import sqlite3
@@ -2188,7 +2200,7 @@ class _ClusterWorker(QObject):
                     now=ctx_proto.now,
                     db=SimpleNamespace(conn=conn),
                 )
-                runner = ClusterRunner(local_ctx)
+                runner = ClusterRunner(local_ctx, max_per_class=max_per_class)
                 result = runner.run_once(devices)
             finally:
                 conn.close()
@@ -2206,7 +2218,7 @@ class CanvasWindow(QMainWindow):
     # the persistent ``_ClusterWorker``. Emission is queued across
     # threads automatically, so the worker's slot runs on its own
     # thread regardless of where ``emit`` is called.
-    _dispatch_cluster = Signal(object, object, object)
+    _dispatch_cluster = Signal(object, object, object, int)
 
     def __init__(self, store: Store, project_id: int) -> None:
         super().__init__()
@@ -2476,6 +2488,11 @@ class CanvasWindow(QMainWindow):
         tb.addAction("Reload", self.reload)
         tb.addAction("Reset layout", self.reset_layout)
         tb.addAction("Clear all data…", self.clear_all_data)
+        # Preferences action — Qt routes this to the application menu
+        # ("btviz → Preferences…") on macOS via the PreferencesRole;
+        # on Linux/Windows it stays on the toolbar.
+        prefs_action = tb.addAction("Preferences…", self._open_preferences)
+        prefs_action.setMenuRole(QAction.MenuRole.PreferencesRole)
         tb.addSeparator()
 
         # ---- Status (right edge) -------------------------------------------
@@ -2791,6 +2808,21 @@ class CanvasWindow(QMainWindow):
                 h.setLevel(logging.INFO)
             self.status.setText("  cluster log: normal (INFO)")
 
+    def _open_preferences(self) -> None:
+        """Open the modal Preferences dialog.
+
+        Reads the singleton ``Preferences``, hands it to the dialog,
+        and saves on accept. Knobs are picked up by their consumers
+        on the next read (per-call sites read fresh values), so most
+        changes take effect without restart. Fields tagged
+        ``requires_restart`` (e.g. DB path) need a btviz relaunch —
+        the dialog's label suffix tells the user.
+        """
+        from ..preferences import get_prefs
+        from ..preferences.ui import PreferencesDialog
+        dlg = PreferencesDialog(get_prefs(), parent=self)
+        dlg.exec()
+
     def clear_all_data(self) -> None:
         """Wipe all observations, sessions, broadcasts, and layout for
         this project. Devices and addresses are global and stay
@@ -3005,13 +3037,20 @@ class CanvasWindow(QMainWindow):
         # ~60s of silence and restarts the wedged subprocess. Bumps
         # ``sniffers.stall_count`` in the DB so chronic per-dongle
         # stalls show up as a "STALL ×N" badge in the panel — both
-        # within a session and across btviz restarts.
+        # within a session and across btviz restarts. Tunables are
+        # all read from preferences so the user can widen the
+        # threshold for RF-quiet environments without code edits.
         from ..capture.watchdog import StallWatchdog
+        from ..preferences import get_prefs
+        prefs = get_prefs()
         self._stall_watchdog = StallWatchdog(
             sniffers=lambda: list(self._coord.sniffers.values())
                               if self._coord is not None else [],
             repos=self.repos,
             restart=self._coord.restart_one,
+            threshold_s=prefs.get("watchdog.stall_threshold_s"),
+            max_attempts=prefs.get("watchdog.max_attempts"),
+            min_gap_s=prefs.get("watchdog.min_gap_s"),
         )
 
         # Count what actually started — with N dongles and 3 primary
@@ -3223,9 +3262,13 @@ class CanvasWindow(QMainWindow):
         # queued connection guarantees ``run_request`` runs on the
         # worker thread, never on the main thread. ``_cluster_busy``
         # is cleared by the matched ``finished`` / ``failed`` slot.
+        # ``max_per_class`` reads from prefs at dispatch time so a
+        # live preference change takes effect on the next tick.
+        from ..preferences import get_prefs
+        max_per_class = int(get_prefs().get("cluster.max_per_class"))
         self._cluster_busy = True
         self._dispatch_cluster.emit(
-            self._cluster_ctx, self.store.path, devices,
+            self._cluster_ctx, self.store.path, devices, max_per_class,
         )
 
     @Slot(object)

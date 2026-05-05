@@ -140,6 +140,34 @@ class CaptureCoordinator:
         self._apply_role(dongle_id, role)
         self._recompute_scan_unmonitored()
 
+    def _capture_flags(self) -> dict:
+        """Per-call read of the capture-flag preferences.
+
+        Read at the moment a sniffer is started so a live preference
+        change applies on the next role transition / Start Capture
+        without restart. Falls back to the historical defaults when
+        preferences haven't been initialised (test paths that drive
+        the coordinator without a Qt app).
+        """
+        try:
+            from ..preferences import get_prefs
+            p = get_prefs()
+            return {
+                "only_advertising": bool(p.get("capture.only_advertising")),
+                "only_legacy_advertising": bool(p.get("capture.only_legacy_advertising")),
+                "scan_follow_rsp": bool(p.get("capture.scan_follow_rsp")),
+                "scan_follow_aux": bool(p.get("capture.scan_follow_aux")),
+                "coded_phy": bool(p.get("capture.coded_phy")),
+            }
+        except Exception:  # noqa: BLE001
+            return {
+                "only_advertising": True,
+                "only_legacy_advertising": False,
+                "scan_follow_rsp": True,
+                "scan_follow_aux": True,
+                "coded_phy": False,
+            }
+
     def _apply_role(self, dongle_id: str, role: SnifferRole) -> None:
         sp = self.sniffers[dongle_id]
         if isinstance(role, Idle):
@@ -151,13 +179,16 @@ class CaptureCoordinator:
             if sp.state.running:
                 sp.set_adv_hop(channels)
             else:
-                sp.start(adv_hop=channels)
+                sp.start(adv_hop=channels, **self._capture_flags())
             return
         if isinstance(role, Follow):
             if sp.state.running:
                 sp.follow_address(role.target_addr, role.is_random)
             else:
-                sp.start(follow_address=(role.target_addr, role.is_random))
+                sp.start(
+                    follow_address=(role.target_addr, role.is_random),
+                    **self._capture_flags(),
+                )
             # IRK feed for RPA resolution. Sent AFTER the follow_address
             # call so the sniffer's key state is already on "Follow LE
             # address"; add_irk overrides the key-type to IRK and writes
@@ -191,7 +222,7 @@ class CaptureCoordinator:
                 if list(sp.state.adv_hop) != uncovered:
                     sp.set_adv_hop(uncovered)
             else:
-                sp.start(adv_hop=uncovered)
+                sp.start(adv_hop=uncovered, **self._capture_flags())
 
     # --- follow convenience ---------------------------------------------
 

@@ -1165,6 +1165,33 @@ def section_grid_layout(
 # Device box (QGraphicsItem)
 # ──────────────────────────────────────────────────────────────────────────
 
+
+@dataclass
+class _DeviceLiveState:
+    """Per-device live state that survives canvas reload.
+
+    The canvas rebuilds DeviceItems every ~2 s during live capture
+    (``scene.clear()`` inside ``reload()``). Anything stored on the
+    DeviceItem itself would reset every reload — flashing the
+    Signal/Quality bars to neutral, breaking channel-flash continuity,
+    and freezing the packet counter for 2 s at a time. Hoisting these
+    pieces here gives them a stable home keyed by ``device_id`` on the
+    canvas; each new DeviceItem receives its slice by reference.
+    """
+    # Rolling-window samples driving the Signal/Quality meters.
+    # Pruned on read in ``DeviceItem._recent_stats``.
+    recent: deque = field(default_factory=deque)
+    # Channel-flash tail for data channels (0-36). Pruned in place
+    # in ``DeviceItem.notify_channel_hit``.
+    data_flash_recent: list = field(default_factory=list)
+    # Latest flash per advertising channel (37/38/39).
+    adv_flash: dict = field(default_factory=dict)
+    # Live packet count delta on top of ``CanvasDevice.packet_count``.
+    # Incremented per attribution between reloads; zeroed at reload
+    # because the fresh DB count already includes those packets.
+    live_packet_delta: int = 0
+
+
 class DeviceItem(QGraphicsItem):
     """Draggable, collapsible box representing one device.
 
@@ -1172,8 +1199,13 @@ class DeviceItem(QGraphicsItem):
     persists position (and collapsed state) via the owning scene's callback.
     """
 
-    def __init__(self, device: CanvasDevice, persist_cb,
-                 context_cb=None) -> None:
+    def __init__(
+        self,
+        device: CanvasDevice,
+        persist_cb,
+        context_cb=None,
+        live_state: "_DeviceLiveState | None" = None,
+    ) -> None:
         super().__init__()
         self.device = device
         self._persist = persist_cb
@@ -1181,28 +1213,20 @@ class DeviceItem(QGraphicsItem):
         # right-click menu. Signature: (device) -> list[QAction]. When
         # None, no context menu is shown.
         self._context_cb = context_cb
-        # Channel flash state — populated by ``notify_channel_hit``
-        # whenever a packet for this device is recorded. Split into
-        # data (channels 0-36) and advertising (37-39) so the two
-        # populations of activity render in their own indicators:
-        # the data-channel badge sits in the top-right of the header,
-        # the adv strip sits below it.
-        #
-        # ``_data_flash_recent`` keeps a small recency tail of
-        # (ts, channel, crc_fail) tuples so a hopping Auracast train
-        # paints a comet-tail. ``_adv_flash`` is keyed by channel
-        # (37/38/39) holding the latest (ts, crc_fail) — adv channels
-        # don't hop, so we only need the most recent hit per channel
-        # for fade rendering.
-        self._data_flash_recent: list[tuple[float, int, bool]] = []
-        self._adv_flash: dict[int, tuple[float, bool]] = {}
-        # Rolling-window samples driving the Signal and Quality meters.
-        # Each entry is ``(ts, rssi, crc_ok)``. Pruned to the last
-        # ``_RECENT_WINDOW_S`` seconds inside ``_recent_stats``. The
-        # bars reflect *current* link health, not session-cumulative
-        # totals — after capture stops or the device goes silent, the
-        # window drains and the bars fade to neutral.
-        self._recent: deque[tuple[float, int | None, bool]] = deque()
+        # All per-device live state lives on the canvas-owned
+        # ``_DeviceLiveState`` so it survives ``scene.clear()`` in
+        # reload(). Falls back to a private instance when no live
+        # state is provided (tests / standalone construction).
+        # ``_recent``, ``_data_flash_recent``, ``_adv_flash`` are
+        # aliases pointing at the dataclass fields — mutate in place
+        # (append, popleft, slice-assign), never reassign, or the
+        # alias drifts away from the canvas-owned state.
+        self._live: _DeviceLiveState = (
+            live_state if live_state is not None else _DeviceLiveState()
+        )
+        self._data_flash_recent = self._live.data_flash_recent
+        self._adv_flash = self._live.adv_flash
+        self._recent = self._live.recent
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
@@ -1240,6 +1264,7 @@ class DeviceItem(QGraphicsItem):
         """
         now = time.time()
         self._recent.append((now, rssi, crc_ok))
+        self._live.live_packet_delta += 1
         if channel is None:
             self.update()
             return
@@ -1248,7 +1273,11 @@ class DeviceItem(QGraphicsItem):
         else:
             self._data_flash_recent.append((now, channel, not crc_ok))
             cutoff = now - _CHANNEL_FLASH_DURATION_S
-            self._data_flash_recent = [
+            # Slice-assign so the canvas-owned list keeps the same
+            # identity — reassigning to a fresh list would break the
+            # alias and our updates would land on a list nobody else
+            # references.
+            self._data_flash_recent[:] = [
                 e for e in self._data_flash_recent if e[0] >= cutoff
             ][-6:]
         self.update()
@@ -1583,7 +1612,11 @@ class DeviceItem(QGraphicsItem):
         self._paint_signal_line(painter, _HEADER_H + 4)
 
         # Pkt count + channels — single line between the two bars.
-        line = f"{d.packet_count:,} pkts · ch {ch_str}"
+        # ``live_packet_delta`` adds packets attributed since the most
+        # recent reload so the counter ticks live instead of jumping
+        # once per ~2 s reload cycle.
+        pkts = d.packet_count + self._live.live_packet_delta
+        line = f"{pkts:,} pkts · ch {ch_str}"
         painter.drawText(
             QRectF(8, _HEADER_H + 32, _BOX_W - 16, 14),
             Qt.AlignVCenter | Qt.AlignLeft, line,
@@ -1853,7 +1886,8 @@ class DeviceItem(QGraphicsItem):
             line(f"class: {d.device_class}")
         if d.appearance is not None:
             line(f"appearance: 0x{d.appearance:04X}")
-        line(f"pkts: {d.packet_count:,} (adv {d.adv_count:,}, data {d.data_count:,})")
+        pkts_total = d.packet_count + self._live.live_packet_delta
+        line(f"pkts: {pkts_total:,} (adv {d.adv_count:,}, data {d.data_count:,})")
         line(f"rssi: {rssi}")
 
         # Identity strings — show every name source so it's obvious which
@@ -2337,6 +2371,12 @@ class CanvasWindow(QMainWindow):
         # _stop_live. None outside of an active capture session.
         self._stall_watchdog = None
         self._reload_tick = 0       # increments per timer fire; reload() runs every Nth
+        # Per-device live state surviving scene.clear() during reload:
+        # rolling-window samples for Signal/Quality, channel-flash tails,
+        # and a live packet-count delta on top of the DB total. See
+        # ``_DeviceLiveState``. Pruned in reload() to drop entries for
+        # devices that have fallen out of load_canvas_devices.
+        self._live_state: dict[int, _DeviceLiveState] = {}
         # Wall-clock at the moment the most recent capture session ended,
         # or None while a session is active (or before the first Start).
         # Used by the top "Devices" section to FREEZE opacity-fade — top
@@ -2602,6 +2642,21 @@ class CanvasWindow(QMainWindow):
             self.store, self.project_id, stale_cutoff=cutoff,
         )
 
+        # Prune _live_state to the devices we just loaded, and zero the
+        # live packet delta on survivors — the fresh DB count already
+        # includes everything that was attributed since the last reload,
+        # so the delta starts again from 0 and ticks up between reloads.
+        # Rolling-window samples and channel-flash tails carry across
+        # untouched; they're time-decayed by their own pruning logic.
+        live_ids = {d.device_id for d in devs}
+        self._live_state = {
+            dev_id: state
+            for dev_id, state in self._live_state.items()
+            if dev_id in live_ids
+        }
+        for state in self._live_state.values():
+            state.live_packet_delta = 0
+
         # Partition into the two sections. Section assignment is
         # structural (see ``is_stable_device``) — when a device
         # migrates between sections (typically because the cluster
@@ -2691,6 +2746,9 @@ class CanvasWindow(QMainWindow):
             item = DeviceItem(
                 d, self._persist_device,
                 context_cb=self._device_context_menu,
+                live_state=self._live_state.setdefault(
+                    d.device_id, _DeviceLiveState(),
+                ),
             )
             item.setOpacity(opacity_for_recency(
                 d.last_seen, top_now, dormant_s=self._stale_window_s,
@@ -2700,6 +2758,9 @@ class CanvasWindow(QMainWindow):
             item = DeviceItem(
                 d, self._persist_device,
                 context_cb=self._device_context_menu,
+                live_state=self._live_state.setdefault(
+                    d.device_id, _DeviceLiveState(),
+                ),
             )
             item.setOpacity(opacity_for_recency(
                 d.last_seen, now_ts, dormant_s=self._stale_window_s,

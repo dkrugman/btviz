@@ -2134,49 +2134,62 @@ class ProjectPicker(QDialog):
 # ──────────────────────────────────────────────────────────────────────────
 
 class _ClusterWorker(QObject):
-    """Runs ``ClusterRunner.run_once`` on a worker QThread.
+    """Persistent worker that runs ``ClusterRunner.run_once`` on a
+    worker QThread.
 
-    Cluster analysis is O(N²) over same-class device pairs and on
-    realistic captures (4000+ apple_device RPAs in a long session)
-    can take many seconds. Doing it inline on the main thread froze
-    the UI hard enough that users assumed the program had crashed.
+    Lifetime model: created once at canvas startup, lives for the
+    entire window. Each cluster pass dispatches a ``run_request``
+    invocation via a queued signal connection from the canvas; the
+    worker runs the pass on its own thread, emits ``finished`` (or
+    ``failed``), then sits idle in its event loop waiting for the
+    next request.
 
-    The worker opens its own sqlite3 connection in its own thread —
-    the main thread's connection is bound to the GUI thread and
-    can't be shared. WAL mode (set in ``Store.__init__``) lets the
-    worker read concurrently with whatever the main thread is doing.
-    Persistence of the result is the caller's job and happens back
-    on the main thread once ``finished`` fires.
+    Why persistent rather than per-pass:
+    Earlier designs created a fresh ``QThread`` + ``_ClusterWorker``
+    per tick and tore them down via the ``deleteLater`` chain. Two
+    user-reproducible crashes traced to a Shiboken-vs-Qt ownership
+    race during teardown — Python's wrapper finalizer and Qt's
+    DeferredDelete event would both try to destroy the same C++
+    QObject, just on different threads. Persistent objects avoid
+    the entire teardown question: nothing is destroyed mid-run.
+    Cleanup happens only at canvas close, when the thread is quit
+    and joined deterministically before Python releases anything.
+
+    The worker opens a fresh sqlite3 connection per request and
+    closes it before emitting ``finished``. The main thread's
+    connection is locked to the GUI thread; WAL mode (set in
+    ``Store.__init__``) lets the worker read concurrently with
+    whatever the main thread is doing.
     """
 
     finished = Signal(object)   # RunResult
     failed = Signal(str)        # error message
 
-    def __init__(self, *, ctx_proto, db_path, devices) -> None:
-        super().__init__()
-        self._ctx_proto = ctx_proto
-        self._db_path = db_path
-        self._devices = devices
+    @Slot(object, object, object)
+    def run_request(self, ctx_proto, db_path, devices) -> None:
+        """Execute one cluster pass. Runs on the worker thread.
 
-    @Slot()
-    def run(self) -> None:
+        Receives all inputs as queued-signal arguments rather than
+        reading instance state — keeps the worker stateless between
+        runs and avoids any cross-thread reads of mutable state.
+        """
         try:
             import sqlite3
             from types import SimpleNamespace
             from ..cluster import ClusterRunner
             from ..cluster.base import ClusterContext
 
-            conn = sqlite3.connect(str(self._db_path), isolation_level=None)
+            conn = sqlite3.connect(str(db_path), isolation_level=None)
             conn.row_factory = sqlite3.Row
             try:
                 local_ctx = ClusterContext(
-                    signals=self._ctx_proto.signals,
-                    profiles=self._ctx_proto.profiles,
-                    now=self._ctx_proto.now,
+                    signals=ctx_proto.signals,
+                    profiles=ctx_proto.profiles,
+                    now=ctx_proto.now,
                     db=SimpleNamespace(conn=conn),
                 )
                 runner = ClusterRunner(local_ctx)
-                result = runner.run_once(self._devices)
+                result = runner.run_once(devices)
             finally:
                 conn.close()
             self.finished.emit(result)
@@ -2189,6 +2202,12 @@ class _ClusterWorker(QObject):
 # ──────────────────────────────────────────────────────────────────────────
 
 class CanvasWindow(QMainWindow):
+    # Class-level signal used to dispatch a cluster-analysis request to
+    # the persistent ``_ClusterWorker``. Emission is queued across
+    # threads automatically, so the worker's slot runs on its own
+    # thread regardless of where ``emit`` is called.
+    _dispatch_cluster = Signal(object, object, object)
+
     def __init__(self, store: Store, project_id: int) -> None:
         super().__init__()
         self.store = store
@@ -2276,15 +2295,28 @@ class CanvasWindow(QMainWindow):
         self._cluster_ctx = None
         self._cluster_tick = 0
         self._cluster_period_ticks = 60
-        # Cluster analysis runs on a worker thread (see ``_ClusterWorker``)
-        # so a multi-second pass on a 4000-device class never freezes
-        # the UI. ``_cluster_busy`` gates new dispatches: while a run
-        # is in flight we drop subsequent reload-tick triggers rather
-        # than queueing them, since the data we'd cluster against would
+        # Cluster analysis runs on a worker thread so a multi-second
+        # pass on a 4000-device class never freezes the UI.
+        # ``_cluster_busy`` gates new dispatches: while a run is in
+        # flight we drop subsequent reload-tick triggers rather than
+        # queueing them, since the data we'd cluster against would
         # be the same set the in-flight run is already chewing on.
+        #
+        # Worker + thread are created once and live for the lifetime
+        # of the window. Per-tick spawn/destroy was tried earlier and
+        # produced a Shiboken-vs-Qt double-delete race during teardown
+        # (Python wrapper finalize on main thread vs. Qt DeferredDelete
+        # on worker thread). Persistent objects sidestep the entire
+        # teardown question — only ``closeEvent`` quits + joins the
+        # thread, after which Python release is safe.
         self._cluster_busy = False
-        self._cluster_thread: QThread | None = None
-        self._cluster_worker: _ClusterWorker | None = None
+        self._cluster_thread = QThread(self)
+        self._cluster_worker = _ClusterWorker()
+        self._cluster_worker.moveToThread(self._cluster_thread)
+        self._dispatch_cluster.connect(self._cluster_worker.run_request)
+        self._cluster_worker.finished.connect(self._on_cluster_finished)
+        self._cluster_worker.failed.connect(self._on_cluster_failed)
+        self._cluster_thread.start()
         # Stale-device cutoff in seconds. Devices whose latest
         # observation is older than this are hidden from the canvas AND
         # excluded from the cluster hydrator. ``None`` disables the
@@ -3143,65 +3175,24 @@ class CanvasWindow(QMainWindow):
             self.status.setText(f"  cluster error: {e}")
             return
 
-        # Spin up the worker thread. The ClusterContext we built on
-        # the main thread is passed by reference, but the worker opens
-        # its own sqlite3 connection so cross-thread reads are safe
-        # (the main connection is locked to the GUI thread).
-        #
-        # Lifetime wiring carefully avoids a known PySide6 footgun:
-        # if ``worker.deleteLater`` is connected to ``worker.finished``,
-        # the DeferredDelete event lands in the worker thread's queue
-        # while ``_on_cluster_finished`` is simultaneously dropping
-        # the Python wrapper's last refcount on the main thread. That
-        # races: Shiboken thinks Python owns the C++ object and
-        # ``delete``s it from the main thread, then the worker
-        # thread's event loop dereferences a freed pointer when it
-        # processes the still-queued DeferredDelete. The crash that
-        # taught us this had ``QObject::~QObject`` on the worker
-        # thread and ``pysqlite_cursor_fetchall`` on the main thread.
-        #
-        # Fix: ``worker.deleteLater`` is connected to ``thread.finished``
-        # so the worker is destroyed only after the event loop has
-        # fully exited and any pending events are drained. Python ref
-        # cleanup (``self._cluster_worker = None``) happens in a
-        # ``thread.finished`` slot, AFTER Qt is done with the C++
-        # object — never inside a slot that fires while the worker
-        # thread is still running.
+        # Dispatch the request to the persistent worker. The signal's
+        # queued connection guarantees ``run_request`` runs on the
+        # worker thread, never on the main thread. ``_cluster_busy``
+        # is cleared by the matched ``finished`` / ``failed`` slot.
         self._cluster_busy = True
-        thread = QThread(self)
-        worker = _ClusterWorker(
-            ctx_proto=self._cluster_ctx,
-            db_path=self.store.path,
-            devices=devices,
+        self._dispatch_cluster.emit(
+            self._cluster_ctx, self.store.path, devices,
         )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._on_cluster_finished)
-        worker.failed.connect(self._on_cluster_failed)
-        worker.finished.connect(thread.quit)
-        worker.failed.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_cluster_thread_done)
-        self._cluster_thread = thread
-        self._cluster_worker = worker
-        thread.start()
 
     @Slot(object)
     def _on_cluster_finished(self, result) -> None:
         """Worker delivered a RunResult. Persist + show status.
 
-        Runs on the main thread (Qt queues signal across threads).
-        SQLite writes via ``self.repos.clusters.apply_run`` are bound
-        to the main thread's connection, which is exactly what we
-        want.
-
-        Does NOT null ``self._cluster_thread`` / ``self._cluster_worker``
-        — that's deferred to ``_on_cluster_thread_done`` which fires
-        on ``thread.finished``, after the worker thread has fully
-        exited and Qt has had a chance to delete the C++ objects via
-        the ``deleteLater`` chain. Releasing the Python wrappers here
-        races with the worker thread's still-pending events.
+        Runs on the main thread (the worker emits across threads, Qt
+        queues the slot invocation here). SQLite writes via
+        ``self.repos.clusters.apply_run`` are bound to the main
+        thread's connection — that's the side that owns the writable
+        connection.
         """
         self._cluster_busy = False
         try:
@@ -3228,23 +3219,8 @@ class CanvasWindow(QMainWindow):
 
     @Slot(str)
     def _on_cluster_failed(self, msg: str) -> None:
-        # See ``_on_cluster_finished`` re: not nulling the references
-        # here. ``_on_cluster_thread_done`` does that after the thread
-        # has fully exited.
         self._cluster_busy = False
         self.status.setText(f"  cluster error: {msg}")
-
-    @Slot()
-    def _on_cluster_thread_done(self) -> None:
-        """Drop Python references to the worker / thread.
-
-        Connected to ``thread.finished``; runs on the main thread
-        after the worker thread's event loop has exited and after
-        the queued ``deleteLater`` events have processed the C++
-        objects. Safe to release wrappers now.
-        """
-        self._cluster_thread = None
-        self._cluster_worker = None
 
     def _on_live_packet(
         self, source: str, channel: int | None, crc_ok: bool = True,
@@ -3511,11 +3487,11 @@ class CanvasWindow(QMainWindow):
         # leak FIFOs or extcap processes when the window closes.
         if self._live is not None and self._live.running:
             self._stop_live()
-        # Wait briefly for an in-flight cluster pass so we don't drop
-        # results or hit deleteLater on a still-running thread. The
-        # worker's ``run`` is bounded by the per-class cap, so a 2-s
-        # timeout is plenty for normal captures and tolerable for the
-        # outlier where the user closes mid-pass.
+        # Stop the persistent cluster worker thread cleanly: quit its
+        # event loop and wait for the underlying pthread to exit
+        # before Python releases anything. After ``wait`` returns, no
+        # one else can touch the worker QObject, so Shiboken's
+        # finalizer can destroy the C++ wrapper safely.
         if self._cluster_thread is not None:
             self._cluster_thread.quit()
             self._cluster_thread.wait(2000)

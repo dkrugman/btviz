@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QPushButton, QSizePolicy, QWidget
+from PySide6.QtWidgets import QLabel, QSizePolicy, QWidget
 
 from ..db.models import Sniffer
 from ..db.repos import Repos
@@ -52,15 +52,17 @@ _PANEL_W = 320                 # expanded-panel width (px); widened from
 _DOT_SIZE = 12
 _ROW_H = 52                    # row pitch (same in both states so dots
                                # don't jump vertically when expanding)
-# Refresh button at the top of the panel — moved here from the canvas
-# toolbar in 2026-04 because the action's results land in this panel
-# (sniffer rows reload), so co-locating control + result removes the
-# trip to the toolbar's overflow menu.
-_REFRESH_BTN_TOP = 6
-_REFRESH_BTN_H = 22
-_REFRESH_BTN_BOTTOM_PAD = 8
+# Session timer at the top of the panel. Replaced the original
+# "Refresh" button — refresh duplicated discovery work that Start
+# Capture already does, and after PR #76 (pyserial discovery) the
+# slow / fast paths converged so the redundant button stopped having
+# distinct value. The session timer reuses the same vertical slot
+# so existing layout math (``_TOP_PAD``, dot Y-positions) is unchanged.
+_TIMER_TOP = 6
+_TIMER_H = 22
+_TIMER_BOTTOM_PAD = 8
 _TOP_PAD = (
-    _REFRESH_BTN_TOP + _REFRESH_BTN_H + _REFRESH_BTN_BOTTOM_PAD
+    _TIMER_TOP + _TIMER_H + _TIMER_BOTTOM_PAD
 )
 _CHEVRON_W = 14
 _CHEVRON_H = 28
@@ -177,11 +179,6 @@ class SnifferPanel(QWidget):
     # Emitted when the user toggles expansion. The CanvasWindow can use
     # this to e.g. re-size the scene viewport, save state to DB, etc.
     expansionChanged = Signal(bool)
-    # Emitted when the user clicks the panel-top "Refresh" button.
-    # Wired to the canvas's ``_refresh_sniffers`` so a click re-runs
-    # USB discovery; co-locating the control with the panel that
-    # displays the result removes a trip to the toolbar.
-    refreshRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None,
                  store: Store | None = None) -> None:
@@ -269,15 +266,36 @@ class SnifferPanel(QWidget):
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
-        # Refresh button at the top — fires ``refreshRequested`` so
-        # the canvas can re-run USB discovery. Geometry is set in
-        # ``resizeEvent`` so it tracks the panel's collapsed/expanded
-        # width.
-        self._refresh_btn = QPushButton("Refresh", self)
-        self._refresh_btn.setToolTip(
-            "Re-run USB sniffer discovery and refresh the rows below."
+        # Session timer at the top — replaces the old Refresh button.
+        # Driven by ``start_session_timer`` / ``stop_session_timer``
+        # called from the canvas at capture-start / -stop. Geometry
+        # is set in ``resizeEvent`` so it tracks the panel's
+        # collapsed / expanded width.
+        self._session_label = QLabel("00:00:00", self)
+        self._session_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._session_label.setToolTip(
+            "Elapsed time of the current capture session. Resets on the "
+            "next Start Capture. Freezes at the final value when capture "
+            "stops so the session length is visible afterward."
         )
-        self._refresh_btn.clicked.connect(self.refreshRequested.emit)
+        sf = self._session_label.font()
+        sf.setBold(True)
+        sf.setPointSize(11)
+        # Tabular nums + a monospace-ish family so the digits don't
+        # jiggle every second. Qt picks the platform default mono.
+        sf.setStyleHint(QFont.StyleHint.Monospace)
+        self._session_label.setFont(sf)
+        self._session_label.setStyleSheet(
+            "QLabel { color: rgb(120, 120, 130); }"
+        )
+        # Timer state. ``_session_start_ts`` is None outside an active
+        # session; ``_session_frozen_ts`` holds the last value shown
+        # so the label persists after stop until the next start.
+        self._session_start_ts: float | None = None
+        self._session_frozen_ts: float | None = None
+        self._session_tick = QTimer(self)
+        self._session_tick.setInterval(1000)  # 1 Hz is plenty
+        self._session_tick.timeout.connect(self._update_session_label)
 
         self.refresh()
 
@@ -393,6 +411,81 @@ class SnifferPanel(QWidget):
             return
         self._stuck_serials = set(serials)
         self.update()
+
+    # --- session timer -----------------------------------------------
+
+    def start_session_timer(self, start_ts: float) -> None:
+        """Begin counting up from ``start_ts`` (epoch seconds).
+
+        Called from ``CanvasWindow._start_live`` at the moment a
+        live capture session starts. The label updates every second
+        until ``stop_session_timer`` is called.
+        """
+        self._session_start_ts = start_ts
+        self._session_frozen_ts = None
+        self._session_label.setStyleSheet(
+            "QLabel { color: rgb(40, 110, 60); }"      # green: live
+        )
+        self._update_session_label()
+        if not self._session_tick.isActive():
+            self._session_tick.start()
+
+    def stop_session_timer(self) -> None:
+        """Freeze the timer at the just-elapsed value and stop ticking.
+
+        The label keeps showing the final duration (so the user can
+        see how long their session ran) until the next
+        ``start_session_timer`` resets it. Idempotent — calling
+        twice is a no-op.
+        """
+        if self._session_start_ts is None:
+            return
+        import time as _time
+        self._session_frozen_ts = _time.time() - self._session_start_ts
+        self._session_start_ts = None
+        self._session_tick.stop()
+        self._session_label.setStyleSheet(
+            "QLabel { color: rgb(120, 120, 130); }"    # grey: ended
+        )
+        self._update_session_label()
+
+    def reset_session_timer(self) -> None:
+        """Clear the label entirely. Used when starting fresh."""
+        self._session_start_ts = None
+        self._session_frozen_ts = None
+        self._session_tick.stop()
+        self._session_label.setText("00:00:00")
+        self._session_label.setStyleSheet(
+            "QLabel { color: rgb(120, 120, 130); }"
+        )
+
+    def _update_session_label(self) -> None:
+        """Refresh the displayed elapsed time.
+
+        Format: ``HH:MM:SS`` for sessions ≤ 99 hours, beyond that
+        ``Nd HH:MM:SS``. No millisecond precision — at 1 Hz it'd
+        flicker without adding information.
+        """
+        import time as _time
+        if self._session_start_ts is not None:
+            elapsed = _time.time() - self._session_start_ts
+        elif self._session_frozen_ts is not None:
+            elapsed = self._session_frozen_ts
+        else:
+            self._session_label.setText("00:00:00")
+            return
+        elapsed = max(0.0, elapsed)
+        days, rem = divmod(int(elapsed), 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, seconds = divmod(rem, 60)
+        if days > 0:
+            self._session_label.setText(
+                f"{days}d {hours:02d}:{minutes:02d}:{seconds:02d}"
+            )
+        else:
+            self._session_label.setText(
+                f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            )
 
     def is_expanded(self) -> bool:
         return self._expanded
@@ -843,19 +936,19 @@ class SnifferPanel(QWidget):
     # --- mouse handling ------------------------------------------------
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
-        """Keep the Refresh button spanning the panel width.
+        """Keep the session timer spanning the panel width.
 
         The panel width changes between collapsed (``_STRIP_W``) and
-        expanded (``_PANEL_W``); we resize the button on every event
-        rather than tracking expansion separately so it stays in sync
-        even on the initial show.
+        expanded (``_PANEL_W``); we resize the timer label on every
+        event rather than tracking expansion separately so it stays
+        in sync even on the initial show.
         """
         super().resizeEvent(event)
-        self._refresh_btn.setGeometry(
+        self._session_label.setGeometry(
             4,
-            _REFRESH_BTN_TOP,
+            _TIMER_TOP,
             self.width() - 8,
-            _REFRESH_BTN_H,
+            _TIMER_H,
         )
 
     def mousePressEvent(self, event) -> None:  # noqa: N802

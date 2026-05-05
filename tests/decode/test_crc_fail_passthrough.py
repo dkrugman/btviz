@@ -110,6 +110,31 @@ class DecodePathTests(unittest.TestCase):
         self.assertEqual(decoded.rssi, -60)
         self.assertIsNone(decoded.adv_addr)
 
+    def test_nbe_crc_failed_short_packet_still_returns_placeholder(self):
+        # Real-world capture: Nordic firmware reports CRC-failed frames
+        # whose total length (30 bytes here) is below the CRC-OK minimum
+        # of 32. Previously the length gate fired before the flags
+        # check and returned None — silently dropping every short
+        # CRC-failed packet from live capture. Confirm we route through
+        # the placeholder path and surface channel + RSSI.
+        full = _nbe_buf(crc_ok=False, channel=38)
+        # Truncate to 30 bytes (17 header + 13 LL fragment) — same
+        # length pattern observed in the live-decode reject log.
+        short = full[:30]
+        self.assertEqual(len(short), 30)
+        decoded = decode_nbe_packet(short)
+        self.assertIsNotNone(decoded)
+        self.assertFalse(decoded.crc_ok)
+        self.assertEqual(decoded.channel, 38)
+        self.assertEqual(decoded.rssi, -60)
+
+    def test_nbe_crc_ok_short_packet_still_rejected(self):
+        # CRC-OK path still requires a full LL frame — a truncated
+        # CRC-OK buffer can't be safely parsed and must return None.
+        full = _nbe_buf(crc_ok=True)
+        short = full[:30]
+        self.assertIsNone(decode_nbe_packet(short))
+
 
 class RecordPacketGatingTests(unittest.TestCase):
     """``record_packet`` must skip CRC-failed packets to avoid ghost RPAs."""

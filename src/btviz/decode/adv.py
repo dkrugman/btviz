@@ -161,12 +161,19 @@ def decode_nbe_packet(buf: bytes) -> DecodedAdv | None:
     ``pkt.crc_ok`` before spawning a device row, while the sniffer
     panel still gets to see the packet for its dropout flash.
     """
-    if len(buf) < _NBE_HDR_LEN + 4 + 2 + 6 + 3:
+    # Need the pseudo-header to read flags/channel/RSSI. The full
+    # LL-frame minimum is checked below, but only on the CRC-OK path
+    # — short CRC-failed frames (e.g. a 30-byte truncated capture)
+    # are still useful for the panel dropout flash and must be routed
+    # through _crc_fail_placeholder rather than silently dropped.
+    if len(buf) < _NBE_HDR_LEN:
         return None
     rf_channel = buf[9]
     rssi_dbm = -buf[10]
     if not (buf[_NBE_FLAGS_OFFSET] & _NBE_FLAG_CRC_OK):
         return _crc_fail_placeholder(rf_channel, rssi_dbm)
+    if len(buf) < _NBE_HDR_LEN + 4 + 2 + 6 + 3:
+        return None
     return _decode_ll(buf[_NBE_HDR_LEN:], channel=rf_channel, rssi=rssi_dbm)
 
 

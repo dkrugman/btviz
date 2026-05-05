@@ -17,7 +17,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import (
+    QObject,
+    QPointF,
+    QRectF,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -2121,6 +2130,61 @@ class ProjectPicker(QDialog):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Cluster analysis worker
+# ──────────────────────────────────────────────────────────────────────────
+
+class _ClusterWorker(QObject):
+    """Runs ``ClusterRunner.run_once`` on a worker QThread.
+
+    Cluster analysis is O(N²) over same-class device pairs and on
+    realistic captures (4000+ apple_device RPAs in a long session)
+    can take many seconds. Doing it inline on the main thread froze
+    the UI hard enough that users assumed the program had crashed.
+
+    The worker opens its own sqlite3 connection in its own thread —
+    the main thread's connection is bound to the GUI thread and
+    can't be shared. WAL mode (set in ``Store.__init__``) lets the
+    worker read concurrently with whatever the main thread is doing.
+    Persistence of the result is the caller's job and happens back
+    on the main thread once ``finished`` fires.
+    """
+
+    finished = Signal(object)   # RunResult
+    failed = Signal(str)        # error message
+
+    def __init__(self, *, ctx_proto, db_path, devices) -> None:
+        super().__init__()
+        self._ctx_proto = ctx_proto
+        self._db_path = db_path
+        self._devices = devices
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            import sqlite3
+            from types import SimpleNamespace
+            from ..cluster import ClusterRunner
+            from ..cluster.base import ClusterContext
+
+            conn = sqlite3.connect(str(self._db_path), isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            try:
+                local_ctx = ClusterContext(
+                    signals=self._ctx_proto.signals,
+                    profiles=self._ctx_proto.profiles,
+                    now=self._ctx_proto.now,
+                    db=SimpleNamespace(conn=conn),
+                )
+                runner = ClusterRunner(local_ctx)
+                result = runner.run_once(self._devices)
+            finally:
+                conn.close()
+            self.finished.emit(result)
+        except Exception as e:  # noqa: BLE001 — surface as failed signal
+            self.failed.emit(repr(e))
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Main window
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -2212,6 +2276,15 @@ class CanvasWindow(QMainWindow):
         self._cluster_ctx = None
         self._cluster_tick = 0
         self._cluster_period_ticks = 60
+        # Cluster analysis runs on a worker thread (see ``_ClusterWorker``)
+        # so a multi-second pass on a 4000-device class never freezes
+        # the UI. ``_cluster_busy`` gates new dispatches: while a run
+        # is in flight we drop subsequent reload-tick triggers rather
+        # than queueing them, since the data we'd cluster against would
+        # be the same set the in-flight run is already chewing on.
+        self._cluster_busy = False
+        self._cluster_thread: QThread | None = None
+        self._cluster_worker: _ClusterWorker | None = None
         # Stale-device cutoff in seconds. Devices whose latest
         # observation is older than this are hidden from the canvas AND
         # excluded from the cluster hydrator. ``None`` disables the
@@ -3028,16 +3101,26 @@ class CanvasWindow(QMainWindow):
             self._publish_sniffer_channels()
 
     def _run_cluster_tick(self) -> None:
-        """Hydrate devices, run the cluster aggregator, persist results.
+        """Dispatch a cluster pass to the worker thread.
 
-        Wrapped in a broad try/except because the cluster framework is
-        new and we don't want a runner crash to take down live capture.
-        Failures land in the toolbar status, not as exceptions.
+        The heavy work (signal evaluation across O(N²) pairs) runs in
+        ``_ClusterWorker.run`` on a ``QThread``; the UI returns to its
+        event loop immediately. Persistence + status update happen on
+        the main thread in ``_on_cluster_finished`` once the worker
+        emits ``finished``.
+
+        If a previous run is still in flight we drop the new tick.
+        Cluster cadence is one pass every 15 s by default — by the
+        time the next tick fires, the in-flight run has either
+        finished (cleared ``_cluster_busy``) or hasn't, in which case
+        skipping is correct because we'd be re-clustering the same
+        device set.
         """
+        if self._cluster_busy:
+            return
         try:
             from ..cluster import (
-                ClusterContext, ClusterRunner,
-                load_devices, load_profiles, load_signals,
+                ClusterContext, load_devices, load_profiles, load_signals,
             )
             if self._cluster_ctx is None:
                 self._cluster_ctx = ClusterContext(
@@ -3056,21 +3139,74 @@ class CanvasWindow(QMainWindow):
             )
             if not devices:
                 return
+        except Exception as e:  # noqa: BLE001
+            self.status.setText(f"  cluster error: {e}")
+            return
 
-            runner = ClusterRunner(self._cluster_ctx)
-            result = runner.run_once(devices)
+        # Spin up the worker thread. The ClusterContext we built on
+        # the main thread is passed by reference, but the worker opens
+        # its own sqlite3 connection so cross-thread reads are safe
+        # (the main connection is locked to the GUI thread).
+        self._cluster_busy = True
+        thread = QThread(self)
+        worker = _ClusterWorker(
+            ctx_proto=self._cluster_ctx,
+            db_path=self.store.path,
+            devices=devices,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_cluster_finished)
+        worker.failed.connect(self._on_cluster_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._cluster_thread = thread
+        self._cluster_worker = worker
+        thread.start()
+
+    @Slot(object)
+    def _on_cluster_finished(self, result) -> None:
+        """Worker delivered a RunResult. Persist + show status.
+
+        Runs on the main thread (Qt queues signal across threads).
+        SQLite writes via ``self.repos.clusters.apply_run`` are bound
+        to the main thread's connection, which is exactly what we
+        want.
+        """
+        self._cluster_busy = False
+        self._cluster_thread = None
+        self._cluster_worker = None
+        try:
             written = self.repos.clusters.apply_run(
                 result.merge_decisions, time.time(),
             )
-            self._cluster_tick += 1
-            if result.merge_decisions:
-                self.status.setText(
-                    f"  clusters: {result.devices_in} → "
-                    f"{result.cluster_count} ({written} groups, "
-                    f"{result.elapsed_s:.2f}s)"
-                )
-        except Exception as e:  # noqa: BLE001 — never let cluster crash live capture
+        except Exception as e:  # noqa: BLE001
             self.status.setText(f"  cluster error: {e}")
+            return
+        self._cluster_tick += 1
+        parts: list[str] = []
+        if result.merge_decisions:
+            parts.append(
+                f"clusters: {result.devices_in} → {result.cluster_count} "
+                f"({written} groups, {result.elapsed_s:.2f}s)"
+            )
+        if result.skipped_classes:
+            skipped = ", ".join(
+                f"{cls} ({n})" for cls, n in result.skipped_classes
+            )
+            parts.append(f"skipped: {skipped}")
+        if parts:
+            self.status.setText("  " + " · ".join(parts))
+
+    @Slot(str)
+    def _on_cluster_failed(self, msg: str) -> None:
+        self._cluster_busy = False
+        self._cluster_thread = None
+        self._cluster_worker = None
+        self.status.setText(f"  cluster error: {msg}")
 
     def _on_live_packet(
         self, source: str, channel: int | None, crc_ok: bool = True,
@@ -3337,6 +3473,14 @@ class CanvasWindow(QMainWindow):
         # leak FIFOs or extcap processes when the window closes.
         if self._live is not None and self._live.running:
             self._stop_live()
+        # Wait briefly for an in-flight cluster pass so we don't drop
+        # results or hit deleteLater on a still-running thread. The
+        # worker's ``run`` is bounded by the per-class cap, so a 2-s
+        # timeout is plenty for normal captures and tolerable for the
+        # outlier where the user closes mid-pass.
+        if self._cluster_thread is not None:
+            self._cluster_thread.quit()
+            self._cluster_thread.wait(2000)
         super().closeEvent(event)
 
     def _refresh_sniffers(self) -> None:

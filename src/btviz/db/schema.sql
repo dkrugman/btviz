@@ -261,7 +261,9 @@ CREATE TABLE sniffers (
     removed         INTEGER NOT NULL DEFAULT 0,
     first_seen      REAL NOT NULL,
     last_seen       REAL NOT NULL,
-    notes           TEXT
+    notes           TEXT,
+    stall_count     INTEGER NOT NULL DEFAULT 0,           -- v6, capture stall watchdog
+    last_stall_at   REAL                                   -- v6, epoch of most recent stall
 );
 CREATE INDEX idx_sniffers_active ON sniffers(is_active, removed);
 CREATE INDEX idx_sniffers_location ON sniffers(location_id_hex);

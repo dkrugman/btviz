@@ -249,6 +249,10 @@ class SnifferPanel(QWidget):
         # tooltip — visually nothing changes today, the dot stays gray
         # because no packets flow.
         self._extcap_unreachable: set[str] = set()
+        # Serial numbers the capture watchdog has given up on (3
+        # restart attempts failed → replug required). Surfaced as a
+        # red "STALL ×N — replug" badge instead of the amber default.
+        self._stuck_serials: set[str] = set()
 
         # Repaint timer — keeps the flash decay smooth without us having
         # to push frames from the bus thread. Runs only while the panel
@@ -375,6 +379,19 @@ class SnifferPanel(QWidget):
         if self._extcap_unreachable == serials:
             return
         self._extcap_unreachable = set(serials)
+        self.update()
+
+    def set_stuck_serials(self, serials: set[str]) -> None:
+        """Mark sniffers the capture watchdog has given up on.
+
+        After 3 failed restart attempts the watchdog stops trying.
+        The badge upgrades from amber "STALL ×N" to red
+        "STALL ×N — replug". Pass an empty set to clear (called on
+        capture stop / on user-initiated reset).
+        """
+        if self._stuck_serials == serials:
+            return
+        self._stuck_serials = set(serials)
         self.update()
 
     def is_expanded(self) -> bool:
@@ -757,6 +774,27 @@ class SnifferPanel(QWidget):
         p.drawText(QRectF(x, top + 2 * line_h, _TEXT_W, line_h),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    _truncate(port_str, 32))
+
+        # STALL badge — surfaces lifetime stall_count from the
+        # sniffers row when > 0. Token "STALL" matches what the
+        # capture watchdog logs to ~/.btviz/capture.log so the user
+        # sees the badge → greps the log → finds the events.
+        # Stuck state (watchdog gave up, replug required) gets red
+        # styling and "replug" suffix.
+        if (s.stall_count or 0) > 0:
+            stall_color = QColor(220, 80, 80) if s.serial_number in self._stuck_serials \
+                else QColor(190, 130, 30)
+            badge_text = f"STALL ×{s.stall_count}"
+            if s.serial_number in self._stuck_serials:
+                badge_text += " — replug"
+            stall_font = QFont(); stall_font.setBold(True); stall_font.setPointSize(8)
+            p.setFont(stall_font)
+            p.setPen(QPen(stall_color))
+            p.drawText(
+                QRectF(x, top + 3 * line_h - 2, _TEXT_W, line_h),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                badge_text,
+            )
 
     def _paint_chevron(self, p: QPainter) -> None:
         """Acrobat-style chevron tab on the inner edge of the panel.

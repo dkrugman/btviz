@@ -32,6 +32,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +84,17 @@ class SnifferState:
     follow_target: str | None = None      # "aa:bb:... (public|random)"
     running: bool = False
     last_error: str | None = None
+    # Wallclock time (epoch seconds) of the most recent successful
+    # packet read from this sniffer's capture FIFO. ``None`` until
+    # the first packet arrives or after a fresh subprocess spawn —
+    # the watchdog (see ``btviz.capture.watchdog``) treats ``None``
+    # as a grace period so it doesn't fire the moment a sniffer
+    # starts. Updated by ``_capture_loop`` on every record.
+    last_packet_ts: float | None = None
+    # Wallclock time the subprocess began. Combined with
+    # ``last_packet_ts`` so the watchdog can grace-period a
+    # newly-spawned sniffer.
+    started_at: float | None = None
 
 
 @dataclass
@@ -222,6 +234,8 @@ class SnifferProcess:
         self._write_ctrl(CTRL_ARG_NONE, CTRL_CMD_INIT, "")
 
         self.state.running = True
+        self.state.started_at = time.time()
+        self.state.last_packet_ts = None
         self.state.adv_hop = list(adv_hop)
         self.state.role = "follow" if follow_address else "scan"
         self.state.follow_target = (
@@ -369,6 +383,12 @@ class SnifferProcess:
                         source=self._dongle.short_id,
                         meta={"dlt": dlt},
                     )
+                    # Wallclock — distinct from pkt.ts which comes
+                    # from the pcap record header. The watchdog
+                    # compares this to ``time.time()``; using the
+                    # pcap ts would not work if the firmware clock
+                    # drifts.
+                    self.state.last_packet_ts = time.time()
                     self._on_packet(self._dongle, pkt)
             except Exception as e:  # noqa: BLE001
                 self.state.last_error = repr(e)

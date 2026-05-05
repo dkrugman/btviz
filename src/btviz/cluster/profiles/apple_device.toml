@@ -11,15 +11,28 @@ min_total_weight = 0.40
 # don't need supporting signals to merge. Solves the apple_device
 # pair case where two RPAs had matching windows + perfect mfg_data
 # match but the weighted sum landed at 0.56 and abstained.
-decisive_signals = ["apple_continuity", "co_lifespan_match"]
+decisive_signals = [
+    "apple_continuity",
+    "co_lifespan_match",
+    "continuity_seq_carryover",
+]
 
 [apple_device.weights]
-apple_continuity  = 0.55
-co_lifespan_match = 0.15
-mfg_data_prefix   = 0.20
-service_uuid_match = 0.05
-adv_interval      = 0.05
-rssi_signature    = 0.00
+apple_continuity         = 0.55
+co_lifespan_match        = 0.15
+mfg_data_prefix          = 0.20
+service_uuid_match       = 0.05
+adv_interval             = 0.05
+rssi_signature           = 0.00
+# continuity_seq_carryover (Martin et al, "Handoff All Your Privacy")
+# fires only when both devices have Handoff TLVs in the recent
+# window — most pairs see no signal here. When it does fire it's
+# near-deterministic same-device, hence the high weight and inclusion
+# in decisive_signals: a clean carry-over hit alone is enough to
+# merge regardless of what the lifespan signal is doing. This is the
+# primary defense against the co_lifespan_match overconfidence on
+# short captures.
+continuity_seq_carryover = 0.40
 
 [apple_device.params.apple_continuity]
 # Production default — long Continuity payloads (Handoff, NearbyInfo
@@ -27,3 +40,14 @@ rssi_signature    = 0.00
 # length that a byte-for-byte match between two devices is essentially
 # never coincidence.
 min_fingerprint_bytes = 8
+
+[apple_device.params.continuity_seq_carryover]
+# Tolerate up to 5 missed handoff increments between the two
+# observations being matched. Rationale: Handoff seq increments at
+# 275–630 events per active user per day (Martin et al fig 9) ≈
+# one per 2-5 min. Any meaningful gap usually means we missed a
+# packet at the rotation boundary, not that they're different
+# devices. ``max_dt_s`` caps the time window for a candidate
+# carry-over at 10 min (the typical Apple RPA cycle).
+max_seq_gap = 5
+max_dt_s    = 600.0

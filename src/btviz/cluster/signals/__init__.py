@@ -25,24 +25,50 @@ from __future__ import annotations
 from ..base import Signal
 from .apple_continuity import AppleContinuity
 from .co_lifespan_match import CoLifespanMatch
+from .continuity_seq_carryover import ContinuitySeqCarryover
 from .mfg_data_prefix import MfgDataPrefix
 from .rotation_cohort import RotationCohort
 from .service_uuid_match import ServiceUuidMatch
 
 
 def load_signals() -> dict[str, Signal]:
-    return {sig.name: sig for sig in (
+    """Build the {name: signal} mapping for the current run.
+
+    Honors per-signal enable/disable flags from preferences
+    (``cluster.signals.<name>``). A disabled signal is omitted from
+    the returned mapping entirely — the runner won't query it, the
+    aggregator can't weight it, profiles silently ignore the missing
+    weight entry. Toggling requires app restart since signals are
+    cached on the canvas's ClusterContext.
+
+    Falls back to "all enabled" if the preferences module isn't
+    available (e.g., during early bootstrap or in tests that drive
+    the cluster framework without a running app).
+    """
+    candidates = (
         RotationCohort(),
         ServiceUuidMatch(),
         MfgDataPrefix(),
         AppleContinuity(),
         CoLifespanMatch(),
-    )}
+        ContinuitySeqCarryover(),
+    )
+    try:
+        from ...preferences import get_prefs
+        prefs = get_prefs()
+        return {
+            sig.name: sig
+            for sig in candidates
+            if bool(prefs.get(f"cluster.signals.{sig.name}"))
+        }
+    except Exception:  # noqa: BLE001 — preferences unavailable
+        return {sig.name: sig for sig in candidates}
 
 
 __all__ = [
     "AppleContinuity",
     "CoLifespanMatch",
+    "ContinuitySeqCarryover",
     "MfgDataPrefix",
     "RotationCohort",
     "ServiceUuidMatch",

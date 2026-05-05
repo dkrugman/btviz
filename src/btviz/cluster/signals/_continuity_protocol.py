@@ -85,7 +85,9 @@ STABLE_PREFIX_BYTES: dict[int, int] = {
     0x09: 4,   # AirPlaySource: service descriptor stable bytes
     0x0A: 4,   # AirPlayTarget: similar
     0x0B: 2,   # MagicSwitch: top-byte action codes are stable
-    0x0C: 0,   # Handoff: entirely encrypted, no stable prefix (matches via exact full-payload only)
+    0x0C: 3,   # Handoff: clipboard status (1B) + 2-byte seq number are
+               # cleartext per Martin et al, "Handoff All Your Privacy"
+               # §4.2 fig 2. Only the trailing data is encrypted.
     0x0D: 2,   # TetheringTarget: capability bits stable
     0x0E: 2,   # TetheringSource
     0x0F: 4,   # NearbyAction: action type + flags
@@ -299,8 +301,53 @@ def _pairing_variant(n: int) -> str:
     return "unknown_length"
 
 
+def _decode_handoff(payload: bytes) -> dict[str, Any]:
+    """Apple Handoff (type 0x0C). Frame format per Martin et al:
+
+        [Clipboard Status: 1B] [Sequence Number: 2B] [Encrypted data]
+
+    Only the first 3 bytes are cleartext. The 16-bit sequence number
+    increments on user actions in Handoff-enabled apps (open/close,
+    unlock, reboot) and survives RPA rotation, so it's the basis for
+    the ``continuity_seq_carryover`` cluster signal.
+    """
+    if len(payload) < 3:
+        return {}
+    clipboard_status = payload[0]
+    seq = int.from_bytes(payload[1:3], "big")
+    return {
+        "clipboard_status": clipboard_status,
+        "clipboard_has_data": clipboard_status == 0x08,
+        "seq": seq,
+    }
+
+
+def extract_handoff_seq(blob: bytes) -> int | None:
+    """Convenience: pull the Handoff seq from a raw mfg-data blob.
+
+    Returns the 16-bit sequence number when ``blob`` is an Apple-CID
+    payload containing a 0x0C TLV, else None. Cheaper than
+    ``parse_continuity`` for callers that only want the seq.
+    """
+    if len(blob) < 4 or blob[:2] != APPLE_CID_BE:
+        return None
+    i = 2
+    n = len(blob)
+    while i + 1 < n:
+        t = blob[i]
+        length = blob[i + 1]
+        end = i + 2 + length
+        if end > n:
+            return None
+        if t == 0x0C and length >= 3:
+            return int.from_bytes(blob[i + 3:i + 5], "big")
+        i = end
+    return None
+
+
 _DECODERS = {
     0x07: _decode_proximity_pairing,
+    0x0C: _decode_handoff,
     0x10: _decode_nearby_info,
     0x12: _decode_pairing,
 }

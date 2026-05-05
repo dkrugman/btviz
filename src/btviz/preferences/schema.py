@@ -226,6 +226,81 @@ SCHEMA: tuple[Field, ...] = (
         ),
     ),
 
+    # ─── per-signal kill switches ─────────────────────────────────────
+    # Each cluster signal can be disabled here without editing any
+    # profile. Useful when a signal is suspected of contributing
+    # false positives (e.g., co_lifespan_match overconfidence on
+    # short captures) or when validating a new signal in isolation.
+    # Disabled signals are filtered out of ``load_signals()`` at app
+    # start, so changes require a btviz restart.
+    Field(
+        key="cluster.signals.apple_continuity",
+        file="cluster", section="signals", name="apple_continuity",
+        type=bool, default=True, requires_restart=True,
+        label="apple_continuity",
+        description=(
+            "TLV-payload fingerprint match across Apple Continuity "
+            "advertisements. High score on long-payload exact match; "
+            "soft positive on shared type vocabulary."
+        ),
+    ),
+    Field(
+        key="cluster.signals.co_lifespan_match",
+        file="cluster", section="signals", name="co_lifespan_match",
+        type=bool, default=True, requires_restart=True,
+        label="co_lifespan_match",
+        description=(
+            "Per-session window alignment — co-emission and handoff "
+            "timing. Known to be overconfident on short captures "
+            "(every Apple device looks 'concurrent'); consider "
+            "disabling for diagnostic runs."
+        ),
+    ),
+    Field(
+        key="cluster.signals.mfg_data_prefix",
+        file="cluster", section="signals", name="mfg_data_prefix",
+        type=bool, default=True, requires_restart=True,
+        label="mfg_data_prefix",
+        description=(
+            "Manufacturer-data byte prefix match. Looks at stable "
+            "leading bytes of the mfg-data blob across observations."
+        ),
+    ),
+    Field(
+        key="cluster.signals.rotation_cohort",
+        file="cluster", section="signals", name="rotation_cohort",
+        type=bool, default=True, requires_restart=True,
+        label="rotation_cohort",
+        description=(
+            "Temporal handoff scoring — gaps between successive "
+            "addresses' lifespans that match the device's expected "
+            "rotation cadence."
+        ),
+    ),
+    Field(
+        key="cluster.signals.service_uuid_match",
+        file="cluster", section="signals", name="service_uuid_match",
+        type=bool, default=True, requires_restart=True,
+        label="service_uuid_match",
+        description=(
+            "16-bit service-UUID set Jaccard similarity. Strong "
+            "signal for IoT devices with vendor-specific UUIDs."
+        ),
+    ),
+    Field(
+        key="cluster.signals.continuity_seq_carryover",
+        file="cluster", section="signals", name="continuity_seq_carryover",
+        type=bool, default=True, requires_restart=True,
+        label="continuity_seq_carryover",
+        description=(
+            "Apple Handoff sequence-number carry-over across MAC "
+            "rotation (Martin et al, 'Handoff All Your Privacy'). "
+            "Near-deterministic same-device match when the seq "
+            "values line up, but only fires when both devices have "
+            "Handoff observations in the recent window."
+        ),
+    ),
+
     # ─── canvas / display ─────────────────────────────────────────────
     Field(
         key="canvas.stale_window_default_s",

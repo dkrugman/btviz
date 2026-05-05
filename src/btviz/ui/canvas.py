@@ -563,6 +563,13 @@ def load_canvas_devices(
     # ``local_name`` had fallen out of the stale window and wasn't
     # available as a propagation source.
     rename_by_local_all: dict[str, tuple[float, str]] = {}
+    # When two physical devices broadcast the same local_name and the
+    # user has explicitly renamed them differently (e.g. left/right
+    # hearing aids → "Doug HA (L)" vs "Doug HA (R)"), the most-recent
+    # wins is wrong: a fresh RPA from the right HA would inherit the
+    # left's name. Track distinct user_names per local_name and skip
+    # propagation when ambiguous.
+    distinct_names_by_local: dict[str, set[str]] = {}
     for r in conn.execute(
         "SELECT user_name, local_name, last_seen FROM devices"
         " WHERE user_name IS NOT NULL AND local_name IS NOT NULL"
@@ -573,11 +580,13 @@ def load_canvas_devices(
         existing = rename_by_local_all.get(ln)
         if existing is None or ls > existing[0]:
             rename_by_local_all[ln] = (ls, un)
+        distinct_names_by_local.setdefault(ln, set()).add(un)
 
     # Same for cluster-based propagation: pull renamed members of any
     # cluster, even if those members aren't in the current
     # stale-filtered ``devices`` dict.
     rename_by_cluster_all: dict[int, tuple[float, str]] = {}
+    distinct_names_by_cluster: dict[int, set[str]] = {}
     if clusters:
         cluster_ids = list(clusters.keys())
         cph = ",".join("?" * len(cluster_ids))
@@ -593,6 +602,7 @@ def load_canvas_devices(
             existing = rename_by_cluster_all.get(cid)
             if existing is None or ls > existing[0]:
                 rename_by_cluster_all[cid] = (ls, un)
+            distinct_names_by_cluster.setdefault(cid, set()).add(un)
 
     # ---- Rename propagation (cluster-based, most accurate) ---------------
     # For each cluster represented in this canvas reload, propagate the
@@ -604,6 +614,13 @@ def load_canvas_devices(
     for cluster_id, mems in clusters.items():
         live_devs = [devices[did] for did, _ in mems if did in devices]
         if not live_devs:
+            continue
+        # Multiple distinct user_names within one cluster means the user
+        # has labelled cluster members differently (e.g. a stereo pair
+        # incorrectly merged into one cluster, then split apart by
+        # rename). Don't guess — leave each member's stored user_name
+        # as-is.
+        if len(distinct_names_by_cluster.get(cluster_id, ())) > 1:
             continue
         picked = rename_by_cluster_all.get(cluster_id)
         if picked is None:
@@ -626,7 +643,14 @@ def load_canvas_devices(
         for cd in devices.values():
             if cd.user_name:
                 continue
-            picked = rename_by_local_all.get(cd.local_name or "")
+            ln = cd.local_name or ""
+            # Two physical devices that share a local_name and have
+            # been renamed to different things (left/right hearing
+            # aids, stereo earbuds, etc.) are ambiguous from local_name
+            # alone — bail rather than guess.
+            if len(distinct_names_by_local.get(ln, ())) > 1:
+                continue
+            picked = rename_by_local_all.get(ln)
             if picked is not None:
                 cd.user_name = picked[1]
 

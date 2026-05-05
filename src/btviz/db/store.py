@@ -120,9 +120,27 @@ CREATE INDEX idx_sniffers_location ON sniffers(location_id_hex);
 
 
 def default_db_path() -> Path:
+    """Resolve the on-disk DB path.
+
+    Resolution order matches the schema's general policy:
+    ``$BTVIZ_DB_PATH > preferences.general.db_path > platform default``.
+
+    Falling back to the platform default keeps existing CLI / test
+    invocations working when preferences haven't been initialised
+    (e.g. running ``btviz ingest`` against a fresh checkout).
+    """
     override = os.environ.get(DB_PATH_ENV)
     if override:
         return Path(override).expanduser()
+    # Try preferences. Wrapped in try/except so a broken/unbuilt
+    # preferences module never blocks DB access.
+    try:
+        from ..preferences import get_prefs
+        path_str = get_prefs().get("general.db_path")
+        if path_str:
+            return Path(str(path_str)).expanduser()
+    except Exception:  # noqa: BLE001
+        pass
     if sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support" / "btviz"
     elif sys.platform == "win32":

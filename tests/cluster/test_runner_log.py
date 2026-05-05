@@ -220,5 +220,116 @@ class RunnerLogTests(unittest.TestCase):
         self.assertIn("iphone", summary_block)
 
 
+class MaxPerClassCapTests(unittest.TestCase):
+    """Per-class size cap prevents O(N²) blow-up on huge classes."""
+
+    def setUp(self):
+        logger = logging.getLogger("btviz.cluster")
+        for h in list(logger.handlers):
+            logger.removeHandler(h)
+        self.tmp = tempfile.NamedTemporaryFile(
+            "w", suffix=".log", delete=False,
+        )
+        self.tmp.close()
+        self.log_path = Path(self.tmp.name)
+        configure_cluster_log(log_file=self.log_path, max_bytes=1_000_000)
+
+    def tearDown(self):
+        logger = logging.getLogger("btviz.cluster")
+        for h in list(logger.handlers):
+            h.close()
+            logger.removeHandler(h)
+        self.log_path.unlink(missing_ok=True)
+
+    def _ctx(self, signals):
+        return ClusterContext(
+            signals=signals,
+            profiles={
+                "airtag": ClassProfile(
+                    name="airtag",
+                    weights={s.name: 1.0 for s in signals.values()},
+                    threshold=0.5,
+                    min_total_weight=0.5,
+                ),
+            },
+            now=0.0,
+        )
+
+    def test_oversized_class_is_skipped_not_evaluated(self):
+        signals = {"always_merge": _AlwaysMerge()}
+        ctx = self._ctx(signals)
+        # 10 airtags with a cap of 5 → must skip the whole class.
+        devices = [
+            _airtag(i, bytes([i, 0, 0, 0, 0, 0])) for i in range(10)
+        ]
+        runner = ClusterRunner(ctx, max_per_class=5)
+        result = runner.run_once(devices)
+
+        self.assertEqual(result.devices_in, 10)
+        # Zero pairs evaluated — the cap fires *before* iteration.
+        self.assertEqual(result.pairs_evaluated, 0)
+        self.assertEqual(len(result.merge_decisions), 0)
+        # Skipped classes surface in RunResult so the UI can warn.
+        self.assertEqual(result.skipped_classes, [("airtag", 10)])
+        # Devices in skipped classes still appear as 1-element clusters
+        # via the union-find closure pass.
+        self.assertEqual(result.cluster_count, 10)
+        # Log records the skip at WARNING level so it's visible.
+        log_text = self.log_path.read_text(encoding="utf-8")
+        self.assertIn("skipping airtag", log_text)
+        self.assertIn("max_per_class=5", log_text)
+
+    def test_under_cap_class_clusters_normally(self):
+        signals = {"always_merge": _AlwaysMerge()}
+        ctx = self._ctx(signals)
+        devices = [
+            _airtag(i, bytes([i, 0, 0, 0, 0, 0])) for i in range(5)
+        ]
+        runner = ClusterRunner(ctx, max_per_class=5)
+        result = runner.run_once(devices)
+
+        # 5 devices = exactly the cap → still eligible, not skipped.
+        self.assertEqual(result.skipped_classes, [])
+        # C(5,2) = 10 pairs, all merge → one cluster.
+        self.assertEqual(result.pairs_evaluated, 10)
+        self.assertEqual(result.cluster_count, 1)
+
+    def test_mixed_classes_partially_skipped(self):
+        signals = {"always_merge": _AlwaysMerge()}
+        ctx = self._ctx(signals)
+        # Add an iphone profile so iphone-class devices aren't dropped.
+        ctx.profiles = dict(ctx.profiles)
+        ctx.profiles["iphone"] = ClassProfile(
+            name="iphone",
+            weights={"always_merge": 1.0},
+            threshold=0.5,
+            min_total_weight=0.5,
+        )
+        devices = [
+            _airtag(i, bytes([i, 0, 0, 0, 0, 0])) for i in range(8)
+        ] + [
+            Device(
+                id=100 + i,
+                device_class="iphone",
+                address=Address(
+                    bytes_=bytes([i, 1, 1, 1, 1, 1]), kind="random_resolvable",
+                ),
+                first_seen=0.0,
+                last_seen=0.0,
+            )
+            for i in range(3)
+        ]
+        runner = ClusterRunner(ctx, max_per_class=5)
+        result = runner.run_once(devices)
+
+        # airtag (8) skipped; iphone (3) clustered normally.
+        self.assertEqual(result.skipped_classes, [("airtag", 8)])
+        # iphone: C(3,2) = 3 pairs, all merge.
+        self.assertEqual(result.pairs_evaluated, 3)
+        self.assertEqual(result.merges_by_class["iphone"], 3)
+        # 8 airtag 1-clusters + 1 iphone cluster = 9.
+        self.assertEqual(result.cluster_count, 9)
+
+
 if __name__ == "__main__":
     unittest.main()

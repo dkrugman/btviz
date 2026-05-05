@@ -43,6 +43,11 @@ class RunResult:
     pairs abstained — surfaces things like "1485 apple_device pairs
     abstained on below_min_total_weight:0.55/0.60" so it's clear when
     the issue is profile config vs. signal output.
+
+    ``skipped_classes`` is the list of ``(device_class, device_count)``
+    pairs we declined to cluster because the class exceeded
+    ``max_per_class``. Surfaced so the UI can warn the user instead
+    of silently producing partial results.
     """
 
     elapsed_s: float
@@ -58,6 +63,17 @@ class RunResult:
     abstain_reasons_by_class: dict[str, Counter[str]] = field(
         default_factory=dict,
     )
+    skipped_classes: list[tuple[str, int]] = field(default_factory=list)
+
+
+#: Default cap on devices per class before the runner declines to
+#: cluster that class. Pairwise iteration is O(N²); at 1500 we're
+#: looking at ~1.1M pair-evaluations per class, which the current
+#: in-process Python implementation can chew through in a few
+#: seconds. Beyond that the wall-time crosses the threshold where
+#: a user thinks the program has hung. Bucketing/blocking is the
+#: real fix; this is the don't-freeze-the-app guard until that lands.
+DEFAULT_MAX_PER_CLASS = 1500
 
 
 class ClusterRunner:
@@ -67,15 +83,24 @@ class ClusterRunner:
     pre-filter (same class + recent overlap + bucket hash) can be
     swapped without touching the runner. Default: all-pairs within
     the same device_class.
+
+    ``max_per_class`` caps the per-class device count before pair
+    iteration starts. Classes exceeding it are recorded in
+    ``RunResult.skipped_classes`` and not analyzed — prevents the
+    UI from freezing on captures with thousands of same-class
+    devices (e.g. 4000+ apple_device RPAs in a long session).
     """
 
     def __init__(
         self,
         ctx: ClusterContext,
         candidates: CandidateFn | None = None,
+        *,
+        max_per_class: int = DEFAULT_MAX_PER_CLASS,
     ) -> None:
         self.ctx = ctx
         self.candidates = candidates or _same_class_pairs
+        self.max_per_class = max_per_class
 
     def run_once(self, devices: Sequence[Device]) -> RunResult:
         start = time.monotonic()
@@ -93,10 +118,28 @@ class ClusterRunner:
             by_class=by_class,
         )
 
+        # Decide which classes are too large to cluster *before*
+        # generating any pairs, so a 4000-device class doesn't even
+        # trigger the O(N²) yield. Excluded devices fall through as
+        # 1-element clusters via _compute_closure.
+        skipped_classes: set[str] = set()
+        for cls, count in by_class.items():
+            if count > self.max_per_class:
+                skipped_classes.add(cls)
+                result.skipped_classes.append((cls, count))
+                log.warning(
+                    "skipping %s — %d devices exceeds max_per_class=%d",
+                    cls, count, self.max_per_class,
+                )
+        eligible = (
+            [d for d in devices if d.device_class not in skipped_classes]
+            if skipped_classes else list(devices)
+        )
+
         # Per-class narration: emit one line as we move into each
         # class so the log reads like a story.
         pairs_by_class: dict[str, list[tuple[Device, Device]]] = {}
-        for a, b in self.candidates(devices):
+        for a, b in self.candidates(eligible):
             pairs_by_class.setdefault(a.device_class, []).append((a, b))
 
         for cls, pairs in pairs_by_class.items():

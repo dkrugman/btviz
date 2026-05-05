@@ -3147,6 +3147,26 @@ class CanvasWindow(QMainWindow):
         # the main thread is passed by reference, but the worker opens
         # its own sqlite3 connection so cross-thread reads are safe
         # (the main connection is locked to the GUI thread).
+        #
+        # Lifetime wiring carefully avoids a known PySide6 footgun:
+        # if ``worker.deleteLater`` is connected to ``worker.finished``,
+        # the DeferredDelete event lands in the worker thread's queue
+        # while ``_on_cluster_finished`` is simultaneously dropping
+        # the Python wrapper's last refcount on the main thread. That
+        # races: Shiboken thinks Python owns the C++ object and
+        # ``delete``s it from the main thread, then the worker
+        # thread's event loop dereferences a freed pointer when it
+        # processes the still-queued DeferredDelete. The crash that
+        # taught us this had ``QObject::~QObject`` on the worker
+        # thread and ``pysqlite_cursor_fetchall`` on the main thread.
+        #
+        # Fix: ``worker.deleteLater`` is connected to ``thread.finished``
+        # so the worker is destroyed only after the event loop has
+        # fully exited and any pending events are drained. Python ref
+        # cleanup (``self._cluster_worker = None``) happens in a
+        # ``thread.finished`` slot, AFTER Qt is done with the C++
+        # object — never inside a slot that fires while the worker
+        # thread is still running.
         self._cluster_busy = True
         thread = QThread(self)
         worker = _ClusterWorker(
@@ -3160,9 +3180,9 @@ class CanvasWindow(QMainWindow):
         worker.failed.connect(self._on_cluster_failed)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_cluster_thread_done)
         self._cluster_thread = thread
         self._cluster_worker = worker
         thread.start()
@@ -3175,10 +3195,15 @@ class CanvasWindow(QMainWindow):
         SQLite writes via ``self.repos.clusters.apply_run`` are bound
         to the main thread's connection, which is exactly what we
         want.
+
+        Does NOT null ``self._cluster_thread`` / ``self._cluster_worker``
+        — that's deferred to ``_on_cluster_thread_done`` which fires
+        on ``thread.finished``, after the worker thread has fully
+        exited and Qt has had a chance to delete the C++ objects via
+        the ``deleteLater`` chain. Releasing the Python wrappers here
+        races with the worker thread's still-pending events.
         """
         self._cluster_busy = False
-        self._cluster_thread = None
-        self._cluster_worker = None
         try:
             written = self.repos.clusters.apply_run(
                 result.merge_decisions, time.time(),
@@ -3203,10 +3228,23 @@ class CanvasWindow(QMainWindow):
 
     @Slot(str)
     def _on_cluster_failed(self, msg: str) -> None:
+        # See ``_on_cluster_finished`` re: not nulling the references
+        # here. ``_on_cluster_thread_done`` does that after the thread
+        # has fully exited.
         self._cluster_busy = False
+        self.status.setText(f"  cluster error: {msg}")
+
+    @Slot()
+    def _on_cluster_thread_done(self) -> None:
+        """Drop Python references to the worker / thread.
+
+        Connected to ``thread.finished``; runs on the main thread
+        after the worker thread's event loop has exited and after
+        the queued ``deleteLater`` events have processed the C++
+        objects. Safe to release wrappers now.
+        """
         self._cluster_thread = None
         self._cluster_worker = None
-        self.status.setText(f"  cluster error: {msg}")
 
     def _on_live_packet(
         self, source: str, channel: int | None, crc_ok: bool = True,

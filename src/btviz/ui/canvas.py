@@ -22,6 +22,8 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontMetricsF,
+    QLinearGradient,
     QPainter,
     QPen,
     QPolygonF,
@@ -93,7 +95,7 @@ _HEADER_H = 50
 # Collapsed body now holds three lines: summary, quality counters, and a
 # gauge icon strip. Expanded body grew by the same amount so the detail
 # block keeps the same vertical space it had before.
-_BOX_H_COLLAPSED = _HEADER_H + 52
+_BOX_H_COLLAPSED = _HEADER_H + 76
 _BOX_H_EXPANDED = _HEADER_H + 242
 _BOX_RADIUS = 10
 _GRID_DX = _BOX_W + 24               # column pitch (box + gutter)
@@ -187,10 +189,24 @@ _QUALITY_RED = QColor(220, 70, 70)
 _QUALITY_NEUTRAL = QColor(170, 170, 170)  # before any packets observed
 _QUALITY_BAR_H = 8
 _QUALITY_BAR_RADIUS = 2
-_QUALITY_LABEL_W = 44      # width reserved for the "Quality" label
-_QUALITY_CARET_W = 6       # base width of the upward-pointing caret
+_QUALITY_LABEL_W = 44      # width reserved for the "Quality" / "Signal" label
+_QUALITY_CARET_W = 6       # base width of the caret triangle
 _QUALITY_CARET_H = 4
 _QUALITY_CARET_FILL = QColor(40, 40, 50)
+
+# Signal-strength bar — same visual vocabulary as the quality bar but
+# paints the [-100..0] dBm RSSI range as a red→green gradient with a
+# downward caret marking ``rssi_avg``. The dBm label sits ABOVE the
+# caret so the bar reads "value first, then where it sits on the
+# scale" — opposite of the quality bar (which leads with the bar and
+# explains itself with the percentage below).
+_SIGNAL_BAR_H = _QUALITY_BAR_H
+_SIGNAL_BAR_RADIUS = _QUALITY_BAR_RADIUS
+_SIGNAL_RSSI_MIN = -100   # left edge of the bar (no signal)
+_SIGNAL_RSSI_MAX = -20    # right edge (effectively touching antenna)
+_SIGNAL_LO = QColor(220, 70, 70)     # red at -100 dBm
+_SIGNAL_MID = QColor(220, 170, 60)   # amber midpoint
+_SIGNAL_HI = QColor(60, 180, 90)     # green at -20 dBm
 
 # Cluster-collapse confidence threshold. The canvas hydrator only
 # collapses a multi-device cluster into one primary box when *every*
@@ -1224,8 +1240,19 @@ class DeviceItem(QGraphicsItem):
         # Square off the bottom of the header so it joins the body cleanly.
         painter.drawRect(QRectF(0, _BOX_RADIUS, _BOX_W, _HEADER_H - _BOX_RADIUS))
 
+        # Reserve room on the left for the cluster badge (if any) so
+        # the icon doesn't sit underneath it. Reserve room on the
+        # right for the data-flash badge + adv strip column so a long
+        # wrapped title doesn't bleed under the 37/38/39 indicators.
+        cluster_reserve = self._cluster_badge_reserve_w()
+        adv_reserve = (
+            _CH_FLASH_BADGE_MARGIN
+            + max(_CH_FLASH_BADGE_W, 3 * _ADV_CH_BOX_W + 2 * _ADV_CH_BOX_GAP)
+            + 4
+        )
+
         # Icon (left side): device_class SVG, falling back to fallback_icon.svg.
-        icon_rect = QRectF(6, 0, 44, _HEADER_H)
+        icon_rect = QRectF(6 + cluster_reserve, 0, 44, _HEADER_H)
         renderer = (
             _icon_renderer(self.device.device_class)
             or _icon_renderer(_FALLBACK_SVG_NAME)
@@ -1247,7 +1274,12 @@ class DeviceItem(QGraphicsItem):
         label_font.setPointSize(11)
         painter.setFont(label_font)
         painter.setPen(QColor(30, 30, 30))
-        text_rect = QRectF(52, 4, _BOX_W - 58, _HEADER_H - 8)
+        text_left = icon_rect.right() + 2
+        text_rect = QRectF(
+            text_left, 4,
+            _BOX_W - text_left - adv_reserve,
+            _HEADER_H - 8,
+        )
         painter.drawText(
             text_rect,
             Qt.AlignVCenter | Qt.AlignLeft | Qt.TextWordWrap,
@@ -1405,21 +1437,46 @@ class DeviceItem(QGraphicsItem):
             str(channel),
         )
 
+    def _cluster_badge_text(self) -> str:
+        return f"↔ {self.device.cluster_member_count}"
+
+    def _cluster_badge_reserve_w(self) -> float:
+        """How far right to shift the icon to clear the cluster badge.
+
+        Returns 0 when the device isn't a cluster primary. Otherwise:
+        badge spans ``[_CLUSTER_BADGE_MARGIN, _CLUSTER_BADGE_MARGIN +
+        badge_w]``; the icon's default left edge is x=6. We shift the
+        icon by however much it overlaps the badge plus a 2 px gap.
+        Computed off the live badge text so "↔ 2" reserves less than
+        "↔ 999".
+        """
+        if self.device.cluster_member_count <= 1:
+            return 0.0
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(8)
+        text_w = QFontMetricsF(font).horizontalAdvance(self._cluster_badge_text())
+        badge_w = text_w + 2 * _CLUSTER_BADGE_PAD_X
+        badge_right = _CLUSTER_BADGE_MARGIN + badge_w
+        icon_default_x = 6
+        return max(0.0, badge_right + 2 - icon_default_x)
+
     def _paint_cluster_badge(self, painter: QPainter) -> None:
         """Render the ↔N badge in the box's top-left corner.
 
         Only called when the device represents a collapsed cluster
         (more than one member). The badge sits *over* the upper-left
         of the kind-fill body, distinct in colour from any kind tint
-        so it scans across a grid of boxes regardless of kind.
+        so it scans across a grid of boxes regardless of kind. The
+        icon and title rect get shifted right by
+        ``_cluster_badge_reserve_w`` in ``paint`` so the badge no
+        longer occludes the device-class glyph.
         """
-        text = f"↔ {self.device.cluster_member_count}"
+        text = self._cluster_badge_text()
         font = QFont()
         font.setBold(True)
         font.setPointSize(8)
         painter.setFont(font)
-        # Width sized to text + padding; height fixed so badges all
-        # line up vertically across boxes.
         metrics = painter.fontMetrics()
         text_w = metrics.horizontalAdvance(text)
         badge_w = text_w + 2 * _CLUSTER_BADGE_PAD_X
@@ -1439,7 +1496,6 @@ class DeviceItem(QGraphicsItem):
 
     def _paint_collapsed_body(self, painter: QPainter) -> None:
         d = self.device
-        rssi = f"{d.rssi_avg:.0f}" if d.rssi_avg is not None else "—"
         all_chs = sorted(d.channels.items(), key=lambda kv: -kv[1])
         top_chs = all_chs[:3]
         if all_chs:
@@ -1449,12 +1505,138 @@ class DeviceItem(QGraphicsItem):
                 ch_str += f" +{extra}"
         else:
             ch_str = "—"
-        line = f"{d.packet_count:,} pkts · {rssi} dBm · ch {ch_str}"
+
+        # Signal-strength bar at the top of the body. ``_paint_signal_line``
+        # is the vertical mirror of ``_paint_quality_line``: dBm label
+        # + ▼ caret on top, gradient bar below. Total height ~25 px
+        # from the y origin to the bar's bottom.
+        self._paint_signal_line(painter, _HEADER_H + 4)
+
+        # Pkt count + channels — single line between the two bars.
+        line = f"{d.packet_count:,} pkts · ch {ch_str}"
         painter.drawText(
-            QRectF(8, _HEADER_H + 4, _BOX_W - 16, 16),
+            QRectF(8, _HEADER_H + 32, _BOX_W - 16, 14),
             Qt.AlignVCenter | Qt.AlignLeft, line,
         )
-        self._paint_quality_line(painter, _HEADER_H + 22)
+
+        # CRC quality bar at the bottom (bar + ▲ caret + % below it).
+        self._paint_quality_line(painter, _HEADER_H + 48)
+
+    def _paint_signal_line(self, painter: QPainter, y: float) -> None:
+        """Render the per-device signal-strength bar.
+
+        Layout (vertical mirror of ``_paint_quality_line``):
+
+            [Signal]   −64 dBm
+                          ▼
+                       [██░░░░░░]
+
+        Bar maps the [_SIGNAL_RSSI_MIN, _SIGNAL_RSSI_MAX] range to a
+        red→amber→green gradient. ``rssi_avg`` drives the caret's x
+        position; values outside the range clamp to the bar's edges.
+        When no RSSI samples have been seen yet, paints a neutral
+        grey bar with no caret/label so the layout slot stays
+        consistent.
+        """
+        rssi_avg = self.device.rssi_avg
+
+        # Same horizontal layout as the quality bar so the two bars
+        # align under each other.
+        label_x = 8
+        bar_left = label_x + _QUALITY_LABEL_W + 6
+        bar_right = _BOX_W - 8
+        bar_w = bar_right - bar_left
+
+        # Bar sits at the BOTTOM of the line so caret + label can stack
+        # above it. Total reserved height ≈ 25 px (10 label + 4 caret +
+        # 1 gap + 8 bar + a little padding).
+        label_h = 10
+        caret_h = _QUALITY_CARET_H
+        bar_top = y + label_h + caret_h + 1
+        bar_bottom = bar_top + _SIGNAL_BAR_H
+
+        # "Signal" label, vertically centered against the bar (mirrors
+        # the "Quality" label position so the two lines read aligned).
+        label_font = QFont()
+        label_font.setPointSize(8)
+        label_font.setBold(True)
+        painter.setFont(label_font)
+        painter.setPen(QColor(50, 50, 50))
+        painter.drawText(
+            QRectF(label_x, bar_top - 1, _QUALITY_LABEL_W, _SIGNAL_BAR_H + 2),
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            "Signal",
+        )
+
+        if rssi_avg is None:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(_QUALITY_NEUTRAL))
+            painter.drawRoundedRect(
+                QRectF(bar_left, bar_top, bar_w, _SIGNAL_BAR_H),
+                _SIGNAL_BAR_RADIUS, _SIGNAL_BAR_RADIUS,
+            )
+            return
+
+        # Three-stop horizontal gradient (red → amber → green).
+        gradient = QLinearGradient(bar_left, 0, bar_right, 0)
+        gradient.setColorAt(0.0, _SIGNAL_LO)
+        gradient.setColorAt(0.5, _SIGNAL_MID)
+        gradient.setColorAt(1.0, _SIGNAL_HI)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(gradient))
+        painter.drawRoundedRect(
+            QRectF(bar_left, bar_top, bar_w, _SIGNAL_BAR_H),
+            _SIGNAL_BAR_RADIUS, _SIGNAL_BAR_RADIUS,
+        )
+
+        # Caret position: linear map clamped to [_SIGNAL_RSSI_MIN, MAX].
+        rssi_clamped = max(
+            _SIGNAL_RSSI_MIN, min(_SIGNAL_RSSI_MAX, rssi_avg),
+        )
+        frac = (
+            (rssi_clamped - _SIGNAL_RSSI_MIN)
+            / (_SIGNAL_RSSI_MAX - _SIGNAL_RSSI_MIN)
+        )
+        caret_x = bar_left + frac * bar_w
+
+        # Caret pointing DOWN at the bar from above.
+        caret_bottom_y = bar_top - 1
+        caret_top_y = caret_bottom_y - _QUALITY_CARET_H
+        caret_poly = QPolygonF([
+            QPointF(caret_x, caret_bottom_y),
+            QPointF(
+                caret_x - _QUALITY_CARET_W / 2.0,
+                caret_top_y,
+            ),
+            QPointF(
+                caret_x + _QUALITY_CARET_W / 2.0,
+                caret_top_y,
+            ),
+        ])
+        painter.setBrush(QBrush(_QUALITY_CARET_FILL))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPolygon(caret_poly)
+
+        # dBm label, centered above the caret. Clipped to the bar's
+        # horizontal bounds so it stays visible at extremes.
+        label_str = f"{rssi_avg:.0f} dBm"
+        val_font = QFont()
+        val_font.setPointSize(7)
+        painter.setFont(val_font)
+        metrics = painter.fontMetrics()
+        val_w = metrics.horizontalAdvance(label_str)
+        val_x = caret_x - val_w / 2.0
+        if val_x < bar_left:
+            val_x = bar_left
+        elif val_x + val_w > bar_right:
+            val_x = bar_right - val_w
+        val_y = caret_top_y - label_h
+        painter.setPen(QColor(50, 50, 50))
+        painter.drawText(
+            QRectF(val_x, val_y, val_w + 1, label_h),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+            label_str,
+        )
 
     def _paint_quality_line(self, painter: QPainter, y: float) -> None:
         """Render the per-device CRC-quality bar.

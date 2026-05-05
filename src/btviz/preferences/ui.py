@@ -209,21 +209,47 @@ class PreferencesDialog(QDialog):
     # ------------------------------------------------------------------
 
     def _on_browse(self, line: QLineEdit, field: Field) -> None:
-        # If the field name suggests a directory ("dir"), pick a dir;
-        # otherwise pick a file. Cheap heuristic — the only path
-        # fields today are db_path, log_dir, nrf_extcap_path.
+        """Pick a path. Uses Qt's own dialog with hidden files visible.
+
+        The native macOS / Windows pickers default-hide dotfiles and
+        dot-dirs, but most btviz path fields point at hidden
+        locations (``~/.btviz``, ``~/Library/Application Support/``,
+        ``~/.local/lib/wireshark/extcap/``). The native shortcut
+        ``Cmd+Shift+.`` toggles them but doesn't survive across
+        opens reliably. Switching to Qt's non-native dialog with
+        ``QDir.Filter.Hidden`` set lets us show them by default —
+        less polished sidebar, but actually navigable to where the
+        user needs to go.
+
+        ``"dir" in field.name`` picks dir-vs-file mode. Cheap
+        heuristic — the only path fields today are ``db_path``,
+        ``log_dir``, ``nrf_extcap_path``.
+        """
+        from PySide6.QtCore import QDir
+
         is_dir = "dir" in field.name
         current = line.text() or str(Path.home())
+
+        dlg = QFileDialog(self, f"Choose {field.label}", current)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        # Show hidden + system entries, hide ``.`` and ``..``.
+        dlg.setFilter(
+            QDir.Filter.AllEntries
+            | QDir.Filter.Hidden
+            | QDir.Filter.System
+            | QDir.Filter.NoDotAndDotDot
+        )
         if is_dir:
-            chosen = QFileDialog.getExistingDirectory(
-                self, f"Choose {field.label}", current,
-            )
+            dlg.setFileMode(QFileDialog.FileMode.Directory)
+            dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
         else:
-            chosen, _ = QFileDialog.getOpenFileName(
-                self, f"Choose {field.label}", current,
-            )
-        if chosen:
-            line.setText(chosen)
+            dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+
+        if dlg.exec() != QFileDialog.DialogCode.Accepted:
+            return
+        files = dlg.selectedFiles()
+        if files:
+            line.setText(files[0])
 
     def _on_save(self) -> None:
         """Read every widget back into the Preferences object and persist."""

@@ -109,13 +109,47 @@ class Follow:
                 )
 
 
-SnifferRole = Idle | Pinned | ScanUnmonitored | Follow
+@dataclass(frozen=True)
+class Probe:
+    """Active interrogation: become a Central, run a GATT probe, drop.
+
+    Only valid on TX-capable dongles (DK with connectivity firmware).
+    Not handled by the nRF Sniffer extcap — the probe coordinator
+    in :mod:`btviz.probe` handles dispatch via Nordic's
+    ``pc-ble-driver-py`` against the same serial port. The role
+    enum entry exists so the role planner can show "probing" as a
+    distinct dongle state in the panel.
+
+    See ``docs/active_interrogation/`` for the design.
+    """
+    target_addr: str
+    is_random: bool = False
+    irk_hex: str | None = None
+
+    def __post_init__(self) -> None:
+        parts = self.target_addr.split(":")
+        if len(parts) != 6 or any(len(p) != 2 for p in parts):
+            raise ValueError(
+                f"expected aa:bb:cc:dd:ee:ff, got {self.target_addr!r}"
+            )
+        if self.irk_hex is not None:
+            stripped = self.irk_hex.lower().removeprefix("0x")
+            if len(stripped) != 32 or not all(c in "0123456789abcdef" for c in stripped):
+                raise ValueError(
+                    f"IRK must be 32 hex chars (128 bits), got {self.irk_hex!r}"
+                )
+
+
+SnifferRole = Idle | Pinned | ScanUnmonitored | Follow | Probe
 
 
 def short_name(role: SnifferRole) -> str:
     """Compact role label for CLI / UI display."""
     if isinstance(role, Idle):
         return "idle"
+    if isinstance(role, Probe):
+        suffix = " random" if role.is_random else ""
+        return f"probe({role.target_addr}{suffix})"
     if isinstance(role, Pinned):
         chs = ",".join(str(c) for c in role.channels)
         return f"pin[{chs}]"

@@ -110,6 +110,16 @@ _GRID_MARGIN_X = 20                  # left margin before the first column
 # when empty so the user always knows where new devices will appear.
 _SECTION_TOP_LABEL = "Devices"
 _SECTION_BOTTOM_LABEL = "Unidentified Advertisements"
+
+
+def _section_label_with_count(base: str, count: int) -> str:
+    """Append "(N)" to a section label, or leave the base bare for 0.
+
+    The empty-section state already shows a "(no stable devices yet)"
+    placeholder; appending "(0)" to the heading on top of that reads
+    redundant, so we drop the parenthesis entirely in that case.
+    """
+    return f"{base} ({count})" if count else base
 _SECTION_LABEL_FONT_PT = 11
 _SECTION_LABEL_H = 22
 _SECTION_LABEL_LEFT = 20
@@ -2458,7 +2468,10 @@ class CanvasWindow(QMainWindow):
         # reloads.
         top_label_y = 6
         top_content_top = top_label_y + _SECTION_LABEL_H + 6
-        self._add_section_label(_SECTION_TOP_LABEL, top_label_y)
+        self._add_section_label(
+            _section_label_with_count(_SECTION_TOP_LABEL, len(top_devs)),
+            top_label_y,
+        )
         next_y = section_grid_layout(top_devs, cols=cols, top_y=top_content_top)
         if not top_devs:
             self._add_placeholder_text(
@@ -2474,7 +2487,10 @@ class CanvasWindow(QMainWindow):
         # the device columns we placed).
         divider_y = next_y + _SECTION_GAP_BEFORE_DIVIDER
         bottom_label_y = divider_y + _SECTION_GAP_AFTER_DIVIDER
-        self._add_section_label(_SECTION_BOTTOM_LABEL, bottom_label_y)
+        self._add_section_label(
+            _section_label_with_count(_SECTION_BOTTOM_LABEL, len(bottom_devs)),
+            bottom_label_y,
+        )
         bottom_content_top = bottom_label_y + _SECTION_LABEL_H + 6
         bottom_next_y = section_grid_layout(
             bottom_devs, cols=cols, top_y=bottom_content_top,

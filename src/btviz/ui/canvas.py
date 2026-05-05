@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -227,6 +228,13 @@ _SIGNAL_RSSI_MAX = -20    # right edge (effectively touching antenna)
 _SIGNAL_LO = QColor(220, 70, 70)     # red at -100 dBm
 _SIGNAL_MID = QColor(220, 170, 60)   # amber midpoint
 _SIGNAL_HI = QColor(60, 180, 90)     # green at -20 dBm
+
+# Rolling window length for the per-device Signal and Quality meters.
+# The meters average packet observations over the last N seconds so the
+# bars reflect *current* link health, not session-cumulative aggregates.
+# When no packets have arrived inside the window the bar shows neutral
+# grey with no caret — honest "no current signal."
+_RECENT_WINDOW_S = 5.0
 
 # Cluster-collapse confidence threshold. The canvas hydrator only
 # collapses a multi-device cluster into one primary box when *every*
@@ -1188,15 +1196,13 @@ class DeviceItem(QGraphicsItem):
         # for fade rendering.
         self._data_flash_recent: list[tuple[float, int, bool]] = []
         self._adv_flash: dict[int, tuple[float, bool]] = {}
-        # Per-device CRC quality counters mirror the sniffer-panel
-        # ones. Seeded from the cumulative DB totals (``packet_count``
-        # and ``bad_packet_count`` columns on observations) so the
-        # quality bar reflects history across capture sessions and
-        # remains correct after capture stops. Live attributions
-        # increment from there during an active session, and the
-        # next reload re-seeds from the now-updated DB.
-        self._good_packets: int = device.packet_count
-        self._bad_packets: int = device.bad_packet_count
+        # Rolling-window samples driving the Signal and Quality meters.
+        # Each entry is ``(ts, rssi, crc_ok)``. Pruned to the last
+        # ``_RECENT_WINDOW_S`` seconds inside ``_recent_stats``. The
+        # bars reflect *current* link health, not session-cumulative
+        # totals — after capture stops or the device goes silent, the
+        # window drains and the bars fade to neutral.
+        self._recent: deque[tuple[float, int | None, bool]] = deque()
         self.setFlag(QGraphicsItem.ItemIsMovable, True)
         self.setFlag(QGraphicsItem.ItemIsSelectable, True)
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
@@ -1209,7 +1215,10 @@ class DeviceItem(QGraphicsItem):
         self.setToolTip(_build_tooltip(device))
 
     def notify_channel_hit(
-        self, channel: int | None, crc_ok: bool = True,
+        self,
+        channel: int | None,
+        crc_ok: bool = True,
+        rssi: int | None = None,
     ) -> None:
         """Record a packet hit on this device on the given channel.
 
@@ -1222,16 +1231,18 @@ class DeviceItem(QGraphicsItem):
         ``crc_ok=False`` flags a dropout — the indicator paints black
         with a red glyph instead of the channel-color.
 
-        Hits with ``channel=None`` are ignored for flash routing but
-        the CRC counter still ticks so quality stats stay correct.
+        ``rssi`` (dBm, negative) feeds the rolling-window Signal meter.
+        It can be None for channels we couldn't pin down.
+
+        Hits with ``channel=None`` are still counted in the rolling
+        window so Signal/Quality stay correct, but no flash badge is
+        drawn (no channel to point to).
         """
-        if not crc_ok:
-            self._bad_packets += 1
-        else:
-            self._good_packets += 1
-        if channel is None:
-            return
         now = time.time()
+        self._recent.append((now, rssi, crc_ok))
+        if channel is None:
+            self.update()
+            return
         if channel >= 37:
             self._adv_flash[channel] = (now, not crc_ok)
         else:
@@ -1241,6 +1252,39 @@ class DeviceItem(QGraphicsItem):
                 e for e in self._data_flash_recent if e[0] >= cutoff
             ][-6:]
         self.update()
+
+    def _recent_stats(
+        self, now: float | None = None,
+    ) -> tuple[float | None, int, int]:
+        """Return ``(rssi_avg, good_count, bad_count)`` over the live
+        rolling window, pruning samples older than ``_RECENT_WINDOW_S``.
+
+        ``rssi_avg`` is None when no in-window samples carried an RSSI
+        (or no samples at all). Callers paint a neutral bar in that
+        case. Pruning happens here on read so the deque doesn't grow
+        unboundedly between paints when no fresh packets arrive.
+        """
+        if now is None:
+            now = time.time()
+        cutoff = now - _RECENT_WINDOW_S
+        while self._recent and self._recent[0][0] < cutoff:
+            self._recent.popleft()
+        if not self._recent:
+            return (None, 0, 0)
+        rssi_total = 0
+        rssi_n = 0
+        good = 0
+        bad = 0
+        for _ts, rssi, crc_ok in self._recent:
+            if crc_ok:
+                good += 1
+            else:
+                bad += 1
+            if rssi is not None:
+                rssi_total += rssi
+                rssi_n += 1
+        rssi_avg = rssi_total / rssi_n if rssi_n else None
+        return (rssi_avg, good, bad)
 
     # --- geometry -----------------------------------------------------
 
@@ -1558,13 +1602,14 @@ class DeviceItem(QGraphicsItem):
                        [██░░░░░░]
 
         Bar maps the [_SIGNAL_RSSI_MIN, _SIGNAL_RSSI_MAX] range to a
-        red→amber→green gradient. ``rssi_avg`` drives the caret's x
-        position; values outside the range clamp to the bar's edges.
-        When no RSSI samples have been seen yet, paints a neutral
-        grey bar with no caret/label so the layout slot stays
-        consistent.
+        red→amber→green gradient. The caret's x position tracks the
+        average RSSI over the last ``_RECENT_WINDOW_S`` seconds —
+        not the session aggregate — so the meter reads "right now."
+        Values outside the range clamp to the bar's edges. When no
+        RSSI samples are in-window, paints a neutral grey bar with no
+        caret/label so the layout slot stays consistent.
         """
-        rssi_avg = self.device.rssi_avg
+        rssi_avg, _good, _bad = self._recent_stats()
 
         # Same horizontal layout as the quality bar so the two bars
         # align under each other.
@@ -1673,15 +1718,14 @@ class DeviceItem(QGraphicsItem):
                                   ▲
                                  95%
 
-        Cumulative bar across all packets seen since the canvas
-        opened. Green segment width = good_packet_share; red segment
-        width = CRC-fail share. The caret marks the boundary; the
-        percentage below it is the good-share rounded to a whole
-        number. When no packets have arrived yet, the bar shows a
-        neutral grey fill with no caret.
+        Rolling window over the last ``_RECENT_WINDOW_S`` seconds.
+        Green segment width = good_packet_share; red segment width =
+        CRC-fail share. The caret marks the boundary; the percentage
+        below it is the good-share rounded to a whole number. When no
+        packets are in-window, the bar shows a neutral grey fill with
+        no caret — the device is silent right now.
         """
-        good = self._good_packets
-        bad = self._bad_packets
+        _rssi, good, bad = self._recent_stats()
         total = good + bad
 
         # Layout — left label, bar to its right, caret + % beneath.
@@ -3340,16 +3384,21 @@ class CanvasWindow(QMainWindow):
         )
 
     def _on_device_packet(
-        self, device_id: int, channel: int | None, crc_ok: bool = True,
+        self,
+        device_id: int,
+        channel: int | None,
+        crc_ok: bool = True,
+        rssi: int | None = None,
     ) -> None:
         """LiveIngest per-device notifier. Drives the per-DeviceItem
-        channel-flash badge so the canvas shows spectrum activity
-        per-device in real time.
+        channel-flash badge and rolling-window Signal/Quality meters
+        so the canvas shows current link health per-device in real time.
 
         ``crc_ok=False`` is fired by LiveIngest for CRC-failed packets
         that it credited to this device via the last-clean-device
         cache, so the canvas can render a dropout flash matching the
-        sniffer panel.
+        sniffer panel and count the dropout in the rolling window.
+        ``rssi`` (dBm) feeds the Signal meter's rolling average.
 
         Looks up the DeviceItem by ``device_id`` in the scene. The
         scene gets fully rebuilt by ``reload()`` every ~2 s during
@@ -3362,21 +3411,23 @@ class CanvasWindow(QMainWindow):
         """
         for item in self.scene.items():
             if isinstance(item, DeviceItem) and item.device.device_id == device_id:
-                item.notify_channel_hit(channel, crc_ok=crc_ok)
+                item.notify_channel_hit(channel, crc_ok=crc_ok, rssi=rssi)
                 if not self._channel_flash_timer.isActive():
                     self._channel_flash_timer.start()
                 return
 
     def _tick_channel_flash(self) -> None:
         """20 Hz repaint pump — calls update() on every DeviceItem
-        with an active flash so the badge alpha fades smoothly. Stops
-        the timer when no items have anything left to fade so the
-        canvas is idle at rest.
+        with an active flash OR an in-window Signal/Quality sample,
+        so badge alpha fades smoothly and the rolling-window meters
+        drain visibly when packets stop arriving. Stops the timer
+        when no items have anything left to fade so the canvas is
+        idle at rest.
         """
         any_active = False
         for item in self.scene.items():
             if isinstance(item, DeviceItem) and (
-                item._data_flash_recent or item._adv_flash
+                item._data_flash_recent or item._adv_flash or item._recent
             ):
                 any_active = True
                 item.update()

@@ -98,8 +98,9 @@ class LiveIngest:
         self._session_id: int | None = None
         self._on_source_packet: Callable[[str, int | None, bool], None] | None = None
         # Optional per-device callback fired on each successfully-recorded
-        # packet. Receives (device_id, channel, crc_ok) so the canvas can
-        # flash a per-device channel indicator and render dropouts.
+        # packet. Receives (device_id, channel, crc_ok, rssi) so the
+        # canvas can flash a per-device channel indicator, render
+        # dropouts, and feed the rolling-window Signal meter.
         # Distinct from the source callback because attribution to a
         # device requires a successful ``record_packet`` (i.e. the packet
         # had a parseable adv_addr) — the source callback fires for every
@@ -111,7 +112,9 @@ class LiveIngest:
         # (source, channel) within ``_CRC_ATTRIB_WINDOW_S``. That gives
         # the canvas a per-device dropout flash matching the sniffer
         # panel's CRC-fail indicator.
-        self._on_device_packet: Callable[[int, int | None, bool], None] | None = None
+        self._on_device_packet: (
+            Callable[[int, int | None, bool, int | None], None] | None
+        ) = None
         # Most recent clean attribution per (source, channel), used to
         # route CRC-failed packets to the device that was most likely
         # transmitting on that channel a moment ago. Stores
@@ -163,15 +166,18 @@ class LiveIngest:
         self._on_source_packet = fn
 
     def set_device_packet_callback(
-        self, fn: "Callable[[int, int | None, bool], None] | None",
+        self,
+        fn: "Callable[[int, int | None, bool, int | None], None] | None",
     ) -> None:
         """Set a per-device notifier called on flush (main thread).
 
-        Receives ``(device_id, channel, crc_ok)`` for each packet
+        Receives ``(device_id, channel, crc_ok, rssi)`` for each packet
         attributed to a device row. ``crc_ok=True`` for clean packets
         that recorded normally; ``crc_ok=False`` for CRC-failed packets
         that we credited to the most recent clean device on the same
-        (source, channel) inside ``_CRC_ATTRIB_WINDOW_S``.
+        (source, channel) inside ``_CRC_ATTRIB_WINDOW_S``. ``rssi`` is
+        the radio's per-packet RSSI (dBm, negative); the canvas uses
+        it to drive the rolling-window Signal meter.
 
         Packets with no recoverable channel (None), or CRC fails with
         no recent clean attribution on that channel, don't fire this —
@@ -317,7 +323,7 @@ class LiveIngest:
                     if self._on_device_packet is not None:
                         try:
                             self._on_device_packet(
-                                device_id, pkt.channel, pkt.crc_ok,
+                                device_id, pkt.channel, pkt.crc_ok, pkt.rssi,
                             )
                         except Exception:  # noqa: BLE001
                             import traceback
@@ -352,7 +358,7 @@ class LiveIngest:
                         if self._on_device_packet is not None:
                             try:
                                 self._on_device_packet(
-                                    cached[1], pkt.channel, False,
+                                    cached[1], pkt.channel, False, pkt.rssi,
                                 )
                             except Exception:  # noqa: BLE001
                                 import traceback

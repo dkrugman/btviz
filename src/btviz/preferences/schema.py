@@ -238,6 +238,34 @@ SCHEMA: tuple[Field, ...] = (
             "Off by default; INFO-level run narration always logs."
         ),
     ),
+    Field(
+        key="capture.verbose_log",
+        file="capture", section="logging", name="verbose_log",
+        type=bool, default=False, requires_restart=True,
+        label="Verbose capture log",
+        description=(
+            "When enabled, capture.log gets the narrative tier — "
+            "per-dongle discovery rows, role assignments, watchdog "
+            "start, periodic in-flight summaries. Useful when "
+            "diagnosing chronic stalls or odd capture behaviour. "
+            "Off by default; INFO-level lifecycle events (capture "
+            "started / stopped, STALL detected) always log."
+        ),
+    ),
+    Field(
+        key="capture.debug_log",
+        file="capture", section="logging", name="debug_log",
+        type=bool, default=False, requires_restart=True,
+        label="Debug capture log",
+        description=(
+            "When enabled, capture.log gets per-tick watchdog "
+            "narration and per-source throughput samples — the "
+            "fire-hose tier. Use only while reproducing a specific "
+            "issue; the file rotates at 10 MB and the rate at this "
+            "level is high enough to evict useful older entries "
+            "during long captures. Implies verbose."
+        ),
+    ),
 
     # ─── per-signal kill switches ─────────────────────────────────────
     # Each cluster signal can be disabled here without editing any

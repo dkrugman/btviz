@@ -3388,18 +3388,37 @@ class CanvasWindow(QMainWindow):
 
         # Discovery: list_dongles() runs the slow extcap probe — acceptable
         # at capture-start (the user pressed Start; they expect to wait).
+        from ..capture_log import get_capture_logger
+        cap_log = get_capture_logger()
         try:
             self._coord.refresh_dongles()
         except Exception as e:  # noqa: BLE001
             self.status.setText(f"  live: discovery failed: {e}")
+            cap_log.error("capture aborted — discovery failed: %s", e)
             self._bus = None
             self._coord = None
             return
         if not self._coord.dongles:
             self.status.setText("  live: no dongles discovered")
+            cap_log.warning("capture aborted — no dongles discovered")
             self._bus = None
             self._coord = None
             return
+        # Verbose: per-dongle discovery rows. Pinned at VERBOSE so a
+        # default-tier log stays compact even with many dongles.
+        cap_log.verbose(
+            "discovered %d dongle%s",
+            len(self._coord.dongles),
+            "" if len(self._coord.dongles) == 1 else "s",
+        )
+        for d in self._coord.dongles:
+            cap_log.verbose(
+                "  dongle short_id=%s serial=%s port=%s display=%s",
+                getattr(d, "short_id", "?"),
+                getattr(d, "serial_number", None) or getattr(d, "serial_path", "?"),
+                getattr(d, "serial_path", "?"),
+                getattr(d, "display", ""),
+            )
 
         # Persist the discovered dongles into the sniffers table so the
         # panel renders them as active. Each detection path has blind
@@ -3541,7 +3560,51 @@ class CanvasWindow(QMainWindow):
         self.sniffer_panel.start_session_timer(time.time())
         self.status.setText(msg)
 
+        # INFO-level lifecycle line — always lands in capture.log
+        # regardless of verbose/debug prefs. Format chosen so a
+        # ``grep "capture started" ~/.btviz/capture.log`` works as a
+        # session boundary marker.
+        roles_count: dict[str, int] = {}
+        for sp in self._coord.sniffers.values():
+            r = getattr(sp.state, "role", "idle") or "idle"
+            roles_count[r] = roles_count.get(r, 0) + 1
+        roles_str = " ".join(
+            f"{n} {r}" for r, n in sorted(roles_count.items())
+        ) or "no roles assigned"
+        cap_log.info(
+            "capture started — %d/%d dongles capturing (%s)",
+            running, total, roles_str,
+        )
+        # Verbose: per-sniffer role assignment so a long log with
+        # multiple captures has the role-vs-stall correlation.
+        for short_id, sp in self._coord.sniffers.items():
+            cap_log.verbose(
+                "  role short_id=%s role=%s running=%s",
+                short_id,
+                getattr(sp.state, "role", "?"),
+                getattr(sp.state, "running", False),
+            )
+        cap_log.verbose(
+            "watchdog started — threshold=%.0fs max_attempts=%d min_gap=%.0fs",
+            float(prefs.get("watchdog.stall_threshold_s")),
+            int(prefs.get("watchdog.max_attempts")),
+            float(prefs.get("watchdog.min_gap_s")),
+        )
+
+        # Stash session-start metadata for the matching "capture
+        # stopped" summary line. Lifetime: cleared in _stop_live.
+        self._capture_started_at_log = time.time()
+        self._capture_started_running = running
+        self._capture_started_total = total
+
     def _stop_live(self) -> None:
+        # Capture summary stats BEFORE we drop self._live, since
+        # the lifecycle log line needs them.
+        from ..capture_log import get_capture_logger
+        cap_log = get_capture_logger()
+        live_stats = self._live.stats if self._live is not None else None
+        started_at_log = getattr(self, "_capture_started_at_log", None)
+
         if self._live_timer is not None:
             self._live_timer.stop()
             self._live_timer = None
@@ -3584,6 +3647,24 @@ class CanvasWindow(QMainWindow):
         # Clear the panel's "extcap-unreachable" hint — the next live
         # start will recompute it from a fresh discovery sweep.
         self.sniffer_panel.set_extcap_unreachable(set())
+
+        # INFO-level lifecycle line — counterpart to "capture started".
+        # Format chosen so a single ``grep "capture " capture.log`` shows
+        # the lifecycle envelope of every session.
+        if started_at_log is not None:
+            duration_s = self._capture_stopped_at - started_at_log
+            h, rem = divmod(int(duration_s), 3600)
+            m, s = divmod(rem, 60)
+            duration_str = (
+                f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+            )
+            pkts = live_stats.packets_recorded if live_stats is not None else 0
+            dropped = live_stats.packets_dropped if live_stats is not None else 0
+            cap_log.info(
+                "capture stopped — duration=%s, packets=%d, dropped=%d",
+                duration_str, pkts, dropped,
+            )
+        self._capture_started_at_log = None
         # Leave sniffer rows as-is: stopping capture doesn't unplug them.
         # Dots stay green to reflect "detected, idle". A row only goes grey
         # when a fresh discovery sweep (Refresh sniffers / next Start Capture)
@@ -3640,8 +3721,48 @@ class CanvasWindow(QMainWindow):
                         if sid in short_to_serial
                     }
                     self.sniffer_panel.set_stuck_serials(stuck_serials)
+                # Debug-tier: per-tick eligibility + silence snapshot.
+                # Loud (every 10 s) but only when capture.debug_log
+                # is on, so this is opt-in fire-hose narration.
+                from ..capture_log import get_capture_logger
+                cap_log = get_capture_logger()
+                if cap_log.isEnabledFor(10):  # logging.DEBUG
+                    silent = self._stall_watchdog.currently_silent_short_ids()
+                    stuck = self._stall_watchdog.stuck_short_ids()
+                    cap_log.debug(
+                        "watchdog tick — silent=%d stuck=%d ids_silent=%s ids_stuck=%s",
+                        len(silent), len(stuck),
+                        ",".join(sorted(silent)) or "-",
+                        ",".join(sorted(stuck)) or "-",
+                    )
             except Exception as e:  # noqa: BLE001 — never break live capture
                 self.status.setText(f"  watchdog error: {e}")
+        # Verbose-tier: 5-minute in-flight summary so a long capture
+        # has periodic context interleaved with STALL events. 1200
+        # ticks * 250 ms = 5 min. Skipped when verbose is off so the
+        # default-tier file stays compact.
+        if self._reload_tick % 1200 == 0 and self._live is not None:
+            from ..capture_log import get_capture_logger as _get_cap_log
+            _cap_log = _get_cap_log()
+            if _cap_log.isEnabledFor(15):  # capture_log.VERBOSE
+                stats = self._live.stats
+                running = (
+                    sum(
+                        1 for sp in self._coord.sniffers.values()
+                        if sp.state.running
+                    )
+                    if self._coord is not None else 0
+                )
+                stuck_n = (
+                    len(self._stall_watchdog.stuck_short_ids())
+                    if self._stall_watchdog is not None else 0
+                )
+                _cap_log.verbose(
+                    "summary @ tick=%d — running=%d packets=%d dropped=%d stuck=%d",
+                    self._reload_tick, running,
+                    stats.packets_recorded, stats.packets_dropped,
+                    stuck_n,
+                )
         # Reload the scene every ~2s (8 ticks * 250ms). Full rebuild is
         # heavy (re-runs the project-aggregate query and rebuilds every
         # DeviceItem) — incremental updates can replace this later.

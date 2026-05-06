@@ -4554,6 +4554,40 @@ def run_canvas(db_path: Path | None = None, project_name: str | None = None) -> 
     app = QApplication.instance() or QApplication([])
     store = open_store(db_path)
 
+    # Single-instance enforcement: only one canvas may run per DB.
+    # Two instances on the same DB collide on USB-CDC ports
+    # (sniffer subprocess fights over /dev/cu.usbmodem*), corrupt
+    # capture.log rotation (RotatingFileHandler isn't multi-process
+    # safe), and double-run cluster passes. The lock auto-releases
+    # on process death, so a crash leaves no stale state.
+    from ..single_instance import acquire_db_lock, conflict_message
+    lock_result = acquire_db_lock(store.path)
+    if not lock_result.acquired:
+        # Existing instance — show a dialog (with parent=None
+        # because we don't have a window yet; QMessageBox at this
+        # point in startup is before any QMainWindow exists, so
+        # the macOS-Tahoe segfault path that haunts in-canvas
+        # dialogs doesn't apply — but we still wrap in try/except
+        # for a stderr fallback).
+        msg = conflict_message(lock_result)
+        try:
+            from PySide6.QtWidgets import QMessageBox as _QMB
+            box = _QMB()
+            box.setWindowTitle("btviz")
+            box.setIcon(_QMB.Icon.Critical)
+            box.setText("btviz is already running")
+            box.setInformativeText(msg)
+            box.setStandardButtons(_QMB.StandardButton.Ok)
+            box.exec()
+        except Exception:  # noqa: BLE001
+            import sys as _sys
+            print(f"btviz: {msg}", file=_sys.stderr)
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return 2
+
     repos = Repos(store)
     project_id: int | None = None
     if project_name:
@@ -4601,4 +4635,15 @@ def run_canvas(db_path: Path | None = None, project_name: str | None = None) -> 
         _logging.shutdown()
     except Exception:  # noqa: BLE001
         pass
+    # Explicit lock release — closing the file handle releases
+    # the flock. The kernel would do this on process exit anyway,
+    # but explicit close keeps the cleanup chain symmetric with
+    # store + logging shutdown above and means a long-lived
+    # parent process (e.g., a test runner reusing run_canvas)
+    # frees the lock immediately rather than at GC time.
+    if lock_result.file_handle is not None:
+        try:
+            lock_result.file_handle.close()
+        except Exception:  # noqa: BLE001
+            pass
     return rc

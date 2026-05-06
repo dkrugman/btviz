@@ -1007,21 +1007,27 @@ def _pick_display_label(d: CanvasDevice) -> str:
 
 
 def _build_tooltip(d: CanvasDevice) -> str:
-    """Comprehensive plain-text tooltip showing every full value the box
-    might be truncating in the visual.
+    """Comprehensive plain-text tooltip for the device box body.
 
-    Hover-target is the whole DeviceItem — we don't do per-line tooltips
-    yet, so this single tooltip lists everything notable. Plain text only
-    (Qt's tooltip handles ``\\n``); avoids HTML for cross-platform render
+    Skipped when the device is a cluster primary (member_count > 1):
+    cluster info + the merged address list move to a separate
+    badge-specific tooltip via ``_build_cluster_tooltip`` so the main
+    tooltip stays readable on heavy merges. Plain text only (Qt's
+    tooltip handles ``\\n``); avoids HTML for cross-platform render
     consistency.
     """
+    is_cluster = d.cluster_member_count > 1
     lines: list[str] = []
     lines.append(_pick_display_label(d))
     lines.append("─" * 36)
     lines.append(f"Device ID:     {d.device_id}")
     lines.append(f"Stable key:    {d.stable_key}")
     lines.append(f"Kind:          {d.kind}")
-    if d.cluster_id is not None:
+    # Cluster identity moves to the badge tooltip when this device is
+    # a primary that absorbed siblings — the badge itself signals
+    # "this is a merge" so its tooltip is the natural home for the
+    # cluster details and the union of addresses.
+    if d.cluster_id is not None and not is_cluster:
         score = (
             f" (min score {d.cluster_min_score:.2f})"
             if d.cluster_min_score is not None else ""
@@ -1097,6 +1103,52 @@ def _build_tooltip(d: CanvasDevice) -> str:
                 lines.append(f"  0x{u:04X}  {label}")
             else:
                 lines.append(f"  0x{u:04X}")
+    # Addresses move to the cluster-badge tooltip for cluster
+    # primaries (where the list is the union over absorbed members
+    # and would otherwise overflow the main tooltip). Single-device
+    # devices still see their address list here — there's no badge
+    # tooltip to host it on.
+    if d.addresses and not is_cluster:
+        lines.append("")
+        lines.append(f"Addresses ({len(d.addresses)}):")
+        for addr, atype in d.addresses[:_TOOLTIP_ADDR_MAX]:
+            lines.append(f"  {addr}  ({atype})")
+        if len(d.addresses) > _TOOLTIP_ADDR_MAX:
+            lines.append(
+                f"  +{len(d.addresses) - _TOOLTIP_ADDR_MAX} more"
+            )
+    return "\n".join(lines)
+
+
+def _build_cluster_tooltip(d: CanvasDevice) -> str:
+    """Tooltip shown when the cursor hovers the cluster badge.
+
+    Carries the cluster identity (id, member count, min score, the
+    list of absorbed device_ids) and the union of addresses across
+    the cluster. This is the home for "what got merged into this
+    box" so the main tooltip can stay focused on the primary's own
+    identity and stats.
+
+    Returns an empty string when the device isn't a cluster primary
+    — the badge isn't drawn in that case so the tooltip is unused.
+    """
+    if d.cluster_member_count <= 1:
+        return ""
+    lines: list[str] = []
+    lines.append(_pick_display_label(d))
+    lines.append("─" * 36)
+    score = (
+        f" (min score {d.cluster_min_score:.2f})"
+        if d.cluster_min_score is not None else ""
+    )
+    lines.append(
+        f"Cluster:       {d.cluster_id} · "
+        f"{d.cluster_member_count} member"
+        f"{'s' if d.cluster_member_count != 1 else ''}{score}"
+    )
+    if d.cluster_member_ids:
+        ids = ", ".join(str(i) for i in d.cluster_member_ids)
+        lines.append(f"Absorbed IDs:  {ids}")
     if d.addresses:
         lines.append("")
         lines.append(f"Addresses ({len(d.addresses)}):")
@@ -1459,11 +1511,16 @@ class DeviceItem(QGraphicsItem):
         self.setFlag(QGraphicsItem.ItemSendsGeometryChanges, True)
         self.setPos(device.pos_x, device.pos_y)
         self.setZValue(_Z_EXPANDED if not device.collapsed else _Z_NORMAL)
-        # Comprehensive tooltip — gives the full text of every value that
-        # might get truncated in the rendered box (vendor, model, name,
-        # broadcast name, addresses, etc.) so the user can mouse-over to
-        # see what doesn't fit on screen.
-        self.setToolTip(_build_tooltip(device))
+        # Pre-built tooltip strings, swapped on hover by region:
+        # over the cluster badge → cluster identity + merged-address
+        # list; anywhere else → the main tooltip (everything except
+        # the badge-owned content). Cached so we're not rebuilding
+        # the strings on every mouse-move event.
+        self._main_tooltip = _build_tooltip(device)
+        self._cluster_tooltip = _build_cluster_tooltip(device)
+        self.setToolTip(self._main_tooltip)
+        # Hover events drive the region-specific tooltip swap.
+        self.setAcceptHoverEvents(True)
 
     def notify_channel_hit(
         self,
@@ -1566,11 +1623,10 @@ class DeviceItem(QGraphicsItem):
         # Square off the bottom of the header so it joins the body cleanly.
         painter.drawRect(QRectF(0, _BOX_RADIUS, _BOX_W, _HEADER_H - _BOX_RADIUS))
 
-        # Reserve room on the left for the cluster badge (if any) so
-        # the icon doesn't sit underneath it. Reserve room on the
-        # right for the data-flash badge + adv strip column so a long
-        # wrapped title doesn't bleed under the 37/38/39 indicators.
-        cluster_reserve = self._cluster_badge_reserve_w()
+        # Reserve room on the right for the data-flash badge + adv
+        # strip column so a long wrapped title doesn't bleed under
+        # the 37/38/39 indicators. The cluster badge no longer steals
+        # header space — it lives in the lower-left corner of the body.
         adv_reserve = (
             _CH_FLASH_BADGE_MARGIN
             + max(_CH_FLASH_BADGE_W, 3 * _ADV_CH_BOX_W + 2 * _ADV_CH_BOX_GAP)
@@ -1578,7 +1634,7 @@ class DeviceItem(QGraphicsItem):
         )
 
         # Icon (left side): device_class SVG, falling back to fallback_icon.svg.
-        icon_rect = QRectF(6 + cluster_reserve, 0, 44, _HEADER_H)
+        icon_rect = QRectF(6, 0, 44, _HEADER_H)
         renderer = (
             _icon_renderer(self.device.device_class)
             or _icon_renderer(_FALLBACK_SVG_NAME)
@@ -1766,58 +1822,52 @@ class DeviceItem(QGraphicsItem):
     def _cluster_badge_text(self) -> str:
         return f"↔ {self.device.cluster_member_count}"
 
-    def _cluster_badge_reserve_w(self) -> float:
-        """How far right to shift the icon to clear the cluster badge.
+    def _cluster_badge_rect(self) -> QRectF:
+        """Lower-left placement for the cluster badge.
 
-        Returns 0 when the device isn't a cluster primary. Otherwise:
-        badge spans ``[_CLUSTER_BADGE_MARGIN, _CLUSTER_BADGE_MARGIN +
-        badge_w]``; the icon's default left edge is x=6. We shift the
-        icon by however much it overlaps the badge plus a 2 px gap.
-        Computed off the live badge text so "↔ 2" reserves less than
-        "↔ 999".
+        Anchored to the bottom-left corner of the box's bounding rect
+        (collapsed or expanded — the bounding rect already accounts
+        for state), with ``_CLUSTER_BADGE_MARGIN`` on both axes. The
+        width grows with the digit count so "↔ 213" still fits.
+        Returns an empty QRectF when the device isn't a cluster
+        primary — callers can use ``isEmpty()`` as a "no badge" check.
         """
         if self.device.cluster_member_count <= 1:
-            return 0.0
+            return QRectF()
         font = QFont()
         font.setBold(True)
         font.setPointSize(8)
         text_w = QFontMetricsF(font).horizontalAdvance(self._cluster_badge_text())
         badge_w = text_w + 2 * _CLUSTER_BADGE_PAD_X
-        badge_right = _CLUSTER_BADGE_MARGIN + badge_w
-        icon_default_x = 6
-        return max(0.0, badge_right + 2 - icon_default_x)
+        box_h = self.boundingRect().height()
+        y = box_h - _CLUSTER_BADGE_H - _CLUSTER_BADGE_MARGIN
+        return QRectF(
+            _CLUSTER_BADGE_MARGIN, y, badge_w, _CLUSTER_BADGE_H,
+        )
 
     def _paint_cluster_badge(self, painter: QPainter) -> None:
-        """Render the ↔N badge in the box's top-left corner.
+        """Render the ↔N badge in the box's lower-left corner.
 
         Only called when the device represents a collapsed cluster
-        (more than one member). The badge sits *over* the upper-left
-        of the kind-fill body, distinct in colour from any kind tint
-        so it scans across a grid of boxes regardless of kind. The
-        icon and title rect get shifted right by
-        ``_cluster_badge_reserve_w`` in ``paint`` so the badge no
-        longer occludes the device-class glyph.
+        (more than one member). The badge sits over the bottom-left
+        of the body, distinct in colour from any kind tint so it
+        scans across a grid of boxes regardless of kind. The icon and
+        title text in the header are no longer shifted to make room
+        for it — the badge has its own corner now.
         """
-        text = self._cluster_badge_text()
+        rect = self._cluster_badge_rect()
+        if rect.isEmpty():
+            return
         font = QFont()
         font.setBold(True)
         font.setPointSize(8)
         painter.setFont(font)
-        metrics = painter.fontMetrics()
-        text_w = metrics.horizontalAdvance(text)
-        badge_w = text_w + 2 * _CLUSTER_BADGE_PAD_X
-        badge_rect = QRectF(
-            _CLUSTER_BADGE_MARGIN,
-            _CLUSTER_BADGE_MARGIN,
-            badge_w,
-            _CLUSTER_BADGE_H,
-        )
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QBrush(_CLUSTER_BADGE_BG))
-        painter.drawRoundedRect(badge_rect, 4, 4)
+        painter.drawRoundedRect(rect, 4, 4)
         painter.setPen(QPen(_CLUSTER_BADGE_FG))
         painter.drawText(
-            badge_rect, Qt.AlignmentFlag.AlignCenter, text,
+            rect, Qt.AlignmentFlag.AlignCenter, self._cluster_badge_text(),
         )
 
     def _paint_collapsed_body(self, painter: QPainter) -> None:
@@ -2162,6 +2212,25 @@ class DeviceItem(QGraphicsItem):
         return _Z_EXPANDED if not self.device.collapsed else _Z_NORMAL
 
     # --- interaction --------------------------------------------------
+
+    def hoverMoveEvent(self, event) -> None:
+        """Swap the active tooltip based on which region the cursor
+        is over. The cluster badge gets its own tooltip carrying the
+        cluster identity and the merged-address list; everywhere else
+        on the box shows the main identity tooltip. Both strings are
+        pre-built in __init__ so this is just a rect-contains check
+        per move event.
+        """
+        if (
+            self._cluster_tooltip
+            and self._cluster_badge_rect().contains(event.pos())
+        ):
+            if self.toolTip() != self._cluster_tooltip:
+                self.setToolTip(self._cluster_tooltip)
+        else:
+            if self.toolTip() != self._main_tooltip:
+                self.setToolTip(self._main_tooltip)
+        super().hoverMoveEvent(event)
 
     def mousePressEvent(self, event) -> None:
         # Float to the top while the user is interacting with this box —

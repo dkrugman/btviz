@@ -164,6 +164,47 @@ class SummaryTickTests(unittest.TestCase):
         self.assertGreater(s.jitter_s, 1.0)  # mixed-gap shows jitter
 
 
+class EmissionTimestampTests(unittest.TestCase):
+    """SUMMARY's prefix timestamp is the emission time, not last-seen.
+
+    Without this, summaries appear "back in time" relative to the
+    verbatim lines emitted between their last sample and the
+    summary tick — confusing for ``tail -f`` reading.
+    """
+
+    def test_emission_ts_overrides_last_seen_in_render(self):
+        eng = DrainerEngine()
+        for i in range(3):
+            eng.ingest(_rec(
+                f"watchdog tick — silent={i}", ts=1000.0 + i * 10.0,
+            ))
+        # Sample times: 1000, 1010, 1020. Pretend we're emitting
+        # the summary at t=2000 (much later) — the rendered line
+        # should reflect 2000, not 1020.
+        summaries = eng.tick_summary(now=2000.0)
+        self.assertEqual(len(summaries), 1)
+        s = summaries[0]
+        self.assertEqual(s.emission_ts, 2000.0)
+        self.assertEqual(s.last_ts, 1020.0)
+        from datetime import datetime
+        expected_prefix = datetime.fromtimestamp(2000.0).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        self.assertTrue(s.render().startswith(expected_prefix))
+
+    def test_emission_ts_defaults_to_last_seen(self):
+        # Backward-compat: if a caller doesn't pass ``now``, the
+        # emission_ts falls back to last_seen so existing test
+        # patterns keep working.
+        eng = DrainerEngine()
+        for i in range(3):
+            eng.ingest(_rec(
+                f"watchdog tick — silent={i}", ts=1000.0 + i * 10.0,
+            ))
+        summaries = eng.tick_summary()  # no now
+        self.assertEqual(summaries[0].emission_ts, 1020.0)
+
+
 class VerbatimMatchTests(unittest.TestCase):
 
     def test_stall_lines_always_verbatim(self):
@@ -177,6 +218,31 @@ class VerbatimMatchTests(unittest.TestCase):
                 f"STALL detected sniffer=abc role=scan silent_for=70.{i}s "
                 f"attempt={i+1}",
                 ts=1000.0 + i * 60.0, level="WARNING",
+            ))
+            self.assertEqual(len(emit), 1)
+
+    def test_per_dongle_discovery_lines_always_verbatim(self):
+        # Per-dongle discovery rows ("dongle short_id=… serial=…")
+        # differ only in numeric ID — Drain3 would otherwise cluster
+        # them. They're load-bearing for diagnosis (which dongle is
+        # which?) so the default regex keeps them verbatim. Same
+        # rationale that already covers STALL.
+        eng = DrainerEngine()
+        for sid in ("2234201", "223101", "2234301"):
+            emit = eng.ingest(_rec(
+                f"  dongle short_id={sid} serial=ABCDEF "
+                f"port=/dev/cu.usbmodem{sid} display=nRF Sniffer",
+                ts=1000.0, level="VERBOSE",
+            ))
+            self.assertEqual(len(emit), 1)
+
+    def test_per_role_assignment_lines_always_verbatim(self):
+        # Per-sniffer role rows are similarly load-bearing.
+        eng = DrainerEngine()
+        for sid in ("2234201", "223101", "2234301"):
+            emit = eng.ingest(_rec(
+                f"  role short_id={sid} role=scan running=True",
+                ts=1000.0, level="VERBOSE",
             ))
             self.assertEqual(len(emit), 1)
 

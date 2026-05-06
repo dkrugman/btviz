@@ -198,7 +198,7 @@ def drain_file(
 
             now = clock()
             if now - last_summary_at >= summary_interval_s:
-                summaries = engine.tick_summary()
+                summaries = engine.tick_summary(now=clock())
                 if summaries:
                     for s in summaries:
                         sink.write(s.render() + "\n")
@@ -208,7 +208,7 @@ def drain_file(
             if stop_when_eof:
                 # Final flush of any pending repeats so the test
                 # sees them without waiting for a tick.
-                summaries = engine.tick_summary()
+                summaries = engine.tick_summary(now=clock())
                 if summaries:
                     for s in summaries:
                         sink.write(s.render() + "\n")

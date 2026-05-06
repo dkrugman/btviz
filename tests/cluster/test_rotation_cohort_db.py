@@ -200,6 +200,73 @@ class IntegrationWithSignalTests(unittest.TestCase):
         score = self.signal.score(ctx, self.a, self.b)
         self.assertEqual(score, -1.0)
 
+    def test_default_params_score_real_rotation_near_one(self):
+        # Regression: with defaults (expected=900, window_max=1800),
+        # a real ~15-min RPA rotation must score near 1.0. Previously
+        # window_max=60 clipped this to 0.0 — the score formula's peak
+        # region was unreachable.
+        _seed_packets(self.store, self.session_id, self.id_a,
+                      {1: [0.0, 100.0, 500.0, 900.0]})
+        _seed_packets(self.store, self.session_id, self.id_b,
+                      {1: [1810.0, 1900.0, 2700.0]})
+        ctx = self._ctx()
+        score = self.signal.score(ctx, self.a, self.b)  # default params
+        # gap = 1810 - 900 = 910 → 1 - 10/900 ≈ 0.989
+        self.assertIsNotNone(score)
+        self.assertGreater(score, 0.95)
+
+    def test_short_handoff_with_no_overlap_scores_positive(self):
+        # The user's HA reset case: device A stops, device B starts
+        # 13s later. No emission overlap on the same sniffer. Old code
+        # would reject this as "concurrent" (because the nearest pair
+        # was within expected_rotation=900). New code uses true
+        # window-overlap, so this is correctly seen as a fast handoff
+        # and gets a small (but non-zero) score.
+        _seed_packets(self.store, self.session_id, self.id_a,
+                      {1: [0.0, 100.0, 500.0]})
+        _seed_packets(self.store, self.session_id, self.id_b,
+                      {1: [513.0, 600.0, 700.0]})
+        ctx = self._ctx()
+        score = self.signal.score(ctx, self.a, self.b)
+        self.assertIsNotNone(score)
+        self.assertGreater(score, 0.0)
+        # Far from the expected_rotation peak, so the score is small —
+        # weak evidence on its own, but positive enough that a profile
+        # weighting it alongside corroborating signals can still merge.
+        self.assertLess(score, 0.05)
+
+    def test_overlapping_windows_rejected_even_when_far_apart_inside(self):
+        # Device A emits 0..1000, device B emits 500..1500. Their
+        # nearest cross-pair is hundreds of seconds apart, but their
+        # emission windows overlap (500..1000 = 500 s of overlap).
+        # That's true concurrent existence — must reject with -1.0.
+        _seed_packets(self.store, self.session_id, self.id_a,
+                      {1: [0.0, 1000.0]})
+        _seed_packets(self.store, self.session_id, self.id_b,
+                      {1: [500.0, 1500.0]})
+        ctx = self._ctx()
+        score = self.signal.score(ctx, self.a, self.b)
+        self.assertEqual(score, -1.0)
+
+    def test_overlap_slack_absorbs_small_overlap(self):
+        # A few seconds of overlap (rotation jitter) shouldn't reject
+        # a pair when overlap_slack is configured to absorb it.
+        _seed_packets(self.store, self.session_id, self.id_a,
+                      {1: [0.0, 100.0, 902.0]})  # bleeds 2s past 900
+        _seed_packets(self.store, self.session_id, self.id_b,
+                      {1: [900.0, 1000.0, 1800.0]})  # starts at 900
+        ctx = self._ctx()
+        # Default slack=0 → 2s of overlap → reject.
+        score_strict = self.signal.score(ctx, self.a, self.b)
+        self.assertEqual(score_strict, -1.0)
+        # slack=5 → 2s overlap is within slack → pass to handoff.
+        score_lenient = self.signal.score(
+            ctx, self.a, self.b,
+            params={"overlap_slack": 5.0},
+        )
+        self.assertIsNotNone(score_lenient)
+        self.assertNotEqual(score_lenient, -1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

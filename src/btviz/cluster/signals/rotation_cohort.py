@@ -28,9 +28,25 @@ from ..base import ClusterContext, Device
 
 @dataclass(frozen=True)
 class _Params:
-    expected_rotation: float = 900.0  # seconds
+    # Peak score sits at this gap; score decays linearly as the
+    # observed gap moves away from it. Defaults to 900 s (15 min,
+    # the typical RPA rotation cadence for AirTags / iPhones).
+    expected_rotation: float = 900.0
+    # Smallest gap we'll score. Below this, the handoff is so fast
+    # it's "suspiciously instantaneous" — score 0.5 (moderate).
     window_min: float = 0.05
-    window_max: float = 60.0
+    # Largest gap we'll score. Beyond this, the gap is too long for
+    # a plausible same-device handoff regardless of cadence — score
+    # 0.0. Default 1800 s (30 min) so typical 5-15 min rotations
+    # land near the 900 s peak without being clipped.
+    window_max: float = 1800.0
+    # Concurrent-existence rejection: how much the two devices'
+    # observation windows are allowed to overlap before treating
+    # them as "both alive at once" (and thus impossible to be one
+    # device handing off identity). Default 0 — strict overlap is
+    # rejection. Tunable upward to absorb ~1 s of measurement jitter
+    # if RPA rotation isn't atomic in your data.
+    overlap_slack: float = 0.0
     min_observations: int = 1
 
 
@@ -39,7 +55,8 @@ def _params(raw: Mapping[str, Any] | None) -> _Params:
     return _Params(
         expected_rotation=float(raw.get("expected_rotation", 900.0)),
         window_min=float(raw.get("window_min", 0.05)),
-        window_max=float(raw.get("window_max", 60.0)),
+        window_max=float(raw.get("window_max", 1800.0)),
+        overlap_slack=float(raw.get("overlap_slack", 0.0)),
         min_observations=int(raw.get("min_observations", 1)),
     )
 
@@ -128,12 +145,18 @@ class RotationCohort:
         if not common:
             return None
 
-        # Concurrent-existence rejection (refinement C6a).
-        # If they were both observed *together* by the same sniffer
-        # within the rotation window, they cannot be one rotating
-        # device — return active-mismatch score.
+        # Concurrent-existence rejection. If the two devices' emission
+        # windows overlap on the same sniffer, they were both alive at
+        # once and cannot be one device handing off identity. The
+        # previous formulation used ``expected_rotation`` as a
+        # "nearest-pair distance" threshold, which conflated the
+        # rotation cadence with the overlap-detection radius and made
+        # any sub-rotation handoff look concurrent — fixed by switching
+        # to true window-overlap semantics.
         for s in common:
-            if self._concurrently_observed(obs_a[s], obs_b[s], p.expected_rotation):
+            if self._concurrently_observed(
+                obs_a[s], obs_b[s], p.overlap_slack,
+            ):
                 return -1.0
 
         best: float | None = None
@@ -151,23 +174,27 @@ class RotationCohort:
 
     @staticmethod
     def _concurrently_observed(
-        ts_a: list[float], ts_b: list[float], rotation_s: float
+        ts_a: list[float], ts_b: list[float], slack_s: float,
     ) -> bool:
-        """True if any pair of timestamps from a, b is within rotation_s."""
+        """True if a's and b's emission windows overlap by more than
+        ``slack_s`` seconds on this sniffer.
+
+        Each device's "alive window" is ``[min(ts), max(ts)]``. They're
+        concurrent iff those windows intersect. Overlap is computed as
+        ``min(last_a, last_b) - max(first_a, first_b)``; a value > 0
+        means the windows intersected for that many seconds.
+
+        ``slack_s`` lets a small measured overlap still count as
+        handoff (RPA rotation isn't atomic — adjacent windows can
+        bleed into each other by a fraction of a second). Default 0
+        treats any overlap as rejection.
+        """
         if not ts_a or not ts_b:
             return False
-        i = j = 0
-        ts_a = sorted(ts_a)
-        ts_b = sorted(ts_b)
-        while i < len(ts_a) and j < len(ts_b):
-            d = ts_a[i] - ts_b[j]
-            if abs(d) < rotation_s:
-                return True
-            if d < 0:
-                i += 1
-            else:
-                j += 1
-        return False
+        first_a, last_a = min(ts_a), max(ts_a)
+        first_b, last_b = min(ts_b), max(ts_b)
+        overlap = min(last_a, last_b) - max(first_a, first_b)
+        return overlap > slack_s
 
     @staticmethod
     def _score_handoff(
@@ -176,8 +203,19 @@ class RotationCohort:
         """Score the best handoff between sequence a and sequence b.
 
         We allow either direction (a→b or b→a) since the labels are
-        arbitrary. Take the smallest forward gap that lands in the
-        plausible window; score it by proximity to expected rotation.
+        arbitrary. Take the smallest forward gap (last-of-one to
+        first-of-the-other) and score by proximity to ``expected_rotation``:
+
+          * gap > ``window_max``                    → 0.0  (too long for plausible handoff)
+          * gap < ``window_min``                    → 0.5  (suspiciously instantaneous)
+          * otherwise: 1.0 − |gap − expected| / expected
+            (peaks at 1.0 when gap == expected, decays linearly)
+
+        ``window_max`` should be large enough to span the expected
+        rotation cadence (default 1800 s for a 900 s peak). The
+        previous default of 60 s clipped the score formula's peak
+        region entirely and made the signal unable to score real
+        rotations — fixed in this revision.
         """
         last_a = max(ts_a)
         first_b = min(ts_b)
@@ -195,9 +233,16 @@ class RotationCohort:
             candidates.append(gap_ba)
 
         if not candidates:
-            return None
-
-        best_gap = min(candidates)
+            # No positive forward gap means the emission windows
+            # overlap. The caller's concurrent-check has already
+            # verified the overlap is within ``overlap_slack`` (else
+            # we'd have returned -1.0 before getting here), so this
+            # is jitter at the rotation boundary. Treat as a
+            # zero-gap handoff — the window_min branch picks it up
+            # as "suspiciously instantaneous" (score 0.5).
+            best_gap = 0.0
+        else:
+            best_gap = min(candidates)
 
         if best_gap > p.window_max:
             return 0.0

@@ -2907,26 +2907,22 @@ class CanvasWindow(QMainWindow):
             self._on_cluster_period_changed,
         )
         tb.addWidget(self._cluster_period_combo)
-        # Verbose abstain logging: toggle the cluster logger between
-        # INFO (default) and DEBUG. DEBUG enables a per-pair line for
-        # every abstain, with the partial signals/scores. Useful while
-        # iterating on signals/profiles; very loud (O(n²) per class).
-        self._cluster_verbose_action = tb.addAction(
-            "Verbose cluster log", self._on_cluster_verbose_toggled,
-        )
-        self._cluster_verbose_action.setCheckable(True)
+        # Verbose cluster log moved to Preferences (cluster.verbose_log)
+        # — applied at app startup, no toolbar slot needed for a
+        # diagnostic toggle that's mostly off in normal use.
         tb.addSeparator()
 
         # ---- Maintenance group (right side) --------------------------------
-        # Reload / Reset layout / Clear all data sit in their own group
-        # to the right of the cluster controls — visible at a glance
-        # but separated from the day-to-day capture/view/cluster flow.
+        # Reset layout / Clear all data sit in their own group to the
+        # right of the cluster controls — visible at a glance but
+        # separated from the day-to-day capture/view/cluster flow.
         # ``Clear all data…`` keeps its trailing ellipsis to signal it
         # opens a confirmation dialog before destroying anything.
-        # ``Refresh sniffers`` moved out of the toolbar entirely — it
-        # lives at the top of the sniffer panel now (one click, in the
-        # same panel where its results land).
-        tb.addAction("Reload", self.reload)
+        # ``Reload`` removed: the canvas auto-reloads every ~2 s during
+        # live capture and after every state-changing action (rename,
+        # set class, hide, follow, …), so a manual reload button never
+        # had a reachable purpose. ``Refresh sniffers`` lives at the
+        # top of the sniffer panel.
         tb.addAction("Reset layout", self.reset_layout)
         tb.addAction("Clear all data…", self.clear_all_data)
         # Preferences action — Qt routes this to the application menu
@@ -3278,27 +3274,6 @@ class CanvasWindow(QMainWindow):
         """
         if self._live is None:
             self.reload()
-
-    def _on_cluster_verbose_toggled(self) -> None:
-        """Flip the cluster logger between INFO (default) and DEBUG.
-
-        DEBUG enables a per-pair abstain line showing exactly what
-        signals contributed (and at what weight) before the aggregator
-        gave up. Loud — O(n²) per class — so off by default.
-        """
-        import logging
-        from ..cluster import get_cluster_logger
-        logger = get_cluster_logger()
-        if self._cluster_verbose_action.isChecked():
-            logger.setLevel(logging.DEBUG)
-            for h in logger.handlers:
-                h.setLevel(logging.DEBUG)
-            self.status.setText("  cluster log: verbose (DEBUG)")
-        else:
-            logger.setLevel(logging.INFO)
-            for h in logger.handlers:
-                h.setLevel(logging.INFO)
-            self.status.setText("  cluster log: normal (INFO)")
 
     def _open_preferences(self) -> None:
         """Open the modal Preferences dialog.

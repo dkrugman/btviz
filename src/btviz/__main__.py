@@ -6,10 +6,27 @@ import sys
 
 
 def main() -> int:
+    import logging
+
     from .cluster import configure_cluster_log, get_cluster_logger
     from .capture_log import configure_capture_log, get_capture_logger
     configure_cluster_log()
     configure_capture_log()
+    # Apply ``cluster.verbose_log`` preference at startup. Bumps the
+    # cluster logger (and its handlers) to DEBUG when enabled, so
+    # per-pair abstain lines start landing in cluster.log on the
+    # next cluster run. Reverts to INFO when disabled. Any errors
+    # reading prefs (e.g., during early bootstrap) leave the logger
+    # at its configure_cluster_log default.
+    try:
+        from .preferences import get_prefs
+        if bool(get_prefs().get("cluster.verbose_log")):
+            cluster_log = get_cluster_logger()
+            cluster_log.setLevel(logging.DEBUG)
+            for h in cluster_log.handlers:
+                h.setLevel(logging.DEBUG)
+    except Exception:  # noqa: BLE001 — preferences unavailable
+        pass
     get_cluster_logger().info("btviz startup")
     get_capture_logger().info("btviz startup")
 

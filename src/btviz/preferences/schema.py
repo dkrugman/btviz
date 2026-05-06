@@ -225,6 +225,19 @@ SCHEMA: tuple[Field, ...] = (
             "Higher = more conservative merges."
         ),
     ),
+    Field(
+        key="cluster.verbose_log",
+        file="cluster", section="runner", name="verbose_log",
+        type=bool, default=False, requires_restart=True,
+        label="Verbose cluster log",
+        description=(
+            "When enabled, the cluster logger writes a per-pair line "
+            "for every abstain decision (which signals contributed and "
+            "at what weight) at DEBUG level. Loud — O(N²) per class — "
+            "but invaluable while iterating on signals or profiles. "
+            "Off by default; INFO-level run narration always logs."
+        ),
+    ),
 
     # ─── per-signal kill switches ─────────────────────────────────────
     # Each cluster signal can be disabled here without editing any

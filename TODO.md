@@ -149,14 +149,10 @@ the implementation order.
 
 ## Cleanup
 
-- [ ] **Strip one-time diagnostic logs.** Two stderr lines that were
-      useful when debugging the DLT 272 / NBE-flags-byte mismatches
-      and have served their purpose:
+- [x] **Strip one-time diagnostic logs.** Removed in `feat/rssi-signature-and-cleanup`.
     - `[sniffer] <id> pcap magic=0xa1b2c3d4 dlt=N` in
       `extcap/sniffer.py::_capture_loop`.
     - `[live-decode] reject src=… first32=…` in
       `capture/live_ingest.py::_on_packet`.
-- [ ] **Stale `app.py` reference in `canvas.py` docstring.** Module
-      docstring still says "Lives alongside the live-capture table
-      window in app.py (which is unchanged)". `app.py` was retired
-      in `feat/canvas-follow-and-retire-app`. One-line fix.
+- [x] **Stale `app.py` reference in `canvas.py` docstring.** Fixed in
+      `feat/rssi-signature-and-cleanup`.

@@ -313,6 +313,19 @@ SCHEMA: tuple[Field, ...] = (
             "Handoff observations in the recent window."
         ),
     ),
+    Field(
+        key="cluster.signals.rssi_signature",
+        file="cluster", section="signals", name="rssi_signature",
+        type=bool, default=True, requires_restart=True,
+        label="rssi_signature",
+        description=(
+            "Per-sniffer mean-RSSI agreement between two devices "
+            "observed by the same dongles. Same physical device → "
+            "same distance from each antenna → near-identical RSSI "
+            "distributions. Reads the packets table; abstains for "
+            "captures with 'Record packets' off."
+        ),
+    ),
 
     # ─── canvas / display ─────────────────────────────────────────────
     Field(

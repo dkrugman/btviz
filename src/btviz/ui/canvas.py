@@ -5,8 +5,8 @@ A QGraphicsScene populated from the DB. Each device is a draggable
 view. Layout persists to the ``device_layouts`` table on drag-end.
 
 Entry point: ``run_canvas(db_path=None, project_name=None)``. Called by
-``btviz canvas`` in __main__.py. Lives alongside the live-capture table
-window in app.py (which is unchanged).
+``btviz canvas`` in ``__main__.py``. The live-capture sniffer panel
+docks into the same QMainWindow.
 """
 from __future__ import annotations
 

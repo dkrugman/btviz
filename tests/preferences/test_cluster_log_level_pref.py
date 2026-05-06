@@ -45,7 +45,8 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(
             field.enum, ("error", "warning", "info", "verbose", "debug"),
         )
-        self.assertTrue(field.requires_restart)
+        # Live-applies on save — see preferences/ui.py:_apply_live_prefs.
+        self.assertFalse(field.requires_restart)
 
 
 class StartupApplyTests(unittest.TestCase):

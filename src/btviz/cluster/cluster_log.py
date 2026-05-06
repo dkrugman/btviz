@@ -87,6 +87,11 @@ def apply_cluster_log_prefs(level: str | int | None = None) -> None:
     parity and so future VERBOSE-tier cluster narration (e.g.,
     per-class headers, per-signal timing) can be added without a
     schema migration.
+
+    On change, logs a confirmation line *at the new level* so the
+    message survives the new filter — e.g., setting ERROR still
+    produces an ERROR-tier confirmation. The user sees the change
+    take effect by glancing at cluster.log after Save.
     """
     # Imported here to avoid a circular at module load (capture_log
     # is independent of cluster, so cluster_log → capture_log is
@@ -94,6 +99,14 @@ def apply_cluster_log_prefs(level: str | int | None = None) -> None:
     from ..capture_log import resolve_level
     target = resolve_level(level)
     logger = logging.getLogger(LOG_NAME)
+    old_level = logger.level
     logger.setLevel(target)
     for h in logger.handlers:
         h.setLevel(target)
+    if old_level != target:
+        logger.log(
+            target,
+            "cluster log level: %s (was %s)",
+            logging.getLevelName(target).lower(),
+            logging.getLevelName(old_level).lower(),
+        )

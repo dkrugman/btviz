@@ -20,7 +20,8 @@ broadcasts (Auracast) — across multiple captures over time.
   `nRF Sniffer for Bluetooth LE COM…`.
 - One or more **Nordic nRF52840 dongles or DKs** flashed with the official
   nRF Sniffer firmware (only needed for live capture; file ingest works
-  without hardware).
+  without hardware). See [docs/HARDWARE.md](docs/HARDWARE.md) for the full
+  compatible-device list, firmware-flashing steps, and troubleshooting.
 
 ## Install
 

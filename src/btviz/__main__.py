@@ -6,30 +6,25 @@ import sys
 
 
 def main() -> int:
-    import logging
-
-    from .cluster import configure_cluster_log, get_cluster_logger
+    from .cluster import (
+        apply_cluster_log_prefs, configure_cluster_log, get_cluster_logger,
+    )
     from .capture_log import (
         apply_capture_log_prefs, configure_capture_log, get_capture_logger,
     )
     configure_cluster_log()
     configure_capture_log()
-    # Apply log-level preferences at startup. Cluster has one verbose
-    # knob (DEBUG); capture has two (verbose ⇒ VERBOSE=15, debug ⇒
-    # DEBUG=10). Errors reading prefs (e.g., early-bootstrap)
-    # silently fall back to the configure_*_log defaults (INFO).
+    # Apply log-level preferences at startup. Both ``capture.log_level``
+    # and ``cluster.log_level`` are 5-state dropdowns
+    # (error/warning/info/verbose/debug); the apply functions resolve
+    # the string to a numeric level. Errors reading prefs (e.g.,
+    # early-bootstrap) silently fall back to the configure_*_log
+    # defaults (INFO).
     try:
         from .preferences import get_prefs
         prefs = get_prefs()
-        if bool(prefs.get("cluster.verbose_log")):
-            cluster_log = get_cluster_logger()
-            cluster_log.setLevel(logging.DEBUG)
-            for h in cluster_log.handlers:
-                h.setLevel(logging.DEBUG)
-        apply_capture_log_prefs(
-            verbose=bool(prefs.get("capture.verbose_log")),
-            debug=bool(prefs.get("capture.debug_log")),
-        )
+        apply_cluster_log_prefs(prefs.get("cluster.log_level"))
+        apply_capture_log_prefs(prefs.get("capture.log_level"))
     except Exception:  # noqa: BLE001 — preferences unavailable
         pass
     # "btviz startup" denotes program start — fires once per process

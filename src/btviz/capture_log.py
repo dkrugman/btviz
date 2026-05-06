@@ -137,28 +137,52 @@ def configure_capture_log(
     return logger
 
 
-def apply_capture_log_prefs(verbose: bool, debug: bool) -> None:
-    """Bump the capture logger's level based on user preferences.
+#: Mapping from the user-facing level name (the dropdown values in
+#: ``capture.log_level``) to Python's numeric log level. Order in
+#: the dropdown should mirror this dict — quietest first, loudest
+#: last — so the UI reads naturally.
+LEVEL_NAMES: dict[str, int] = {
+    "error":   logging.ERROR,    # 40
+    "warning": logging.WARNING,  # 30
+    "info":    logging.INFO,     # 20
+    "verbose": VERBOSE,          # 15
+    "debug":   logging.DEBUG,    # 10
+}
 
-    Both flags can be on at once (debug is more verbose than
-    verbose, so debug wins). Both off → INFO. Idempotent;
-    ``__main__.py`` calls this once at startup, but the prefs
-    dialog can also call it on a live change in a later PR.
 
-    Re-applies to all attached handlers so the level change takes
-    effect immediately rather than waiting for the next handler
-    refresh.
+def resolve_level(name: str | int | None) -> int:
+    """Convert a level name (or numeric level) to int. INFO on miss.
+
+    Accepts the dropdown's string values, plain Python level ints,
+    or ``None`` (which means "stick with INFO"). Case-insensitive
+    on the string path so a stale ``capture.toml`` with ``"INFO"``
+    instead of ``"info"`` still works.
     """
+    if name is None:
+        return logging.INFO
+    if isinstance(name, int):
+        return name
+    return LEVEL_NAMES.get(str(name).lower(), logging.INFO)
+
+
+def apply_capture_log_prefs(level: str | int | None = None) -> None:
+    """Set the capture logger's level from the dropdown pref value.
+
+    Called once at startup from ``__main__.py``; idempotent and
+    safe to call again on a live preference change. Re-applies to
+    all attached handlers so the level change takes effect
+    immediately.
+
+    The previous bool-pair API ``(verbose, debug)`` was replaced
+    by a single 5-state dropdown (error / warning / info / verbose /
+    debug) — the two-checkbox UI suggested independent dimensions
+    when there's really only one ordered dimension.
+    """
+    target = resolve_level(level)
     logger = logging.getLogger(LOG_NAME)
-    if debug:
-        level = logging.DEBUG
-    elif verbose:
-        level = VERBOSE
-    else:
-        level = logging.INFO
-    logger.setLevel(level)
+    logger.setLevel(target)
     for h in logger.handlers:
-        h.setLevel(level)
+        h.setLevel(target)
 
 
 def get_capture_logger() -> logging.Logger:

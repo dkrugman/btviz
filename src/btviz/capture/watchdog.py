@@ -253,7 +253,12 @@ class StallWatchdog:
         attempt.count += 1
         attempt.last_at = now
 
-        log.info(
+        # WARNING-level: "detected" / "restarted" — recoverable
+        # events that the watchdog handled on its own. Above INFO
+        # so they're still visible at the strictest user-friendly
+        # level, but below ERROR which is reserved for unrecoverable
+        # ("you must replug") states.
+        log.warning(
             "STALL detected sniffer=%s role=%s silent_for=%.1fs attempt=%d",
             short_id, st.role, silent_for, attempt.count,
         )
@@ -267,7 +272,11 @@ class StallWatchdog:
         if attempt.count > self._max_attempts:
             attempt.given_up = True
             self._stuck.add(short_id)
-            log.warning(
+            # ERROR-level: ``gave_up`` is the only state that
+            # genuinely requires user action (physical replug or
+            # firmware reflash). Even a 'log_level=error' setting
+            # surfaces this so a quiet log isn't a misleading log.
+            log.error(
                 "STALL gave_up sniffer=%s attempts=%d — replug required",
                 short_id, attempt.count - 1,
             )
@@ -283,11 +292,15 @@ class StallWatchdog:
             return
 
         if ok:
-            log.info(
+            log.warning(
                 "STALL restarted sniffer=%s spawned new subprocess",
                 short_id,
             )
         else:
+            # Coordinator-declined restart is recoverable on the
+            # next tick (the watchdog will try again subject to the
+            # min-gap rule), so it stays at WARNING — error tier
+            # is reserved for terminal states.
             log.warning(
                 "STALL restart_failed sniffer=%s coordinator declined",
                 short_id,

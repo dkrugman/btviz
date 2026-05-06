@@ -67,29 +67,75 @@ class ApplyPrefsTests(unittest.TestCase):
         self._logger.addHandler(h)
         return h
 
-    def test_default_off_off_is_info(self):
+    def test_none_falls_back_to_info(self):
         h = self._attach_temp_handler()
-        capture_log.apply_capture_log_prefs(verbose=False, debug=False)
+        capture_log.apply_capture_log_prefs(None)
         self.assertEqual(self._logger.level, logging.INFO)
         self.assertEqual(h.level, logging.INFO)
 
-    def test_verbose_on_promotes_to_15(self):
+    def test_info_string(self):
         h = self._attach_temp_handler()
-        capture_log.apply_capture_log_prefs(verbose=True, debug=False)
+        capture_log.apply_capture_log_prefs("info")
+        self.assertEqual(self._logger.level, logging.INFO)
+        self.assertEqual(h.level, logging.INFO)
+
+    def test_verbose_string_promotes_to_15(self):
+        h = self._attach_temp_handler()
+        capture_log.apply_capture_log_prefs("verbose")
         self.assertEqual(self._logger.level, capture_log.VERBOSE)
         self.assertEqual(h.level, capture_log.VERBOSE)
 
-    def test_debug_on_promotes_to_debug(self):
+    def test_debug_string_promotes_to_debug(self):
         h = self._attach_temp_handler()
-        capture_log.apply_capture_log_prefs(verbose=False, debug=True)
+        capture_log.apply_capture_log_prefs("debug")
         self.assertEqual(self._logger.level, logging.DEBUG)
         self.assertEqual(h.level, logging.DEBUG)
 
-    def test_debug_dominates_verbose(self):
+    def test_warning_string_promotes_to_warning(self):
         h = self._attach_temp_handler()
-        capture_log.apply_capture_log_prefs(verbose=True, debug=True)
-        self.assertEqual(self._logger.level, logging.DEBUG)
-        self.assertEqual(h.level, logging.DEBUG)
+        capture_log.apply_capture_log_prefs("warning")
+        self.assertEqual(self._logger.level, logging.WARNING)
+        self.assertEqual(h.level, logging.WARNING)
+
+    def test_error_string_promotes_to_error(self):
+        h = self._attach_temp_handler()
+        capture_log.apply_capture_log_prefs("error")
+        self.assertEqual(self._logger.level, logging.ERROR)
+        self.assertEqual(h.level, logging.ERROR)
+
+    def test_uppercase_string_normalized(self):
+        # Stale TOML or hand-edited prefs may carry "INFO" instead
+        # of "info"; resolver lowercases before lookup.
+        h = self._attach_temp_handler()
+        capture_log.apply_capture_log_prefs("INFO")
+        self.assertEqual(self._logger.level, logging.INFO)
+        self.assertEqual(h.level, logging.INFO)
+
+    def test_unknown_string_falls_back_to_info(self):
+        # Defensive: an old-pref-version string (e.g., "trace") or
+        # typo shouldn't crash; INFO is the safe default.
+        h = self._attach_temp_handler()
+        capture_log.apply_capture_log_prefs("trace")
+        self.assertEqual(self._logger.level, logging.INFO)
+        self.assertEqual(h.level, logging.INFO)
+
+    def test_int_passed_through(self):
+        # Caller can pass a numeric level directly (e.g., a future
+        # programmatic API). resolve_level treats ints as already-
+        # resolved.
+        h = self._attach_temp_handler()
+        capture_log.apply_capture_log_prefs(logging.WARNING)
+        self.assertEqual(self._logger.level, logging.WARNING)
+        self.assertEqual(h.level, logging.WARNING)
+
+    def test_level_names_table_complete(self):
+        # The dropdown values in the prefs schema must match the
+        # LEVEL_NAMES keys. Pin the set so a future schema rename
+        # without a code update gets caught.
+        self.assertEqual(
+            set(capture_log.LEVEL_NAMES.keys()),
+            {"error", "warning", "info", "verbose", "debug"},
+        )
 
 
 class LogReachesFileTests(unittest.TestCase):

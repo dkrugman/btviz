@@ -226,44 +226,34 @@ SCHEMA: tuple[Field, ...] = (
         ),
     ),
     Field(
-        key="cluster.verbose_log",
-        file="cluster", section="runner", name="verbose_log",
-        type=bool, default=False, requires_restart=True,
-        label="Verbose cluster log",
+        key="cluster.log_level",
+        file="cluster", section="runner", name="log_level",
+        type=str, default="info", requires_restart=True,
+        enum=("error", "warning", "info", "verbose", "debug"),
+        label="Cluster log level",
         description=(
-            "When enabled, the cluster logger writes a per-pair line "
-            "for every abstain decision (which signals contributed and "
-            "at what weight) at DEBUG level. Loud — O(N²) per class — "
-            "but invaluable while iterating on signals or profiles. "
-            "Off by default; INFO-level run narration always logs."
+            "Cluster log verbosity. error/warning surface only "
+            "abnormal events; info adds run narration (decisions, "
+            "merges, no-merges); verbose/debug add per-pair "
+            "abstain detail (loud — O(N²) per class — but "
+            "invaluable while iterating on signals or profiles). "
+            "Default 'info'."
         ),
     ),
     Field(
-        key="capture.verbose_log",
-        file="capture", section="logging", name="verbose_log",
-        type=bool, default=False, requires_restart=True,
-        label="Verbose capture log",
+        key="capture.log_level",
+        file="capture", section="logging", name="log_level",
+        type=str, default="info", requires_restart=True,
+        enum=("error", "warning", "info", "verbose", "debug"),
+        label="Capture log level",
         description=(
-            "When enabled, capture.log gets the narrative tier — "
-            "per-dongle discovery rows, role assignments, watchdog "
-            "start, periodic in-flight summaries. Useful when "
-            "diagnosing chronic stalls or odd capture behaviour. "
-            "Off by default; INFO-level lifecycle events (capture "
-            "started / stopped, STALL detected) always log."
-        ),
-    ),
-    Field(
-        key="capture.debug_log",
-        file="capture", section="logging", name="debug_log",
-        type=bool, default=False, requires_restart=True,
-        label="Debug capture log",
-        description=(
-            "When enabled, capture.log gets per-tick watchdog "
-            "narration and per-source throughput samples — the "
-            "fire-hose tier. Use only while reproducing a specific "
-            "issue; the file rotates at 10 MB and the rate at this "
-            "level is high enough to evict useful older entries "
-            "during long captures. Implies verbose."
+            "Capture log verbosity. error shows only STALL gave_up "
+            "(replug required); warning adds STALL detected / "
+            "restarted; info adds capture started / stopped + "
+            "btviz exit; verbose adds per-dongle discovery, role "
+            "assignments, watchdog start, periodic summaries; "
+            "debug adds per-tick watchdog narration and per-source "
+            "throughput (fire-hose). Default 'info'."
         ),
     ),
 

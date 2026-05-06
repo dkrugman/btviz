@@ -14,7 +14,11 @@ from .base import (
     Device,
     Signal,
 )
-from .cluster_log import configure_cluster_log, get_cluster_logger
+from .cluster_log import (
+    apply_cluster_log_prefs,
+    configure_cluster_log,
+    get_cluster_logger,
+)
 from .db_loader import load_devices
 from .profile_loader import load_profiles
 from .runner import ClusterRunner, RunResult
@@ -28,6 +32,7 @@ __all__ = [
     "Device",
     "RunResult",
     "Signal",
+    "apply_cluster_log_prefs",
     "cluster_pair",
     "configure_cluster_log",
     "get_cluster_logger",

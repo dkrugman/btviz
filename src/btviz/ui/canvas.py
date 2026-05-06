@@ -681,6 +681,13 @@ def load_canvas_devices(
     # stale-filtered ``devices`` dict.
     rename_by_cluster_all: dict[int, tuple[float, str]] = {}
     distinct_names_by_cluster: dict[int, set[str]] = {}
+    # Same shape for user_device_class — when the user pinned a class
+    # on one cluster member, propagate to the rendered primary so the
+    # override doesn't appear to flip back when the runner re-elects a
+    # different primary. Multiple distinct overrides in one cluster →
+    # bail (mirror the rename ambiguity rule).
+    class_by_cluster_all: dict[int, tuple[float, str]] = {}
+    distinct_classes_by_cluster: dict[int, set[str]] = {}
     if clusters:
         cluster_ids = list(clusters.keys())
         cph = ",".join("?" * len(cluster_ids))
@@ -697,6 +704,19 @@ def load_canvas_devices(
             if existing is None or ls > existing[0]:
                 rename_by_cluster_all[cid] = (ls, un)
             distinct_names_by_cluster.setdefault(cid, set()).add(un)
+        for r in conn.execute(
+            f"SELECT m.cluster_id, d.user_device_class, d.last_seen"
+            f" FROM device_cluster_members m JOIN devices d ON d.id = m.device_id"
+            f" WHERE d.user_device_class IS NOT NULL AND m.cluster_id IN ({cph})",
+            cluster_ids,
+        ).fetchall():
+            cid = r["cluster_id"] if not isinstance(r, tuple) else r[0]
+            cls = r["user_device_class"] if not isinstance(r, tuple) else r[1]
+            ls = r["last_seen"] if not isinstance(r, tuple) else r[2]
+            existing = class_by_cluster_all.get(cid)
+            if existing is None or ls > existing[0]:
+                class_by_cluster_all[cid] = (ls, cls)
+            distinct_classes_by_cluster.setdefault(cid, set()).add(cls)
 
     # ---- Rename propagation (cluster-based, most accurate) ---------------
     # For each cluster represented in this canvas reload, propagate the
@@ -709,20 +729,34 @@ def load_canvas_devices(
         live_devs = [devices[did] for did, _ in mems if did in devices]
         if not live_devs:
             continue
-        # Multiple distinct user_names within one cluster means the user
-        # has labelled cluster members differently (e.g. a stereo pair
-        # incorrectly merged into one cluster, then split apart by
-        # rename). Don't guess — leave each member's stored user_name
-        # as-is.
-        if len(distinct_names_by_cluster.get(cluster_id, ())) > 1:
-            continue
-        picked = rename_by_cluster_all.get(cluster_id)
-        if picked is None:
-            continue
-        chosen = picked[1]
-        for d in live_devs:
-            if not d.user_name:
-                d.user_name = chosen
+
+        # User-name propagation. Multiple distinct user_names within
+        # one cluster means the user has labelled members differently
+        # (e.g. a stereo pair incorrectly merged into one cluster,
+        # then split apart by rename). Don't guess — leave each
+        # member's stored user_name as-is.
+        if len(distinct_names_by_cluster.get(cluster_id, ())) <= 1:
+            picked = rename_by_cluster_all.get(cluster_id)
+            if picked is not None:
+                chosen = picked[1]
+                for d in live_devs:
+                    if not d.user_name:
+                        d.user_name = chosen
+
+        # User-device-class propagation. Same ambiguity rule. The
+        # cluster runner can re-elect a different primary across
+        # reloads; without this, an override set on member X is
+        # invisible once the primary becomes member Y. Updates the
+        # effective ``device_class`` too because the Python-side
+        # COALESCE downstream uses the per-row value loaded from SQL.
+        if len(distinct_classes_by_cluster.get(cluster_id, ())) <= 1:
+            picked_cls = class_by_cluster_all.get(cluster_id)
+            if picked_cls is not None:
+                chosen_cls = picked_cls[1]
+                for d in live_devs:
+                    if not d.user_device_class:
+                        d.user_device_class = chosen_cls
+                        d.device_class = chosen_cls
 
     # ---- Rename propagation (local_name fallback) ------------------------
     # For devices NOT in a cluster, fall back to matching the
@@ -2860,11 +2894,26 @@ class CanvasWindow(QMainWindow):
 
     def reload(self) -> None:
         self.scene.clear()
-        cutoff = (
-            time.time() - self._stale_window_s
-            if self._stale_window_s is not None
-            else None
-        )
+        cutoff = None
+        if self._stale_window_s is not None:
+            # Anchor the staleness cutoff in the packet-clock domain.
+            # ``observations.last_seen`` comes from the dongle firmware
+            # clock (pcap record header timestamps), which can drift
+            # from Python's wallclock by minutes. Using ``time.time()``
+            # for the cutoff while comparing against firmware-stamped
+            # ``last_seen`` leaves ahead-of-wallclock packets visible
+            # forever (and would hide behind-of-wallclock ones early).
+            # Take ``MAX(last_seen)`` over the project's observations
+            # as the freshest packet ts we know and use that as "now"
+            # — apples-to-apples against per-device ``last_seen``.
+            row = self.store.conn.execute(
+                "SELECT MAX(o.last_seen) AS now_ts FROM observations o "
+                "JOIN sessions s ON s.id = o.session_id "
+                "WHERE s.project_id = ?",
+                (self.project_id,),
+            ).fetchone()
+            packet_now = row["now_ts"] if row and row["now_ts"] else time.time()
+            cutoff = packet_now - self._stale_window_s
         devs = load_canvas_devices(
             self.store, self.project_id, stale_cutoff=cutoff,
         )

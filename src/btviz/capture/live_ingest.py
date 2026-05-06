@@ -27,6 +27,7 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..bus import EventBus, TOPIC_PACKET
 from ..db.repos import Repos
@@ -130,6 +131,14 @@ class LiveIngest:
         # ``_lock`` because ``_on_packet`` runs on a reader thread.
         self._source_received: dict[str, int] = {}
         self._source_rejected: dict[str, int] = {}
+        # Active-interrogation self-dedup. When the canvas spins up an
+        # InterrogatorProcess, it publishes the interrogator dongle's
+        # broadcaster address(es) here so the passive sniffers don't
+        # re-attribute SCAN_REQ packets *we* radiated as third-party
+        # traffic from our own host. Stored lowercase + colons to match
+        # the decoder's normalized form. ``frozenset`` for cheap
+        # membership tests on the per-packet hot path.
+        self._own_interrogator_addrs: frozenset[str] = frozenset()
         self.stats = LiveIngestStats()
 
     # ------------------------------------------------------------------ API
@@ -141,6 +150,46 @@ class LiveIngest:
     @property
     def running(self) -> bool:
         return self._unsub is not None
+
+    def _is_own_interrogator_packet(self, decoded: Any) -> bool:
+        """True iff ``decoded.adv_addr`` belongs to our own interrogator.
+
+        Pulled out as a method (rather than inlined in ``_on_packet``)
+        so the dedup rule is testable without standing up the full
+        bus-decoder-queue path. The hot-path behavior is unchanged:
+        an empty ``_own_interrogator_addrs`` short-circuits before the
+        attribute access.
+        """
+        if not self._own_interrogator_addrs:
+            return False
+        addr = getattr(decoded, "adv_addr", None)
+        if addr is None:
+            return False
+        return addr in self._own_interrogator_addrs
+
+    def set_own_interrogator_addresses(
+        self, addrs: frozenset[str] | set[str] | tuple[str, ...] | None,
+    ) -> None:
+        """Tell ingest which adv addresses are our own interrogator's.
+
+        Packets whose ``adv_addr`` matches any of these get silently
+        dropped at decode time — see the comment in ``_on_packet`` for
+        the rationale (passive sniffers re-observing our SCAN_REQs
+        would otherwise look like a new device coming and going every
+        time we interrogated).
+
+        Pass an empty collection (or ``None``) to clear when the
+        interrogator stops; the dedup filter is a hot-path equality
+        check that always runs, so an empty set is as cheap as None.
+        """
+        if not addrs:
+            self._own_interrogator_addrs = frozenset()
+            return
+        # Normalize to lowercase to match the decoder's output. The
+        # decoder writes ``adv_addr`` as lowercase + colons already.
+        self._own_interrogator_addrs = frozenset(
+            str(a).lower() for a in addrs
+        )
 
     def set_packet_callback(
         self, fn: Callable[[str, int | None, bool], None] | None,
@@ -249,6 +298,15 @@ class LiveIngest:
                 self._source_rejected[src] = (
                     self._source_rejected.get(src, 0) + 1
                 )
+            return
+        # Self-dedup: drop packets the active interrogator radiated.
+        # If we just sent a SCAN_REQ, our passive sniffers WILL pick it
+        # up and decode it as advertising from our own host's address.
+        # Counting it as a third-party device or feeding it back into
+        # the cluster signals would pollute the analysis. Suppress
+        # silently — the interrogator's audit log is the system of
+        # record for what we sent.
+        if self._is_own_interrogator_packet(decoded):
             return
         self.stats.packets_decoded += 1
         with self._lock:

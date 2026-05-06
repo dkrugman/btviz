@@ -1230,6 +1230,105 @@ class Packets:
         )
 
 
+class Interrogations:
+    """Persists active-interrogation attempts into ``device_interrogation_log``.
+
+    The interrogator driver (see ``btviz.interrogator``) issues
+    SCAN_REQs (and later GATT-discovery / pairing-pubkey collects) to
+    target RPAs and writes the result here. Each attempt is logged
+    in three steps:
+
+      1. ``open_attempt`` — at request submission, status='pending'.
+         Returns the row id so the driver can update it later.
+      2. ``record_response`` — on success, fills ``responded_at`` and
+         ``payload``, flips status to 'response'.
+      3. ``record_failure`` — on timeout / error, fills ``error``,
+         flips status to 'timeout' or 'error'.
+
+    The 3-step write keeps the audit trail honest even when the
+    interrogator crashes mid-request: the open row stays as
+    ``pending`` and downstream readers can sweep it up.
+    """
+
+    def __init__(self, store: Store) -> None:
+        self.s = store
+
+    def open_attempt(
+        self,
+        session_id: int,
+        target_address_id: int,
+        primitive: str,
+        requested_at: float,
+        target_device_id: int | None = None,
+        interrogator_sniffer_id: int | None = None,
+    ) -> int:
+        cur = self.s.conn.execute(
+            """
+            INSERT INTO device_interrogation_log
+                (session_id, target_address_id, target_device_id,
+                 interrogator_sniffer_id, requested_at, primitive, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            """,
+            (session_id, target_address_id, target_device_id,
+             interrogator_sniffer_id, requested_at, primitive),
+        )
+        return int(cur.lastrowid)
+
+    def record_response(
+        self,
+        attempt_id: int,
+        responded_at: float,
+        payload: bytes | None = None,
+    ) -> None:
+        self.s.conn.execute(
+            """
+            UPDATE device_interrogation_log
+               SET responded_at = ?, payload = ?, status = 'response'
+             WHERE id = ?
+            """,
+            (responded_at, payload, attempt_id),
+        )
+
+    def record_failure(
+        self,
+        attempt_id: int,
+        when: float,
+        error: str,
+        timed_out: bool = False,
+    ) -> None:
+        status = "timeout" if timed_out else "error"
+        self.s.conn.execute(
+            """
+            UPDATE device_interrogation_log
+               SET responded_at = ?, error = ?, status = ?
+             WHERE id = ?
+            """,
+            (when, error, status, attempt_id),
+        )
+
+    def recent_for_device(
+        self, device_id: int, limit: int = 20,
+    ) -> list[dict]:
+        """Most-recent attempts targeting this device, newest first.
+
+        Returned rows are dicts (sqlite3.Row → dict) for easy use in
+        tooltips ("last interrogated 12 s ago — got SCAN_RSP").
+        """
+        rows = self.s.conn.execute(
+            """
+            SELECT id, session_id, target_address_id, target_device_id,
+                   interrogator_sniffer_id, requested_at, responded_at,
+                   primitive, status, error, payload
+              FROM device_interrogation_log
+             WHERE target_device_id = ?
+             ORDER BY requested_at DESC
+             LIMIT ?
+            """,
+            (device_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 class Clusters:
     """Persists cluster-runner output into device_clusters / device_cluster_members.
 
@@ -1504,3 +1603,4 @@ class Repos:
         self.ad_history = AdHistory(store)
         self.packets = Packets(store)
         self.clusters = Clusters(store)
+        self.interrogations = Interrogations(store)

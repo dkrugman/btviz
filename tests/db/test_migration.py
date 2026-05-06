@@ -177,7 +177,7 @@ class FreshDbTests(unittest.TestCase):
             store = Store(Path(d) / "fresh.db")
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 7)
+            self.assertEqual(version, 8)
 
     def test_fresh_db_has_v4_column(self):
         # observations.bad_packet_count was added in v4 to back the
@@ -233,6 +233,9 @@ class FreshDbTests(unittest.TestCase):
                   FROM devices;
                 DROP TABLE devices;
                 ALTER TABLE _dev_v3 RENAME TO devices;
+                -- Drop tables added in later migrations so the
+                -- migrator's CREATE TABLE statements don't collide.
+                DROP TABLE IF EXISTS device_interrogation_log;
                 PRAGMA user_version = 3;
             """)
             conn.commit()
@@ -245,7 +248,7 @@ class FreshDbTests(unittest.TestCase):
             }
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 7)
+            self.assertEqual(version, 8)
             self.assertIn("bad_packet_count", cols)
 
 
@@ -259,7 +262,7 @@ class V1UpgradeTests(unittest.TestCase):
             tables = _tables(store.conn)
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 7)
+            self.assertEqual(version, 8)
             self.assertIn("sniffers", tables)
             for t in _V3_TABLES:
                 self.assertIn(t, tables, f"missing after v1→v3: {t}")
@@ -293,7 +296,7 @@ class V2UpgradeTests(unittest.TestCase):
             tables = _tables(store.conn)
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 7)
+            self.assertEqual(version, 8)
             for t in _V3_TABLES:
                 self.assertIn(t, tables, f"missing after v2→v3: {t}")
 

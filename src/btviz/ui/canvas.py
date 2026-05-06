@@ -11,6 +11,7 @@ docks into the same QMainWindow.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -2653,6 +2654,13 @@ class CanvasWindow(QMainWindow):
     # thread regardless of where ``emit`` is called.
     _dispatch_cluster = Signal(object, object, object, int)
 
+    # Initial-discovery sweep result. Emitted by a daemon thread at
+    # startup once the fast (ioreg) + slow (extcap) probes have run.
+    # Carries the per-dongle records list (DB-shaped dicts produced
+    # by ``discovered_to_db_records``) — the slot writes them on the
+    # main thread because the SQLite connection is bound there.
+    _initial_discovery_signal = Signal(list)
+
     def __init__(self, store: Store, project_id: int) -> None:
         super().__init__()
         self.store = store
@@ -2978,12 +2986,25 @@ class CanvasWindow(QMainWindow):
         # the event loop; by the time it fires, the show event has
         # finished and the viewport has its final width.
         QTimer.singleShot(0, self.reload)
-        # Read whatever is already in the DB so the window draws immediately.
-        # No auto-discovery here: a fast (ioreg-only) sweep at startup misses
-        # hub-connected dongles and would mark them inactive. The user runs
-        # discovery via Refresh sniffers / Start Capture; previous-session state
-        # (preserved across Stop) covers the common case of "I just relaunched".
+        # Read whatever is already in the DB so the window draws immediately
+        # (with possibly-stale activity dots), then schedule a background
+        # discovery sweep that re-stamps is_active flags using BOTH the
+        # fast (ioreg) and slow (extcap) probes. Without this pass, a user
+        # who closed btviz with dongles plugged in, travelled, and reopened
+        # btviz without them sees green dots from the prior session — the
+        # exact "all green at startup, nothing actually plugged in"
+        # confusion that prompted the no-dongles dialog. Combined fast +
+        # slow mirrors what ``_start_live`` does so hub-connected dongles
+        # (missed by fast alone) are still recognised. Runs on a daemon
+        # thread so the window appears immediately and a slow extcap probe
+        # doesn't block first paint.
         self.sniffer_panel.refresh()
+        self._initial_discovery_signal.connect(self._on_initial_discovery_done)
+        threading.Thread(
+            target=self._initial_discovery_worker,
+            daemon=True,
+            name="btviz-initial-discovery",
+        ).start()
         self.repos.meta.set(self.repos.meta.LAST_PROJECT, str(project_id))
 
     # --- data ---------------------------------------------------------
@@ -3377,6 +3398,144 @@ class CanvasWindow(QMainWindow):
                 else _CAPTURE_BUTTON_STYLE_IDLE
             )
 
+    def _initial_discovery_worker(self) -> None:
+        """Background USB + extcap probe at canvas startup.
+
+        Runs on a daemon thread; emits ``_initial_discovery_signal``
+        with the discovered records when done. Combines the fast
+        ioreg probe (catches what's physically plugged in including
+        bus-only devices) with the slow extcap probe (catches
+        hub-connected dongles the fast probe misses).
+
+        DB writes happen on the **main thread** — SQLite connections
+        are thread-bound and the canvas's connection lives on the
+        Qt thread, so the worker just gathers records and hands
+        them to the slot for persistence + panel refresh.
+
+        Failures are swallowed: a missing ioreg / extcap binary
+        would log to capture.log but must not crash startup.
+        """
+        from ..extcap.discovery import (
+            discovered_to_db_records, list_dongles_fast,
+        )
+        from ..extcap import find_extcap_binary, list_dongles
+        from ..capture_log import get_capture_logger
+        cap_log = get_capture_logger()
+        fast: list = []
+        slow: list = []
+        try:
+            fast = list_dongles_fast() or []
+        except Exception as e:  # noqa: BLE001
+            cap_log.warning("startup discovery: fast probe failed: %s", e)
+        try:
+            binary = find_extcap_binary()
+            slow = list_dongles(binary) or []
+        except Exception as e:  # noqa: BLE001
+            cap_log.warning("startup discovery: slow probe failed: %s", e)
+        slow_keys = {(d.serial_number or d.serial_path) for d in slow}
+        extra_fast = [
+            d for d in fast
+            if (d.serial_number or d.serial_path) not in slow_keys
+        ]
+        merged = slow + extra_fast
+        try:
+            records = discovered_to_db_records(merged)
+        except Exception as e:  # noqa: BLE001
+            cap_log.warning("startup discovery: record build failed: %s", e)
+            records = []
+        # Hand off to the main thread — the slot writes to SQLite
+        # and refreshes the panel.
+        self._initial_discovery_signal.emit(records)
+
+    @Slot(list)
+    def _on_initial_discovery_done(self, records: list) -> None:
+        """Main-thread slot: persist discovery + refresh the panel.
+
+        Receives the records produced by ``_initial_discovery_worker``
+        and writes them via ``record_discovered`` (which clears
+        ``is_active`` for any serials not in the new set, so a
+        relaunch with no dongles plugged in correctly grays out the
+        prior session's rows). Then refreshes the panel and
+        recomputes the extcap-unreachable hint.
+        """
+        from ..capture_log import get_capture_logger
+        cap_log = get_capture_logger()
+        try:
+            self.repos.sniffers.record_discovered(records)
+        except Exception as e:  # noqa: BLE001 — never break startup
+            cap_log.warning("startup discovery: db update failed: %s", e)
+        try:
+            serials = {
+                (r.get("serial_number") or r.get("serial_path"))
+                for r in records
+            }
+            db_sniffers = self.repos.sniffers.list_all(
+                active_only=False, include_removed=False,
+            )
+            unreachable = {
+                s.serial_number for s in db_sniffers
+                if s.serial_number and s.serial_number not in serials
+            }
+            self.sniffer_panel.set_extcap_unreachable(unreachable)
+        except Exception:  # noqa: BLE001
+            pass
+        self.sniffer_panel.refresh()
+
+    def _show_no_dongles_dialog(
+        self,
+        *,
+        title: str = "No capture devices found",
+        detail: str | None = None,
+    ) -> None:
+        """Surface a clear dialog when Start Capture finds no dongles.
+
+        Replaces the previous silent-toolbar-text behaviour, which
+        was easy to miss — clicking Start with no dongles plugged in
+        appeared to do nothing. The dialog includes a clickable link
+        to ``docs/HARDWARE.md`` for compatible-device guidance.
+
+        ``QMessageBox.critical(None, ...)`` segfaults on macOS Tahoe
+        + PySide6 6.11 (see the same workaround in ``run_canvas``);
+        passing ``self`` as parent avoids the metaobject path that
+        triggers the crash. We also catch construction errors and
+        fall back to stderr so a dialog failure never blocks Start.
+        """
+        body = (
+            "btviz didn't find any nRF Sniffer dongles attached to this "
+            "machine.<br><br>"
+            "Plug in one or more compatible USB dongles flashed with the "
+            "Nordic <i>nRF Sniffer for Bluetooth LE</i> firmware, then "
+            "click Start Capture again.<br><br>"
+            'See <a href="https://github.com/dkrugman/btviz/blob/main/'
+            'docs/HARDWARE.md">docs/HARDWARE.md</a> for the list of '
+            "compatible devices, firmware requirements, and "
+            "troubleshooting tips."
+        )
+        if detail:
+            body += f"<br><br><small>{detail}</small>"
+        try:
+            from PySide6.QtCore import Qt as _Qt
+            from PySide6.QtWidgets import QMessageBox as _QMB
+            box = _QMB(self)
+            box.setWindowTitle("btviz")
+            box.setIcon(_QMB.Icon.Warning)
+            box.setText(title)
+            box.setTextFormat(_Qt.TextFormat.RichText)
+            box.setTextInteractionFlags(
+                _Qt.TextInteractionFlag.TextBrowserInteraction
+            )
+            box.setInformativeText(body)
+            box.setStandardButtons(_QMB.StandardButton.Ok)
+            box.exec()
+        except Exception as e:  # noqa: BLE001 — dialog must never block Start
+            import sys as _sys
+            print(
+                f"btviz: {title} — see "
+                f"https://github.com/dkrugman/btviz/blob/main/docs/HARDWARE.md "
+                f"(dialog suppressed: {e!r})",
+                file=_sys.stderr,
+            )
+
     def _start_live(self) -> None:
         """Begin a live capture session for this project.
 
@@ -3401,12 +3560,28 @@ class CanvasWindow(QMainWindow):
         except Exception as e:  # noqa: BLE001
             self.status.setText(f"  live: discovery failed: {e}")
             cap_log.error("capture aborted — discovery failed: %s", e)
+            self._show_no_dongles_dialog(
+                title="Discovery failed",
+                detail=f"The extcap probe raised: {e}",
+            )
             self._bus = None
             self._coord = None
             return
         if not self._coord.dongles:
-            self.status.setText("  live: no dongles discovered")
+            self.status.setText("  live: no capture devices found")
             cap_log.warning("capture aborted — no dongles discovered")
+            self._show_no_dongles_dialog()
+            # Reset DB sniffer rows to inactive — the panel was
+            # showing stale "active" badges from a prior session
+            # but the extcap probe just confirmed nothing is
+            # currently connected. Without this, a user who closed
+            # btviz with dongles plugged → travelled → reopened
+            # btviz without them sees green dots and is misled.
+            try:
+                self.repos.sniffers.record_discovered([])
+                self.sniffer_panel.refresh()
+            except Exception:  # noqa: BLE001
+                pass
             self._bus = None
             self._coord = None
             return

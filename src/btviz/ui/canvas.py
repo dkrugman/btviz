@@ -354,6 +354,11 @@ class CanvasDevice:
     last_seen: float = 0.0
     channels: dict[int, int] = field(default_factory=dict)
     pdu_types: dict[str, int] = field(default_factory=dict)
+    # 16-bit service UUIDs the device has been seen advertising
+    # (AD types 0x02 incomplete + 0x03 complete, merged). Stable
+    # across captures because they're loaded from device_ad_history.
+    # Cluster primaries inherit the union across absorbed members.
+    service_uuids: list[int] = field(default_factory=list)
     # Cluster membership. ``cluster_id`` is set whenever this device
     # belongs to a row in ``device_cluster_members``; the canvas
     # primary that absorbed N RPAs has ``cluster_member_ids`` populated
@@ -444,6 +449,11 @@ def _absorb_cluster_member(
         if addr not in seen_addrs:
             primary.addresses.append((addr, kind))
             seen_addrs.add(addr)
+    seen_uuids = set(primary.service_uuids)
+    for u in member.service_uuids:
+        if u not in seen_uuids:
+            primary.service_uuids.append(u)
+            seen_uuids.add(u)
     if member.broadcast_name and not primary.broadcast_name:
         primary.broadcast_name = member.broadcast_name
     primary.cluster_member_ids.append(member.device_id)
@@ -557,6 +567,25 @@ def load_canvas_devices(
     ).fetchall()
     for r in addr_rows:
         devices[r["device_id"]].addresses.append((r["address"], r["address_type"]))
+
+    # Service UUIDs (AD type 0x02 incomplete / 0x03 complete). Each
+    # row in device_ad_history is one UUID stored as 2 bytes
+    # little-endian; multiple UUIDs per device produce multiple rows.
+    # Aggregate as the unique UUID set per device so the tooltip
+    # surfaces what services the device advertised.
+    uuid_rows = conn.execute(
+        f"SELECT device_id, ad_value FROM device_ad_history "
+        f"WHERE ad_type IN (2, 3) AND device_id IN ({placeholders})",
+        tuple(devices.keys()),
+    ).fetchall()
+    for r in uuid_rows:
+        val = r["ad_value"]
+        if val is None or len(val) < 2:
+            continue
+        u = val[0] | (val[1] << 8)
+        cd = devices[r["device_id"]]
+        if u not in cd.service_uuids:
+            cd.service_uuids.append(u)
 
     # Most recent broadcast_name per broadcaster (across all sessions in
     # this project). Walk in last_seen DESC order and keep first per
@@ -787,6 +816,50 @@ def _row_best_label(r: Any) -> str:
     return sk
 
 
+# Well-known 16-bit BLE service UUIDs the canvas might surface.
+# Curated set — annotates the tooltip's UUID list with friendly names
+# for the services this app's user community commonly sees (LE Audio,
+# Apple/Google identity beacons, common GATT profiles). Anything not in
+# this dict displays as the bare hex value.
+_KNOWN_UUID16: dict[int, str] = {
+    # Generic GATT profiles
+    0x1800: "GAP",
+    0x1801: "GATT",
+    0x180A: "Device Information",
+    0x180D: "Heart Rate",
+    0x180F: "Battery",
+    0x1812: "HID",
+    # LE Audio (Hearing Access + Audio Stream stack)
+    0x1843: "AICS (Audio Input Control)",
+    0x1844: "VCS (Volume Control)",
+    0x1845: "VOCS (Volume Offset Control)",
+    0x1846: "AICS",
+    0x1850: "PACS (Published Audio Capabilities)",
+    0x1851: "BAS (Basic Audio)",
+    0x1852: "BASS (Broadcast Audio Scan)",
+    0x1853: "CAS (Common Audio)",
+    0x1854: "HAS (Hearing Access)",
+    0x184E: "ASCS (Audio Stream Control)",
+    0x184F: "BASS (Broadcast Audio Scan)",
+    # Vendor / ecosystem service UUIDs
+    0xFD3D: "Apple Watch (LE Audio)",
+    0xFD43: "Meta",
+    0xFD6F: "Apple Continuity / Exposure Notifications",
+    0xFDF0: "Google Nearby",
+    0xFE2C: "Google Fast Pair",
+    0xFE9A: "Estimote",
+    0xFEAA: "Eddystone",
+    0xFEE7: "Tencent",
+}
+
+
+# Truncate the tooltip's address list to keep it screen-sized for
+# heavy-merged clusters. Big clusters (200+ RPAs absorbed into one
+# apple_device primary) used to render 200+ address lines and overflow
+# Qt's tooltip viewport.
+_TOOLTIP_ADDR_MAX = 12
+
+
 def _pick_display_label(d: CanvasDevice) -> str:
     """Choose the strongest identity string for the box header.
 
@@ -874,11 +947,24 @@ def _build_tooltip(d: CanvasDevice) -> str:
         lines.append("Channels:")
         for ch, n in sorted(d.channels.items()):
             lines.append(f"  {ch}: {n}")
+    if d.service_uuids:
+        lines.append("")
+        lines.append(f"Service UUIDs ({len(d.service_uuids)}):")
+        for u in sorted(d.service_uuids):
+            label = _KNOWN_UUID16.get(u)
+            if label:
+                lines.append(f"  0x{u:04X}  {label}")
+            else:
+                lines.append(f"  0x{u:04X}")
     if d.addresses:
         lines.append("")
         lines.append(f"Addresses ({len(d.addresses)}):")
-        for addr, atype in d.addresses:
+        for addr, atype in d.addresses[:_TOOLTIP_ADDR_MAX]:
             lines.append(f"  {addr}  ({atype})")
+        if len(d.addresses) > _TOOLTIP_ADDR_MAX:
+            lines.append(
+                f"  +{len(d.addresses) - _TOOLTIP_ADDR_MAX} more"
+            )
     return "\n".join(lines)
 
 

@@ -51,6 +51,17 @@ def build_parser(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="replay the entire input file from the beginning before "
              "tailing (default: start from end-of-file)",
     )
+    p.add_argument(
+        "--max-bytes", type=int, default=50 * 1024 * 1024, metavar="N",
+        help="rotate the drained log at this size (default: 50 MB; "
+             "larger than capture.log's 10 MB because drained bytes "
+             "are denser)",
+    )
+    p.add_argument(
+        "--backup-count", type=int, default=5, metavar="N",
+        help="how many rotated backups (drained_*.log.1..N) to keep "
+             "(default: 5)",
+    )
     return p
 
 
@@ -87,6 +98,7 @@ def run(args: argparse.Namespace) -> int:
         f"  draining {inp} → {out}\n"
         f"  summary every {args.summary_interval_s:g}s "
         f"({'replay then tail' if args.from_start else 'tail only'})\n"
+        f"  rotation: {args.max_bytes:,}B × {args.backup_count} backups\n"
         f"  (Ctrl-C to stop)",
         file=sys.stderr,
     )
@@ -95,6 +107,8 @@ def run(args: argparse.Namespace) -> int:
             inp, out,
             summary_interval_s=args.summary_interval_s,
             from_start=args.from_start,
+            max_bytes=args.max_bytes,
+            backup_count=args.backup_count,
         )
     except KeyboardInterrupt:
         print("\n  drain stopped (Ctrl-C)", file=sys.stderr)
@@ -114,6 +128,8 @@ def _spawn_drainer(source: str, args: argparse.Namespace) -> threading.Thread:
                 inp, out,
                 summary_interval_s=args.summary_interval_s,
                 from_start=args.from_start,
+                max_bytes=args.max_bytes,
+                backup_count=args.backup_count,
             )
         except Exception as e:  # noqa: BLE001
             print(f"  drain {source} failed: {e!r}", file=sys.stderr)

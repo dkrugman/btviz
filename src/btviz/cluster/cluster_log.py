@@ -74,3 +74,26 @@ def get_cluster_logger() -> logging.Logger:
     to choose where the log lands.
     """
     return logging.getLogger(LOG_NAME)
+
+
+def apply_cluster_log_prefs(level: str | int | None = None) -> None:
+    """Set the cluster logger's level from the dropdown pref value.
+
+    Mirror of :py:func:`btviz.capture_log.apply_capture_log_prefs`.
+    Reuses the same level-name → numeric-level table so the two
+    dropdowns are consistent. ``verbose`` on the cluster dropdown
+    is currently equivalent to ``info`` (the cluster runner has no
+    VERBOSE-tier emissions yet) but the option exists for UI
+    parity and so future VERBOSE-tier cluster narration (e.g.,
+    per-class headers, per-signal timing) can be added without a
+    schema migration.
+    """
+    # Imported here to avoid a circular at module load (capture_log
+    # is independent of cluster, so cluster_log → capture_log is
+    # fine, but the import chain stays clean if we keep it lazy).
+    from ..capture_log import resolve_level
+    target = resolve_level(level)
+    logger = logging.getLogger(LOG_NAME)
+    logger.setLevel(target)
+    for h in logger.handlers:
+        h.setLevel(target)

@@ -10,9 +10,10 @@ Currently shipped:
 - mfg_data_prefix:    manufacturer data prefix match (reads device_ad_history)
 - apple_continuity:   Apple Continuity TLV-payload fingerprint (reads device_ad_history)
 - co_lifespan_match:  per-session window alignment — co-emission + handoff (reads observations)
+- continuity_seq_carryover: Apple Handoff sequence-number carry-over (reads device_ad_history)
+- rssi_signature:     per-sniffer mean-RSSI agreement (reads packets)
 
 Planned (one PR per signal):
-- rssi_signature
 - adv_interval
 - tx_power_match
 - status_byte_match
@@ -28,6 +29,7 @@ from .co_lifespan_match import CoLifespanMatch
 from .continuity_seq_carryover import ContinuitySeqCarryover
 from .mfg_data_prefix import MfgDataPrefix
 from .rotation_cohort import RotationCohort
+from .rssi_signature import RssiSignature
 from .service_uuid_match import ServiceUuidMatch
 
 
@@ -52,6 +54,7 @@ def load_signals() -> dict[str, Signal]:
         AppleContinuity(),
         CoLifespanMatch(),
         ContinuitySeqCarryover(),
+        RssiSignature(),
     )
     try:
         from ...preferences import get_prefs
@@ -71,6 +74,7 @@ __all__ = [
     "ContinuitySeqCarryover",
     "MfgDataPrefix",
     "RotationCohort",
+    "RssiSignature",
     "ServiceUuidMatch",
     "load_signals",
 ]

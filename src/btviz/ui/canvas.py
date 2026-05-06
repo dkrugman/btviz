@@ -2656,10 +2656,12 @@ class CanvasWindow(QMainWindow):
 
     # Initial-discovery sweep result. Emitted by a daemon thread at
     # startup once the fast (ioreg) + slow (extcap) probes have run.
-    # Carries the per-dongle records list (DB-shaped dicts produced
-    # by ``discovered_to_db_records``) — the slot writes them on the
-    # main thread because the SQLite connection is bound there.
-    _initial_discovery_signal = Signal(list)
+    # Carries either the per-dongle records list (DB-shaped dicts
+    # produced by ``discovered_to_db_records``) or ``None`` when
+    # both probes failed — the slot interprets ``None`` as
+    # "discovery didn't actually run, leave the DB alone" so a
+    # transient double-failure can't deactivate plugged-in dongles.
+    _initial_discovery_signal = Signal(object)
 
     def __init__(self, store: Store, project_id: int) -> None:
         super().__init__()
@@ -3412,8 +3414,16 @@ class CanvasWindow(QMainWindow):
         Qt thread, so the worker just gathers records and hands
         them to the slot for persistence + panel refresh.
 
-        Failures are swallowed: a missing ioreg / extcap binary
-        would log to capture.log but must not crash startup.
+        **Empty-probes safety:** if BOTH probes raise (e.g.,
+        missing ioreg + missing extcap binary, or a transient
+        environment failure), we emit ``None`` instead of an empty
+        list. The slot interprets that as "discovery couldn't run;
+        leave the DB alone" — without this guard, a transient
+        double-failure would call ``record_discovered([])`` which
+        deactivates EVERY sniffer row, including dongles that are
+        physically plugged in. A clean run that legitimately found
+        zero dongles still emits ``[]`` and IS allowed to clear
+        the active flags.
         """
         from ..extcap.discovery import (
             discovered_to_db_records, list_dongles_fast,
@@ -3423,15 +3433,28 @@ class CanvasWindow(QMainWindow):
         cap_log = get_capture_logger()
         fast: list = []
         slow: list = []
+        fast_ok = False
+        slow_ok = False
         try:
             fast = list_dongles_fast() or []
+            fast_ok = True
         except Exception as e:  # noqa: BLE001
             cap_log.warning("startup discovery: fast probe failed: %s", e)
         try:
             binary = find_extcap_binary()
             slow = list_dongles(binary) or []
+            slow_ok = True
         except Exception as e:  # noqa: BLE001
             cap_log.warning("startup discovery: slow probe failed: %s", e)
+        if not (fast_ok or slow_ok):
+            # Neither probe ran cleanly — DB update would mark all
+            # dongles inactive based on no actual evidence. Skip it.
+            cap_log.warning(
+                "startup discovery: both probes failed; "
+                "leaving sniffers.is_active flags untouched",
+            )
+            self._initial_discovery_signal.emit(None)
+            return
         slow_keys = {(d.serial_number or d.serial_path) for d in slow}
         extra_fast = [
             d for d in fast
@@ -3447,19 +3470,32 @@ class CanvasWindow(QMainWindow):
         # and refreshes the panel.
         self._initial_discovery_signal.emit(records)
 
-    @Slot(list)
-    def _on_initial_discovery_done(self, records: list) -> None:
+    @Slot(object)
+    def _on_initial_discovery_done(self, records: object) -> None:
         """Main-thread slot: persist discovery + refresh the panel.
 
-        Receives the records produced by ``_initial_discovery_worker``
-        and writes them via ``record_discovered`` (which clears
-        ``is_active`` for any serials not in the new set, so a
-        relaunch with no dongles plugged in correctly grays out the
-        prior session's rows). Then refreshes the panel and
-        recomputes the extcap-unreachable hint.
+        Receives the records produced by ``_initial_discovery_worker``,
+        or ``None`` when both probes failed.
+
+        ``None`` path: refresh the panel from the existing DB state
+        but don't touch ``is_active`` — we don't have evidence to
+        update those flags and the previous-session state is the
+        best fallback. This prevents a transient double-probe
+        failure from greying out plugged-in dongles.
+
+        list path (including empty list): pass to
+        ``record_discovered`` which sets ``is_active=1`` for every
+        serial in the list and clears it for any active row not in
+        the list. An empty list correctly says "no dongles found"
+        and grays out stale entries from a prior session.
         """
         from ..capture_log import get_capture_logger
         cap_log = get_capture_logger()
+        if records is None:
+            # Probes failed — leave the DB alone; just repaint
+            # whatever's already there.
+            self.sniffer_panel.refresh()
+            return
         try:
             self.repos.sniffers.record_discovered(records)
         except Exception as e:  # noqa: BLE001 — never break startup

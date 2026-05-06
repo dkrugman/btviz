@@ -97,6 +97,28 @@ class NoDonglesDialogTests(unittest.TestCase):
                 detail="extcap probe raised TimeoutError",
             )
 
+    def test_initial_discovery_none_does_not_touch_db(self):
+        # Regression: when the worker emits ``None`` (both probes
+        # failed), the slot must NOT call record_discovered with
+        # an empty list — that would deactivate every dongle in
+        # the DB based on no evidence.
+        with patch.object(
+            self.canvas.repos.sniffers, "record_discovered",
+        ) as mock_rd:
+            self.canvas._on_initial_discovery_done(None)
+            mock_rd.assert_not_called()
+
+    def test_initial_discovery_empty_list_does_touch_db(self):
+        # Counterpart: a CLEAN run that legitimately returned no
+        # dongles SHOULD call record_discovered([]) so prior
+        # session's "active" flags get cleared. ``[]`` ≠ ``None``
+        # in this slot's semantics.
+        with patch.object(
+            self.canvas.repos.sniffers, "record_discovered",
+        ) as mock_rd:
+            self.canvas._on_initial_discovery_done([])
+            mock_rd.assert_called_once_with([])
+
     def test_construction_failure_falls_back_to_stderr(self):
         # If QMessageBox itself fails to construct (the macOS Tahoe +
         # PySide6 6.11 segfault pattern), the method must not raise —

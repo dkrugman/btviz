@@ -293,6 +293,12 @@ class SnifferPanel(QWidget):
         # so the label persists after stop until the next start.
         self._session_start_ts: float | None = None
         self._session_frozen_ts: float | None = None
+        # Badge anchor — set by ``start_session_timer`` and kept set
+        # across Stop so STALL badges from the just-ended session
+        # remain visible. Reset to the new value on the next Start
+        # so badges from prior sessions don't bleed in. None at
+        # btviz startup → no badges (the desired clean-slate state).
+        self._badge_session_anchor_ts: float | None = None
         self._session_tick = QTimer(self)
         self._session_tick.setInterval(1000)  # 1 Hz is plenty
         self._session_tick.timeout.connect(self._update_session_label)
@@ -420,9 +426,14 @@ class SnifferPanel(QWidget):
         Called from ``CanvasWindow._start_live`` at the moment a
         live capture session starts. The label updates every second
         until ``stop_session_timer`` is called.
+
+        Also resets the badge anchor to ``start_ts`` so STALL
+        badges from prior sessions stop rendering — only events
+        with ``last_stall_at >= start_ts`` show from now on.
         """
         self._session_start_ts = start_ts
         self._session_frozen_ts = None
+        self._badge_session_anchor_ts = start_ts
         self._session_label.setStyleSheet(
             "QLabel { color: rgb(40, 110, 60); }"      # green: live
         )
@@ -868,26 +879,37 @@ class SnifferPanel(QWidget):
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    _truncate(port_str, 32))
 
-        # STALL badge — surfaces lifetime stall_count from the
-        # sniffers row when > 0. Token "STALL" matches what the
-        # capture watchdog logs to ~/.btviz/capture.log so the user
-        # sees the badge → greps the log → finds the events.
-        # Stuck state (watchdog gave up, replug required) gets red
-        # styling and "replug" suffix.
-        if (s.stall_count or 0) > 0:
-            stall_color = QColor(220, 80, 80) if s.serial_number in self._stuck_serials \
-                else QColor(190, 130, 30)
-            badge_text = f"STALL ×{s.stall_count}"
-            if s.serial_number in self._stuck_serials:
-                badge_text += " — replug"
-            stall_font = QFont(); stall_font.setBold(True); stall_font.setPointSize(8)
-            p.setFont(stall_font)
-            p.setPen(QPen(stall_color))
-            p.drawText(
-                QRectF(x, top + 3 * line_h - 2, _TEXT_W, line_h),
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                badge_text,
-            )
+        # STALL badge — current-or-most-recent-session only. The
+        # sniffers row keeps a lifetime ``stall_count`` for forensic
+        # purposes, but rendering the badge for stalls that happened
+        # in a prior btviz process is misleading: at startup the
+        # user would see "STALL ×N" before any new capture has even
+        # run. We gate on ``last_stall_at >= badge_session_anchor``
+        # so the badge only shows for events from the most-recent
+        # capture session in *this* btviz process. The anchor is set
+        # at Start and kept across Stop (so the badge survives until
+        # the next Start), and starts None on btviz launch so a
+        # fresh process begins with a clean slate. Token "STALL"
+        # matches what the capture watchdog logs to capture.log so
+        # the badge → grep → events workflow still works. Stuck
+        # state (watchdog gave up, replug required) appends the
+        # "— replug" suffix; both states use the same Material
+        # red (#D32F2F) since either is "act now", not informational.
+        if self._badge_session_anchor_ts is not None and (s.stall_count or 0) > 0:
+            last_stall = getattr(s, "last_stall_at", None)
+            if last_stall is not None and last_stall >= self._badge_session_anchor_ts:
+                stall_color = QColor(0xD3, 0x2F, 0x2F)
+                badge_text = f"STALL ×{s.stall_count}"
+                if s.serial_number in self._stuck_serials:
+                    badge_text += " — replug"
+                stall_font = QFont(); stall_font.setBold(True); stall_font.setPointSize(8)
+                p.setFont(stall_font)
+                p.setPen(QPen(stall_color))
+                p.drawText(
+                    QRectF(x, top + 3 * line_h - 2, _TEXT_W, line_h),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    badge_text,
+                )
 
     def _paint_chevron(self, p: QPainter) -> None:
         """Acrobat-style chevron tab on the inner edge of the panel.

@@ -4293,9 +4293,15 @@ class CanvasWindow(QMainWindow):
             )
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
-        # Make sure live capture / subprocesses are torn down so we don't
-        # leak FIFOs or extcap processes when the window closes.
-        if self._live is not None and self._live.running:
+        # Cleanup order matters: live capture first (so the
+        # "capture stopped" line lands BEFORE the exit line), then
+        # cluster worker, then exit log. ``_stop_live`` is a no-op
+        # if no session is active.
+        from ..capture_log import get_capture_logger, get_program_started_at
+        cap_log = get_capture_logger()
+        was_capturing = self._live is not None and self._live.running
+        if was_capturing:
+            cap_log.verbose("window closing — stopping live capture for shutdown")
             self._stop_live()
         # Stop the persistent cluster worker thread cleanly: quit its
         # event loop and wait for the underlying pthread to exit
@@ -4305,6 +4311,27 @@ class CanvasWindow(QMainWindow):
         if self._cluster_thread is not None:
             self._cluster_thread.quit()
             self._cluster_thread.wait(2000)
+        # INFO-level lifecycle counterpart to "btviz startup". Includes
+        # process uptime so a chronic-stall report has the duration
+        # of the run that produced it without the user having to
+        # subtract timestamps manually. Uptime starts at the first
+        # ``configure_capture_log()`` call (effectively program-start).
+        started_at = get_program_started_at()
+        if started_at is not None:
+            import time as _time
+            uptime_s = _time.time() - started_at
+            h, rem = divmod(int(uptime_s), 3600)
+            m, s = divmod(rem, 60)
+            uptime_str = (
+                f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
+            )
+            cap_log.info(
+                "btviz exit — uptime=%s%s",
+                uptime_str,
+                " (capture was active)" if was_capturing else "",
+            )
+        else:
+            cap_log.info("btviz exit")
         super().closeEvent(event)
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -4348,4 +4375,19 @@ def run_canvas(db_path: Path | None = None, project_name: str | None = None) -> 
 
     win = CanvasWindow(store, project_id)
     win.show()
-    return app.exec()
+    rc = app.exec()
+    # Cleanup after the Qt event loop returns. ``CanvasWindow.closeEvent``
+    # already tore down live capture + cluster worker + emitted the
+    # "btviz exit" log line; here we close the SQLite store explicitly
+    # (rather than relying on GC) and flush logging handlers so any
+    # tail-end log entries land on disk before interpreter shutdown.
+    try:
+        store.close()
+    except Exception:  # noqa: BLE001 — best-effort; process is exiting
+        pass
+    try:
+        import logging as _logging
+        _logging.shutdown()
+    except Exception:  # noqa: BLE001
+        pass
+    return rc

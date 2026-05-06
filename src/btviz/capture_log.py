@@ -47,6 +47,17 @@ DEFAULT_BACKUP_COUNT = 5
 
 _HANDLER_TAG = "_btviz_capture_handler"
 
+# Wall-clock at the moment :py:func:`configure_capture_log` first
+# runs. Used by the exit-event logger to compute btviz process
+# uptime. ``None`` means the function hasn't been called yet —
+# callers should fall back to "uptime unknown" rather than crash.
+_PROGRAM_STARTED_AT: float | None = None
+
+
+def get_program_started_at() -> float | None:
+    """Wall-clock at the moment configure_capture_log first ran."""
+    return _PROGRAM_STARTED_AT
+
 #: Custom log level between INFO (20) and DEBUG (10). Reserved for
 #: the verbose-but-not-chatty narration tier — per-dongle discovery
 #: rows, watchdog start, role assignments, periodic summary lines.
@@ -93,6 +104,10 @@ def configure_capture_log(
     place.
     """
     _register_verbose_level()
+    global _PROGRAM_STARTED_AT
+    if _PROGRAM_STARTED_AT is None:
+        import time as _time
+        _PROGRAM_STARTED_AT = _time.time()
     logger = logging.getLogger(LOG_NAME)
     logger.setLevel(level)
     logger.propagate = propagate

@@ -135,6 +135,17 @@ class DrainSummary:
     Wrapped as a record (rather than a raw string) so callers can
     format consistently across CLI / test / future programmatic
     consumers. ``render`` produces the on-wire string.
+
+    Two timestamps for one event:
+      * ``emission_ts`` — when this SUMMARY was actually written.
+        Used as the on-wire prefix so a ``tail -f`` reader sees a
+        monotonic stream (otherwise summaries appear "back in
+        time" relative to the verbatim lines emitted between
+        their last sample and the summary tick).
+      * ``last_ts`` — when the most recent sample landed.
+        Available on the dataclass for programmatic consumers but
+        intentionally NOT in the rendered output, since
+        ``count`` + ``avg_interval_s`` already describe the window.
     """
     cluster_id: int
     template: str
@@ -144,10 +155,11 @@ class DrainSummary:
     avg_interval_s: float
     jitter_s: float
     last_ts: float
+    emission_ts: float
 
     def render(self) -> str:
         from datetime import datetime
-        ts = datetime.fromtimestamp(self.last_ts).strftime(
+        ts = datetime.fromtimestamp(self.emission_ts).strftime(
             "%Y-%m-%d %H:%M:%S.%f",
         )[:-3]
         level_part = f"{self.level} " if self.level else ""
@@ -184,6 +196,8 @@ class DrainerEngine:
         r"\bSTALL\b"
         r"|\bcapture (started|stopped)\b"
         r"|\bbtviz (startup|exit)\b"
+        r"|\bdongle short_id="     # per-dongle discovery rows
+        r"|\brole short_id="       # per-sniffer role assignment
     )
 
     def __init__(
@@ -278,13 +292,21 @@ class DrainerEngine:
 
     # -- periodic summary tick --------------------------------------
 
-    def tick_summary(self) -> tuple[DrainSummary, ...]:
+    def tick_summary(self, now: float | None = None) -> tuple[DrainSummary, ...]:
         """Emit a summary for every cluster active this window.
 
         "Active" = ``window_count >= 2``. Single events were
         already covered by the verbatim emission. Returns the
         summaries in stable cluster_id order so the drained log
         groups consistently.
+
+        ``now`` is the wall-clock used as the SUMMARY's
+        ``emission_ts`` — i.e., what the user sees as the prefix
+        timestamp on the rendered line. Defaults to the latest
+        sample's timestamp (``last_ts``) for callers that don't
+        care about emission ordering, but the tailer always passes
+        the real clock so a ``tail -f`` reader sees monotonic
+        timestamps in the file.
         """
         summaries: list[DrainSummary] = []
         for cid in sorted(self._stats.keys()):
@@ -300,6 +322,7 @@ class DrainerEngine:
                 st.last_seen - st.window_first
                 if st.window_first is not None else 0.0
             )
+            emission_ts = now if now is not None else st.last_seen
             summaries.append(DrainSummary(
                 cluster_id=cid,
                 template=st.template,
@@ -309,6 +332,7 @@ class DrainerEngine:
                 avg_interval_s=avg,
                 jitter_s=jitter,
                 last_ts=st.last_seen,
+                emission_ts=emission_ts,
             ))
             st.window_count = 0
             st.window_first = None

@@ -46,6 +46,16 @@ def main() -> int:
         sub.add_parser("ingest", help="Ingest a pcap/pcapng file into the DB")
     )
 
+    # subcommand: drain (Drain3-backed log compression)
+    from .cli.drain import build_parser as _build_drain_parser
+    _build_drain_parser(
+        sub.add_parser(
+            "drain",
+            help="Tail capture.log / cluster.log and emit a "
+                 "readability-compressed drained_*.log",
+        )
+    )
+
     # subcommand: canvas (per-project device board)
     canvas_p = sub.add_parser("canvas", help="Open the project canvas (GUI)")
     canvas_p.add_argument(
@@ -84,6 +94,10 @@ def main() -> int:
     if args.cmd == "ingest":
         from .cli.ingest import run as run_ingest
         return run_ingest(args)
+
+    if args.cmd == "drain":
+        from .cli.drain import run as run_drain
+        return run_drain(args)
 
     if args.cmd == "canvas":
         from pathlib import Path

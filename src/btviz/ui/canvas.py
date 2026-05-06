@@ -49,10 +49,15 @@ from PySide6.QtWidgets import (
     QGraphicsLineItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
+    QDialog,
+    QDialogButtonBox,
     QGraphicsView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QPushButton,
@@ -63,6 +68,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..bus import EventBus, TOPIC_SNIFFER_STATE
+from ..device_classes import DEVICE_CLASSES, display_label as device_class_label
 from ..capture.coordinator import CaptureCoordinator, FollowRequest
 from ..capture.live_ingest import LiveIngest
 from ..db.models import DeviceLayout
@@ -332,7 +338,17 @@ class CanvasDevice:
     oui_vendor: str | None = None
     vendor_id: int | None = None
     appearance: int | None = None
+    # Effective class — what every consumer (icon, label, cluster
+    # profile lookup, tooltip header) should read. ``user_device_class``
+    # wins when set; otherwise the auto-detected value flows through.
     device_class: str | None = None
+    # Wire-inferred class produced by the auto-detection layer
+    # (apple_continuity / appearance fallback). Preserved separately so
+    # the tooltip can show the auto value alongside an override and
+    # the user can clearly see what btviz inferred independent of any
+    # manual pin. NULL when no auto-detection ever fired.
+    auto_device_class: str | None = None
+    user_device_class: str | None = None
     local_name: str | None = None
     gatt_device_name: str | None = None
     user_name: str | None = None
@@ -484,7 +500,10 @@ def load_canvas_devices(
         SELECT
             d.id, d.stable_key, d.kind,
             d.user_name, d.gatt_device_name, d.local_name,
-            d.vendor, d.vendor_id, d.oui_vendor, d.model, d.device_class,
+            d.vendor, d.vendor_id, d.oui_vendor, d.model,
+            d.device_class AS auto_device_class,
+            d.user_device_class,
+            COALESCE(d.user_device_class, d.device_class) AS device_class,
             d.appearance, d.last_seen,
             SUM(o.packet_count)     AS packet_count,
             SUM(o.adv_count)        AS adv_count,
@@ -522,6 +541,8 @@ def load_canvas_devices(
             oui_vendor=r["oui_vendor"],
             appearance=r["appearance"],
             device_class=r["device_class"],
+            auto_device_class=r["auto_device_class"],
+            user_device_class=r["user_device_class"],
             local_name=r["local_name"],
             gatt_device_name=r["gatt_device_name"],
             user_name=r["user_name"],
@@ -860,6 +881,112 @@ _KNOWN_UUID16: dict[int, str] = {
 _TOOLTIP_ADDR_MAX = 12
 
 
+# Sentinel string used by ``DeviceClassDialog`` to signal "clear the
+# user override and fall back to auto-detection". Picked to be
+# obviously not a real class string.
+_CLASS_RESET_SENTINEL = "__reset_to_auto__"
+
+
+class DeviceClassDialog(QDialog):
+    """Searchable picker over the canonical device-class list.
+
+    The list is fixed (driven by ``DEVICE_CLASSES``) — the user can
+    only choose values btviz knows about. Type into the search box
+    to filter; double-click an item or hit Enter to accept; Escape
+    cancels. A "Reset to auto-detected" entry sits at the top so the
+    user can clear an override without leaving the dialog.
+
+    Display labels run through ``device_class_label`` so underscored
+    machine values present as readable phrases ("auracast source"
+    instead of "auracast_source"). The underlying value the dialog
+    returns is always the underscored form.
+    """
+
+    _RESET_LABEL = "(reset to auto-detected)"
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        current: str | None,
+        auto: str | None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Set device class")
+        self.setModal(True)
+        self.resize(360, 480)
+
+        layout = QVBoxLayout(self)
+
+        header = QLabel(self)
+        if auto:
+            header.setText(f"Auto-detected: <b>{auto}</b>")
+        else:
+            header.setText("Auto-detection has no class for this device.")
+        layout.addWidget(header)
+
+        self._search = QLineEdit(self)
+        self._search.setPlaceholderText("Type to filter…")
+        self._search.textChanged.connect(self._refilter)
+        layout.addWidget(self._search)
+
+        self._list = QListWidget(self)
+        self._list.itemActivated.connect(self._on_activated)
+        self._list.itemDoubleClicked.connect(self._on_activated)
+        layout.addWidget(self._list, 1)
+
+        # Build entries: reset row first, then sorted classes.
+        reset_item = QListWidgetItem(self._RESET_LABEL)
+        reset_item.setData(0x100, _CLASS_RESET_SENTINEL)  # Qt.UserRole
+        self._list.addItem(reset_item)
+        for klass in sorted(DEVICE_CLASSES):
+            item = QListWidgetItem(device_class_label(klass))
+            item.setData(0x100, klass)
+            self._list.addItem(item)
+
+        # Pre-select the current override (or the auto value as a hint
+        # of "what's already in effect"). Selecting the row scrolls it
+        # into view so the user sees their starting point.
+        prefer = current
+        if prefer:
+            for i in range(self._list.count()):
+                if self._list.item(i).data(0x100) == prefer:
+                    self._list.setCurrentRow(i)
+                    self._list.scrollToItem(self._list.item(i))
+                    break
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _refilter(self, text: str) -> None:
+        needle = text.strip().lower()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            # The reset row is always visible — clearing the override
+            # shouldn't require typing the right magic string.
+            if item.data(0x100) == _CLASS_RESET_SENTINEL:
+                item.setHidden(False)
+                continue
+            label = item.text().lower()
+            value = (item.data(0x100) or "").lower()
+            item.setHidden(needle not in label and needle not in value)
+
+    def _on_activated(self, _item: QListWidgetItem) -> None:
+        self.accept()
+
+    def chosen_value(self) -> str | None:
+        """Return the picked class string, the reset sentinel, or
+        None when the user cancelled / nothing is selected."""
+        item = self._list.currentItem()
+        if item is None or item.isHidden():
+            return None
+        return item.data(0x100)
+
+
 def _pick_display_label(d: CanvasDevice) -> str:
     """Choose the strongest identity string for the box header.
 
@@ -908,7 +1035,21 @@ def _build_tooltip(d: CanvasDevice) -> str:
             ids = ", ".join(str(i) for i in d.cluster_member_ids)
             lines.append(f"  absorbed:    {ids}")
     if d.device_class:
-        lines.append(f"Class:         {d.device_class}")
+        # Show "(auto: X)" suffix when the user has pinned an override
+        # that disagrees with what auto-detection inferred — so the
+        # user can tell at a glance that the class they see is their
+        # own choice and what btviz would otherwise have shown.
+        if (
+            d.user_device_class
+            and d.auto_device_class
+            and d.user_device_class != d.auto_device_class
+        ):
+            lines.append(
+                f"Class:         {d.device_class}  "
+                f"(auto: {d.auto_device_class})"
+            )
+        else:
+            lines.append(f"Class:         {d.device_class}")
     if d.user_name:
         lines.append(f"User name:     {d.user_name}")
     if d.gatt_device_name:
@@ -3665,6 +3806,16 @@ class CanvasWindow(QMainWindow):
             lambda checked=False, d=device: self._rename_device(d)
         )
 
+        class_action = menu.addAction("Set device class…")
+        class_action.setToolTip(
+            "Pin a device_class for this device. Wins over the "
+            "auto-detected class for icon, label, and cluster "
+            "profile. Pick from the canonical list."
+        )
+        class_action.triggered.connect(
+            lambda checked=False, d=device: self._set_device_class(d)
+        )
+
         follow_action = menu.addAction("Follow this device")
         if self._coord is None or self._live is None or not self._live.running:
             follow_action.setEnabled(False)
@@ -3753,6 +3904,33 @@ class CanvasWindow(QMainWindow):
         # Empty string clears the override; pass None to set_user_name.
         self.repos.devices.set_user_name(
             device.device_id, new_name if new_name else None,
+        )
+        self.reload()
+
+    def _set_device_class(self, device: CanvasDevice) -> None:
+        """Open the canonical-class picker and persist the choice.
+
+        Selecting the reset entry clears the override (sets the
+        column to NULL) so the auto-detected ``device_class`` flows
+        through unchanged on the next reload.
+        """
+        dlg = DeviceClassDialog(
+            self,
+            current=device.user_device_class,
+            auto=device.auto_device_class,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        choice = dlg.chosen_value()
+        if choice is None:
+            return
+        new_class: str | None
+        if choice == _CLASS_RESET_SENTINEL:
+            new_class = None
+        else:
+            new_class = choice
+        self.repos.devices.set_user_device_class(
+            device.device_id, new_class,
         )
         self.reload()
 

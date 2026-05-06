@@ -9,12 +9,21 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH_ENV = "BTVIZ_DB_PATH"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 # Incremental migrations applied to existing DBs to bring them up to
 # ``SCHEMA_VERSION``. Fresh DBs get the full schema.sql (which already
 # contains everything through SCHEMA_VERSION) and skip these.
+
+# v7 — devices.user_device_class. User override that pins the
+# canvas's class (and downstream profile selection) regardless of
+# what auto-detection inferred. Mirrors the existing user_name
+# precedence pattern: explicit human input wins over wire-inferred
+# clues. NULL means "use the auto-detected device_class".
+_V6_TO_V7_SQL = """
+ALTER TABLE devices ADD COLUMN user_device_class TEXT;
+"""
 
 # v6 — sniffers.stall_count + sniffers.last_stall_at. The capture
 # stall watchdog (src/btviz/capture/watchdog.py) increments these
@@ -194,6 +203,10 @@ class Store:
             self.conn.executescript(_V5_TO_V6_SQL)
             self.conn.execute("PRAGMA user_version = 6")
             version = 6
+        if version == 6:
+            self.conn.executescript(_V6_TO_V7_SQL)
+            self.conn.execute("PRAGMA user_version = 7")
+            version = 7
         if version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unknown db schema version {version}; app expects {SCHEMA_VERSION}"

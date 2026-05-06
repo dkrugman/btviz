@@ -177,7 +177,7 @@ class FreshDbTests(unittest.TestCase):
             store = Store(Path(d) / "fresh.db")
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 6)
+            self.assertEqual(version, 7)
 
     def test_fresh_db_has_v4_column(self):
         # observations.bad_packet_count was added in v4 to back the
@@ -224,6 +224,15 @@ class FreshDbTests(unittest.TestCase):
                   FROM sniffers;
                 DROP TABLE sniffers;
                 ALTER TABLE _sn_v3 RENAME TO sniffers;
+                CREATE TABLE _dev_v3 AS SELECT
+                    id, stable_key, kind, user_name,
+                    local_name, gatt_device_name,
+                    vendor, vendor_id, oui_vendor, model, device_class,
+                    appearance, identifiers_json, notes,
+                    first_seen, last_seen, created_at
+                  FROM devices;
+                DROP TABLE devices;
+                ALTER TABLE _dev_v3 RENAME TO devices;
                 PRAGMA user_version = 3;
             """)
             conn.commit()
@@ -236,7 +245,7 @@ class FreshDbTests(unittest.TestCase):
             }
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 6)
+            self.assertEqual(version, 7)
             self.assertIn("bad_packet_count", cols)
 
 
@@ -250,7 +259,7 @@ class V1UpgradeTests(unittest.TestCase):
             tables = _tables(store.conn)
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 6)
+            self.assertEqual(version, 7)
             self.assertIn("sniffers", tables)
             for t in _V3_TABLES:
                 self.assertIn(t, tables, f"missing after v1→v3: {t}")
@@ -284,7 +293,7 @@ class V2UpgradeTests(unittest.TestCase):
             tables = _tables(store.conn)
             version = store.conn.execute("PRAGMA user_version").fetchone()[0]
             store.close()
-            self.assertEqual(version, 6)
+            self.assertEqual(version, 7)
             for t in _V3_TABLES:
                 self.assertIn(t, tables, f"missing after v2→v3: {t}")
 

@@ -59,11 +59,20 @@ def load_devices(
         where.append("last_seen >= ?")
         params.append(cutoff)
     if require_class:
-        where.append("device_class IS NOT NULL AND device_class != ''")
+        # Effective class — user override wins over auto-detected.
+        # Filter and select on the COALESCE so a device the user
+        # has manually classified still participates in clustering
+        # even if auto-detection never set device_class.
+        where.append(
+            "COALESCE(user_device_class, device_class) IS NOT NULL "
+            "AND COALESCE(user_device_class, device_class) != ''"
+        )
     clause = (" WHERE " + " AND ".join(where)) if where else ""
 
     rows = store.conn.execute(
-        f"SELECT id, device_class, user_name, local_name, vendor, model, "
+        f"SELECT id, "
+        f"COALESCE(user_device_class, device_class) AS device_class, "
+        f"user_name, local_name, vendor, model, "
         f"first_seen, last_seen FROM devices{clause}",
         params,
     ).fetchall()

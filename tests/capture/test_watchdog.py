@@ -210,6 +210,56 @@ class WatchdogTests(unittest.TestCase):
         wd.tick()
         self.assertEqual(len(restarts), 2)
 
+    # ---- read-only inspector for toolbar polling ----
+
+    def test_currently_silent_finds_silent_eligible(self):
+        # Last packet was 70s ago, threshold is 60s → silent.
+        sniffer = _Sniffer(state=_State(last_packet_ts=1030.0))
+        wd, _, _restarts, _ = self._make(sniffer, threshold=60.0)
+        self.assertEqual(wd.currently_silent_short_ids(), frozenset({"abc"}))
+
+    def test_currently_silent_excludes_recent(self):
+        sniffer = _Sniffer(state=_State(last_packet_ts=1095.0))
+        wd, _, _restarts, _ = self._make(sniffer, threshold=60.0)
+        self.assertEqual(wd.currently_silent_short_ids(), frozenset())
+
+    def test_currently_silent_excludes_idle_role(self):
+        sniffer = _Sniffer(state=_State(role="idle", last_packet_ts=0.0))
+        wd, _, _restarts, _ = self._make(sniffer)
+        self.assertEqual(wd.currently_silent_short_ids(), frozenset())
+
+    def test_currently_silent_excludes_not_running(self):
+        sniffer = _Sniffer(state=_State(running=False, last_packet_ts=0.0))
+        wd, _, _restarts, _ = self._make(sniffer)
+        self.assertEqual(wd.currently_silent_short_ids(), frozenset())
+
+    def test_currently_silent_excludes_stuck(self):
+        # After exhausting max_attempts the sniffer is stuck — it
+        # belongs to ``stuck_short_ids`` and should NOT also appear in
+        # ``currently_silent_short_ids`` (callers render the two
+        # categories separately).
+        sniffer = _Sniffer(state=_State(last_packet_ts=0.0))
+        wd, _, _restarts, clock = self._make(
+            sniffer, threshold=60.0, max_attempts=1, min_gap=10.0,
+        )
+        wd.tick()
+        clock.t = 1200.0
+        wd.tick()  # exhausts → stuck
+        self.assertIn("abc", wd.stuck_short_ids())
+        self.assertEqual(wd.currently_silent_short_ids(), frozenset())
+
+    def test_currently_silent_is_pure_read(self):
+        # Calling the inspector must not log STALL, bump DB, or
+        # restart — those side-effects are reserved for ``tick()``.
+        sniffer = _Sniffer(state=_State(last_packet_ts=1030.0))
+        wd, repos, restarts, _ = self._make(sniffer, threshold=60.0)
+        before_bumps = list(repos.sniffers.bumps)
+        before_restarts = list(restarts)
+        wd.currently_silent_short_ids()
+        wd.currently_silent_short_ids()
+        self.assertEqual(repos.sniffers.bumps, before_bumps)
+        self.assertEqual(restarts, before_restarts)
+
 
 if __name__ == "__main__":
     unittest.main()

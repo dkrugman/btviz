@@ -156,6 +156,30 @@ class StallWatchdog:
         """short_ids the watchdog has given up on (replug required)."""
         return frozenset(self._stuck)
 
+    def currently_silent_short_ids(self) -> frozenset[str]:
+        """short_ids of sniffers currently silent past ``threshold_s``.
+
+        Read-only inspector — no logging, no DB bumps, no restart
+        attempts. Mirrors the eligibility + silence checks of
+        :py:meth:`tick` so the canvas can poll between ticks (every
+        scene reload, ~2 s) and keep the toolbar STALL warning in
+        sync without having to wait for the next 10 s watchdog tick.
+
+        Excludes sniffers already in the stuck set — those are
+        reported separately via :py:meth:`stuck_short_ids` so the
+        caller can render the two states with different urgency
+        ("silent, retrying" vs "given up, replug required").
+        """
+        now = self._clock()
+        silent: list[str] = []
+        for sniffer in self._sniffers():
+            if not self._is_eligible(sniffer):
+                continue
+            if not self._is_stalled(sniffer, now):
+                continue
+            silent.append(sniffer._dongle.short_id)
+        return frozenset(silent)
+
     def reset(self, short_id: str) -> None:
         """Forget per-session state for one sniffer.
 

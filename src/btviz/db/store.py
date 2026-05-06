@@ -9,12 +9,40 @@ from pathlib import Path
 from typing import Iterator
 
 DB_PATH_ENV = "BTVIZ_DB_PATH"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 _SCHEMA_FILE = Path(__file__).with_name("schema.sql")
 
 # Incremental migrations applied to existing DBs to bring them up to
 # ``SCHEMA_VERSION``. Fresh DBs get the full schema.sql (which already
 # contains everything through SCHEMA_VERSION) and skip these.
+
+# v8 — device_interrogation_log. Per-attempt audit trail for the
+# active-interrogation driver: each SCAN_REQ / GATT-discovery /
+# pairing-pubkey collect issued by the (manually-triggered, v1)
+# interrogator lands here, with status transitions written in place
+# (pending → response | timeout | error). The forensic ``payload``
+# blob keeps the raw response bytes so the harvested fields can be
+# re-decoded later if the parser changes. Indexed on
+# (session_id, requested_at) so the canvas can paginate recent
+# attempts cheaply, and on target_device_id so a per-device tooltip
+# can show "last interrogated N s ago".
+_V7_TO_V8_SQL = """
+CREATE TABLE device_interrogation_log (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id               INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    target_address_id        INTEGER NOT NULL REFERENCES addresses(id) ON DELETE CASCADE,
+    target_device_id         INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    interrogator_sniffer_id  INTEGER REFERENCES sniffers(id) ON DELETE SET NULL,
+    requested_at             REAL NOT NULL,
+    responded_at             REAL,
+    primitive                TEXT NOT NULL,    -- 'scan_req' | (later: 'gatt_disc', 'smp_pubkey')
+    status                   TEXT NOT NULL,    -- 'pending' | 'response' | 'timeout' | 'error'
+    error                    TEXT,
+    payload                  BLOB              -- raw response bytes (e.g., SCAN_RSP PDU)
+);
+CREATE INDEX idx_dil_session_ts ON device_interrogation_log(session_id, requested_at);
+CREATE INDEX idx_dil_target_dev ON device_interrogation_log(target_device_id);
+"""
 
 # v7 — devices.user_device_class. User override that pins the
 # canvas's class (and downstream profile selection) regardless of
@@ -207,6 +235,10 @@ class Store:
             self.conn.executescript(_V6_TO_V7_SQL)
             self.conn.execute("PRAGMA user_version = 7")
             version = 7
+        if version == 7:
+            self.conn.executescript(_V7_TO_V8_SQL)
+            self.conn.execute("PRAGMA user_version = 8")
+            version = 8
         if version != SCHEMA_VERSION:
             raise RuntimeError(
                 f"Unknown db schema version {version}; app expects {SCHEMA_VERSION}"

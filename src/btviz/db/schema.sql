@@ -348,3 +348,27 @@ CREATE TABLE device_cluster_members (
     PRIMARY KEY (cluster_id, device_id)
 );
 CREATE INDEX idx_dcm_device ON device_cluster_members(device_id);
+
+-- Active-interrogation audit log. One row per interrogation attempt
+-- issued by the (manually-triggered, v1) interrogator driver: a
+-- SCAN_REQ to a target RPA, a GATT-discovery, or a pairing-pubkey
+-- collect. Status starts ``pending``, transitions to ``response`` /
+-- ``timeout`` / ``error`` in place. The ``payload`` BLOB keeps the
+-- raw response (e.g., SCAN_RSP PDU bytes) for forensic re-decode if
+-- the parser changes. ``target_device_id`` is nullable to handle the
+-- case where the address hasn't been resolved to a device row yet.
+CREATE TABLE device_interrogation_log (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id               INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    target_address_id        INTEGER NOT NULL REFERENCES addresses(id) ON DELETE CASCADE,
+    target_device_id         INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    interrogator_sniffer_id  INTEGER REFERENCES sniffers(id) ON DELETE SET NULL,
+    requested_at             REAL NOT NULL,
+    responded_at             REAL,
+    primitive                TEXT NOT NULL,    -- 'scan_req' | (later: 'gatt_disc', 'smp_pubkey')
+    status                   TEXT NOT NULL,    -- 'pending' | 'response' | 'timeout' | 'error'
+    error                    TEXT,
+    payload                  BLOB              -- raw response bytes (e.g., SCAN_RSP PDU)
+);
+CREATE INDEX idx_dil_session_ts ON device_interrogation_log(session_id, requested_at);
+CREATE INDEX idx_dil_target_dev ON device_interrogation_log(target_device_id);

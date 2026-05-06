@@ -2725,6 +2725,12 @@ class CanvasWindow(QMainWindow):
         # Stall watchdog — set up on _start_live, torn down on
         # _stop_live. None outside of an active capture session.
         self._stall_watchdog = None
+        # Most-recent stderr message per sniffer short_id, populated by
+        # ``_on_sniffer_state`` and rendered by ``_live_tick`` as part
+        # of the toolbar status prefix. Held on the canvas (not the
+        # watchdog) because it tracks SnifferProcess stderr surfacing,
+        # which is independent of stall detection.
+        self._sniffer_errors: dict[str, str] = {}
         self._reload_tick = 0       # increments per timer fire; reload() runs every Nth
         # Per-device live state surviving scene.clear() during reload:
         # rolling-window samples for Signal/Quality, channel-flash tails,
@@ -3581,6 +3587,10 @@ class CanvasWindow(QMainWindow):
         # into the next capture run. Lifetime ``stall_count`` lives in
         # the DB and survives.
         self._stall_watchdog = None
+        # Drop any per-sniffer errors and clear the toolbar warning
+        # styling — the next session starts with a clean slate.
+        self._sniffer_errors.clear()
+        self._apply_status_severity("ok")
         # Clear the panel's "extcap-unreachable" hint — the next live
         # start will recompute it from a fresh discovery sweep.
         self.sniffer_panel.set_extcap_unreachable(set())
@@ -3594,23 +3604,94 @@ class CanvasWindow(QMainWindow):
     def _on_sniffer_state(self, state) -> None:
         """Bus subscriber for ``TOPIC_SNIFFER_STATE``.
 
-        Surfaces per-sniffer status changes — most importantly the
-        ``last_error`` field, which previously vanished into the void
-        when a SnifferProcess's capture-loop exited silently (e.g.
-        FIFO open returned no bytes). Without this, the toolbar still
-        said "capturing on N" while only N-1 dongles were actually
-        running.
+        Stashes the most-recent ``last_error`` per sniffer so the
+        next ``_live_tick`` status refresh can render it as part of
+        the live-stats prefix. Previously this method called
+        ``self.status.setText`` directly, but the next tick's stats
+        update (every ~2 s) would clobber it before the user could
+        read it; routing through ``self._sniffer_errors`` lets the
+        message persist until either a fresh non-empty error arrives
+        or capture stops.
 
-        Runs on the bus reader thread; the toolbar status label is a
-        Qt widget but ``setText`` is thread-safe enough on macOS for
-        this lightweight use. If we see threading issues here, route
-        through a Qt signal.
+        Runs on the bus reader thread; assignment to a dict slot is
+        atomic in CPython, and the read on the Qt thread is harmless
+        if it races with a write (worst case: one tick sees the old
+        value).
         """
         err = getattr(state, "last_error", None)
         if not err:
             return
         sid = getattr(getattr(state, "dongle", None), "short_id", "?")
-        self.status.setText(f"  sniffer error [{sid}]: {err}")
+        self._sniffer_errors[sid] = err
+
+    def _compose_stall_status(self) -> tuple[str, str]:
+        """Return ``(prefix, severity)`` for the toolbar status label.
+
+        Severity ordering — most urgent wins so the user sees the
+        worst-state token first:
+
+          * ``"stuck"``  — watchdog has given up (replug required)
+          * ``"silent"`` — at least one sniffer is silent past the
+                           watchdog threshold but hasn't exhausted
+                           restart attempts yet
+          * ``"error"``  — non-empty ``last_error`` from
+                           ``_on_sniffer_state`` exists but no stall
+                           is currently flagged (rare; mainly catches
+                           spawn-time failures the watchdog hasn't
+                           timed out on yet)
+          * ``"ok"``     — clear; default styling
+
+        The prefix is short and ends with a separator so it composes
+        cleanly with the live-stats string.
+        """
+        wd = self._stall_watchdog
+        stuck = frozenset()
+        silent = frozenset()
+        if wd is not None:
+            try:
+                stuck = wd.stuck_short_ids()
+                silent = wd.currently_silent_short_ids()
+            except Exception:  # noqa: BLE001 — never break live status
+                pass
+
+        if stuck:
+            ids = ", ".join(sorted(stuck))
+            return f"  ⚠ STALL [{ids}] — replug required  ·", "stuck"
+        if silent:
+            ids = ", ".join(sorted(silent))
+            return f"  ⚠ silent [{ids}] — restarting  ·", "silent"
+        if self._sniffer_errors:
+            sid, msg = next(iter(self._sniffer_errors.items()))
+            # Truncate long Python tracebacks down to one usable line.
+            short = msg.splitlines()[0][:80]
+            return f"  ⚠ sniffer [{sid}]: {short}  ·", "error"
+        return "", "ok"
+
+    def _apply_status_severity(self, severity: str) -> None:
+        """Style the toolbar status label according to severity.
+
+        Stylesheet is empty in the ``ok`` case so we revert cleanly
+        to the toolbar's default rendering. The padding + radius on
+        the warning styles let the colored block read as a badge
+        rather than a stripe across the whole toolbar.
+        """
+        if severity == "stuck":
+            self.status.setStyleSheet(
+                "color: #721c24; background-color: #f8d7da; "
+                "padding: 2px 6px; border-radius: 3px; font-weight: bold;"
+            )
+        elif severity == "silent":
+            self.status.setStyleSheet(
+                "color: #856404; background-color: #fff3cd; "
+                "padding: 2px 6px; border-radius: 3px;"
+            )
+        elif severity == "error":
+            self.status.setStyleSheet(
+                "color: #721c24; background-color: #f8d7da; "
+                "padding: 2px 6px; border-radius: 3px;"
+            )
+        else:
+            self.status.setStyleSheet("")
 
     def _live_tick(self) -> None:
         """QTimer callback (main thread). Drains the queue; reloads every Nth."""
@@ -3673,7 +3754,9 @@ class CanvasWindow(QMainWindow):
                     short = _shorten_source_label(src)
                     pieces.append(f"{short}:{recv:,}/{rej}")
                 base += "    [ " + " ".join(pieces) + " ]"
-            self.status.setText(base)
+            prefix, severity = self._compose_stall_status()
+            self.status.setText(prefix + base)
+            self._apply_status_severity(severity)
         # Cluster pass at a slower cadence than the scene reload — it's
         # O(n²) over recent devices and we don't want to compete with
         # ingest. Cadence is the toolbar dropdown's selection (default

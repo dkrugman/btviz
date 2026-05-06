@@ -299,6 +299,17 @@ class Devices:
             "UPDATE devices SET user_name = ? WHERE id = ?", (user_name, device_id)
         )
 
+    def set_user_device_class(
+        self, device_id: int, device_class: str | None,
+    ) -> None:
+        """User-assigned override class. Wins over the auto-detected
+        ``device_class`` for icon, profile selection, and tooltip.
+        Pass ``None`` to clear the override and fall back to auto."""
+        self.s.conn.execute(
+            "UPDATE devices SET user_device_class = ? WHERE id = ?",
+            (device_class, device_id),
+        )
+
     def set_notes(self, device_id: int, notes: str | None) -> None:
         self.s.conn.execute(
             "UPDATE devices SET notes = ? WHERE id = ?", (notes, device_id)

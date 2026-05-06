@@ -17,6 +17,7 @@ CREATE TABLE devices (
 
     -- User override (wins over everything automatic)
     user_name         TEXT,
+    user_device_class TEXT,                  -- pinned class; overrides auto-detected device_class
 
     -- Names observed on the wire
     local_name        TEXT,                  -- adv Complete/Shortened Local Name

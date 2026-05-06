@@ -480,12 +480,24 @@ def load_canvas_devices(
     project_id: int,
     *,
     stale_cutoff: float | None = None,
+    stale_session_id: int | None = None,
 ) -> list[CanvasDevice]:
     """Load all devices observed in the project plus their saved layout.
 
-    ``stale_cutoff`` is an absolute epoch threshold; devices whose
-    latest observation in this project is below it are excluded.
-    ``None`` (default) keeps every device the project has ever seen.
+    ``stale_cutoff`` is an absolute timestamp threshold; devices whose
+    latest observation is below it are excluded. ``None`` (default)
+    keeps every device the project has ever seen.
+
+    ``stale_session_id`` scopes the freshness check to a single
+    session — pass it together with ``stale_cutoff`` so the threshold
+    and the per-device MAX live in the same firmware-clock domain.
+    Across sessions, dongle replug resets the firmware clock; a
+    project-wide MAX would mix domains and either hide currently-
+    active devices (if some other session has a higher baseline) or
+    keep stale ones visible. With the session scope set, devices not
+    observed in that session simply don't pass the staleness check —
+    the right answer when the user asks "what's active now".
+
     Filter applies in SQL via HAVING so the addresses / broadcasts /
     histograms follow-up queries stay scoped to the surviving set.
     """
@@ -493,8 +505,21 @@ def load_canvas_devices(
     having = ""
     params: list = [project_id]
     if stale_cutoff is not None:
-        having = "HAVING MAX(o.last_seen) >= ?"
-        params.append(stale_cutoff)
+        if stale_session_id is not None:
+            # Scope the per-device MAX to observations from the
+            # given session. CASE returns NULL for rows in other
+            # sessions; MAX over all-NULLs is NULL, which never
+            # passes ``>= ?`` — so devices with no rows in this
+            # session are filtered out as expected.
+            having = (
+                "HAVING MAX(CASE WHEN o.session_id = ? "
+                "THEN o.last_seen END) >= ?"
+            )
+            params.append(stale_session_id)
+            params.append(stale_cutoff)
+        else:
+            having = "HAVING MAX(o.last_seen) >= ?"
+            params.append(stale_cutoff)
     rows = conn.execute(
         f"""
         SELECT
@@ -2895,27 +2920,42 @@ class CanvasWindow(QMainWindow):
     def reload(self) -> None:
         self.scene.clear()
         cutoff = None
+        recent_session_id: int | None = None
         if self._stale_window_s is not None:
-            # Anchor the staleness cutoff in the packet-clock domain.
-            # ``observations.last_seen`` comes from the dongle firmware
-            # clock (pcap record header timestamps), which can drift
-            # from Python's wallclock by minutes. Using ``time.time()``
-            # for the cutoff while comparing against firmware-stamped
-            # ``last_seen`` leaves ahead-of-wallclock packets visible
-            # forever (and would hide behind-of-wallclock ones early).
-            # Take ``MAX(last_seen)`` over the project's observations
-            # as the freshest packet ts we know and use that as "now"
-            # — apples-to-apples against per-device ``last_seen``.
+            # Anchor the staleness cutoff to the most-recent session's
+            # firmware clock. Each session has its own clock baseline
+            # (dongle firmware uptime resets on replug), so a
+            # project-wide MAX would let a session with a high
+            # baseline swamp the active session — exactly the bug
+            # where currently-flashing devices got filtered out at
+            # short windows because some older session's leftover
+            # observations had higher firmware ts. Per-session scope
+            # keeps "now" in the live session's domain and the
+            # per-device MAX in HAVING in the same domain.
             row = self.store.conn.execute(
-                "SELECT MAX(o.last_seen) AS now_ts FROM observations o "
-                "JOIN sessions s ON s.id = o.session_id "
-                "WHERE s.project_id = ?",
+                "SELECT id FROM sessions WHERE project_id = ? "
+                "ORDER BY started_at DESC LIMIT 1",
                 (self.project_id,),
             ).fetchone()
-            packet_now = row["now_ts"] if row and row["now_ts"] else time.time()
-            cutoff = packet_now - self._stale_window_s
+            recent_session_id = row["id"] if row else None
+            if recent_session_id is not None:
+                row = self.store.conn.execute(
+                    "SELECT MAX(last_seen) AS now_ts FROM observations "
+                    "WHERE session_id = ?",
+                    (recent_session_id,),
+                ).fetchone()
+                packet_now = (
+                    row["now_ts"] if row and row["now_ts"] else time.time()
+                )
+                cutoff = packet_now - self._stale_window_s
+            else:
+                # No sessions yet — fall back to wallclock so the
+                # filter still does something for an empty project.
+                cutoff = time.time() - self._stale_window_s
         devs = load_canvas_devices(
-            self.store, self.project_id, stale_cutoff=cutoff,
+            self.store, self.project_id,
+            stale_cutoff=cutoff,
+            stale_session_id=recent_session_id,
         )
 
         # Prune _live_state to the devices we just loaded, and zero the

@@ -228,7 +228,7 @@ SCHEMA: tuple[Field, ...] = (
     Field(
         key="cluster.log_level",
         file="cluster", section="runner", name="log_level",
-        type=str, default="info", requires_restart=True,
+        type=str, default="info",
         enum=("error", "warning", "info", "verbose", "debug"),
         label="Cluster log level",
         description=(
@@ -243,7 +243,7 @@ SCHEMA: tuple[Field, ...] = (
     Field(
         key="capture.log_level",
         file="capture", section="logging", name="log_level",
-        type=str, default="info", requires_restart=True,
+        type=str, default="info",
         enum=("error", "warning", "info", "verbose", "debug"),
         label="Capture log level",
         description=(

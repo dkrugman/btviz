@@ -269,7 +269,30 @@ class PreferencesDialog(QDialog):
                 f"Files in {self._prefs.prefs_dir} were not updated.",
             )
             return
+        self._apply_live_prefs()
         self.accept()
+
+    def _apply_live_prefs(self) -> None:
+        """Apply prefs that don't need a restart, immediately after save.
+
+        Currently only the two log-level dropdowns
+        (``capture.log_level``, ``cluster.log_level``) live-apply.
+        Both apply functions are idempotent and re-set every
+        attached handler, so calling them on every save is safe
+        even when the level didn't change. Errors are swallowed
+        because a logging-level apply failure must never block the
+        prefs save itself — the values are already on disk.
+
+        New live-applicable prefs should add their apply call here
+        and drop ``requires_restart=True`` from their schema entry.
+        """
+        try:
+            from ..capture_log import apply_capture_log_prefs
+            from ..cluster import apply_cluster_log_prefs
+            apply_capture_log_prefs(self._prefs.get("capture.log_level"))
+            apply_cluster_log_prefs(self._prefs.get("cluster.log_level"))
+        except Exception:  # noqa: BLE001 — logging is best-effort
+            pass
 
     def _read_widget(self, field: Field, w: QWidget) -> Any:
         if isinstance(w, QCheckBox):

@@ -168,21 +168,32 @@ def resolve_level(name: str | int | None) -> int:
 def apply_capture_log_prefs(level: str | int | None = None) -> None:
     """Set the capture logger's level from the dropdown pref value.
 
-    Called once at startup from ``__main__.py``; idempotent and
-    safe to call again on a live preference change. Re-applies to
-    all attached handlers so the level change takes effect
-    immediately.
+    Called at startup from ``__main__.py`` and again from the prefs
+    dialog's ``_on_save`` so changes take effect without a restart.
+    Idempotent: re-applying the same level is a no-op (the
+    confirmation message only lands when the level actually
+    changed). Re-applies to all attached handlers so the change
+    flows through immediately.
 
-    The previous bool-pair API ``(verbose, debug)`` was replaced
-    by a single 5-state dropdown (error / warning / info / verbose /
-    debug) — the two-checkbox UI suggested independent dimensions
-    when there's really only one ordered dimension.
+    On change, logs a confirmation line *at the new level* so the
+    message is visible at the threshold the user just set — i.e.,
+    setting ERROR still produces an ERROR-level confirmation that
+    survives the new filter. Useful at the prefs-save callsite so
+    the user sees the change land in capture.log.
     """
     target = resolve_level(level)
     logger = logging.getLogger(LOG_NAME)
+    old_level = logger.level
     logger.setLevel(target)
     for h in logger.handlers:
         h.setLevel(target)
+    if old_level != target:
+        logger.log(
+            target,
+            "capture log level: %s (was %s)",
+            logging.getLevelName(target).lower(),
+            logging.getLevelName(old_level).lower(),
+        )
 
 
 def get_capture_logger() -> logging.Logger:

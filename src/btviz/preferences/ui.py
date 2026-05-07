@@ -239,13 +239,14 @@ class PreferencesDialog(QDialog):
         (blocked or warning), else ``None`` so the caller falls back
         to the standard plain-checkbox render.
 
-        Visual contract:
-          * **blocked** — checkbox disabled + force-unchecked, suffix
-            ``"FW v. X.Y.Z detected, incompatible (more info)"`` with
-            "more info" as an external-opening link.
-          * **warning** — checkbox enabled, suffix is a single italic-
-            underlined link "compatibility warning" in Material orange.
-            Same external link target.
+        Visual contract: both severities render as a single italic-
+        underlined orange (#E65100) link to the DevZone bug thread.
+        Severity is conveyed by the checkbox state (disabled vs
+        enabled) and the link text, not by color.
+          * **blocked** — checkbox disabled + force-unchecked, link
+            text ``"FW v. X.Y.Z detected, incompatible (more info)"``.
+          * **warning** — checkbox enabled, link text
+            ``"compatibility warning"``.
         """
         status = self._coded_phy_status
         if status.severity is None:
@@ -261,24 +262,23 @@ class PreferencesDialog(QDialog):
         suffix.setOpenExternalLinks(True)
         suffix.setToolTip(status.tooltip or "")
         url = status.url or ""
+        link_style = (
+            "color: #E65100; "
+            "font-style: italic; "
+            "text-decoration: underline;"
+        )
 
         if status.severity == "blocked":
             cb.setChecked(False)
             cb.setEnabled(False)
             self._forced_false.add(field.key)
             suffix.setText(
-                f'{status.suffix} '
-                f'(<a href="{url}">more info</a>)'
+                f'<a href="{url}" style="{link_style}">'
+                f'{status.suffix} (more info)</a>'
             )
         else:  # "warning"
-            # Soft warning: enabled checkbox, single styled link.
-            # Material orange (#E65100) keeps a visual distinction
-            # from the red used for hard errors elsewhere in the UI.
             suffix.setText(
-                f'<a href="{url}" '
-                f'style="color: #E65100; '
-                f'font-style: italic; '
-                f'text-decoration: underline;">'
+                f'<a href="{url}" style="{link_style}">'
                 f'{status.suffix}</a>'
             )
 

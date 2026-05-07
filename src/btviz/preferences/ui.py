@@ -68,6 +68,25 @@ class PreferencesDialog(QDialog):
         # Per-field widgets, keyed by Field.key, so Save knows where
         # to read each value back from.
         self._widgets: dict[str, QWidget] = {}
+        # Fields whose checkbox is force-disabled by hardware/firmware
+        # state (e.g. capture.coded_phy when an incompatible Nordic
+        # firmware is detected). Save writes ``False`` for these
+        # regardless of widget state — the widget is read-only-ish but
+        # we don't trust Qt to never re-enable it mid-session.
+        self._forced_false: set[str] = set()
+
+        # Probe attached Nordic dongles for Coded-PHY firmware
+        # compatibility before building the form. The returned status
+        # has three severity levels:
+        #   * "blocked" — known-broken firmware (4.1.1) on at least one
+        #     dongle; the checkbox is disabled and force-unchecked.
+        #   * "warning" — newer-than-broken firmware (Nordic hasn't
+        #     shipped a fix yet); checkbox is enabled but a
+        #     "compatibility warning" link is rendered beside it.
+        #   * None — nothing detected; render plainly.
+        # Never blocks dialog open: any error returns severity=None.
+        from ..extcap.firmware_query import detect_coded_phy_incompatibility
+        self._coded_phy_status = detect_coded_phy_incompatibility()
 
         self.setWindowTitle("btviz Preferences")
         self.resize(640, 520)
@@ -158,6 +177,13 @@ class PreferencesDialog(QDialog):
             cb = QCheckBox()
             cb.setChecked(bool(current))
             cb.setToolTip(field.description)
+            # Special-case: capture.coded_phy renders with a
+            # firmware-aware compatibility hint to the right of the
+            # checkbox. See ``firmware_query.CodedPhyStatus``.
+            if field.key == "capture.coded_phy":
+                wrapped = self._wrap_coded_phy_checkbox(cb, field)
+                if wrapped is not None:
+                    return cb, wrapped
             return cb, None
 
         if field.enum is not None:
@@ -203,6 +229,62 @@ class PreferencesDialog(QDialog):
             row.addWidget(browse)
             return line, container
         return line, None
+
+    def _wrap_coded_phy_checkbox(
+        self, cb: QCheckBox, field: Field,
+    ) -> QWidget | None:
+        """Render the firmware-aware suffix beside the coded_phy checkbox.
+
+        Returns the wrapping container if a compatibility hint applies
+        (blocked or warning), else ``None`` so the caller falls back
+        to the standard plain-checkbox render.
+
+        Visual contract:
+          * **blocked** — checkbox disabled + force-unchecked, suffix
+            ``"FW v. X.Y.Z detected, incompatible (more info)"`` with
+            "more info" as an external-opening link.
+          * **warning** — checkbox enabled, suffix is a single italic-
+            underlined link "compatibility warning" in Material orange.
+            Same external link target.
+        """
+        status = self._coded_phy_status
+        if status.severity is None:
+            return None
+
+        container = QWidget()
+        row = QHBoxLayout(container)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(cb)
+
+        suffix = QLabel()
+        suffix.setTextFormat(Qt.TextFormat.RichText)
+        suffix.setOpenExternalLinks(True)
+        suffix.setToolTip(status.tooltip or "")
+        url = status.url or ""
+
+        if status.severity == "blocked":
+            cb.setChecked(False)
+            cb.setEnabled(False)
+            self._forced_false.add(field.key)
+            suffix.setText(
+                f'{status.suffix} '
+                f'(<a href="{url}">more info</a>)'
+            )
+        else:  # "warning"
+            # Soft warning: enabled checkbox, single styled link.
+            # Material orange (#E65100) keeps a visual distinction
+            # from the red used for hard errors elsewhere in the UI.
+            suffix.setText(
+                f'<a href="{url}" '
+                f'style="color: #E65100; '
+                f'font-style: italic; '
+                f'text-decoration: underline;">'
+                f'{status.suffix}</a>'
+            )
+
+        row.addWidget(suffix)
+        row.addStretch(1)
+        return container
 
     # ------------------------------------------------------------------
     # actions
@@ -258,7 +340,13 @@ class PreferencesDialog(QDialog):
             w = self._widgets.get(field.key)
             if w is None:
                 continue
-            value = self._read_widget(field, w)
+            # Hardware-forced defaults override whatever the (disabled)
+            # widget reports — belt-and-suspenders for capture.coded_phy
+            # when 4.1.1 firmware is detected.
+            if field.key in self._forced_false:
+                value: Any = False
+            else:
+                value = self._read_widget(field, w)
             self._prefs.set(field.key, value)
         try:
             self._prefs.save()

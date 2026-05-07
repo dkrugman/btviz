@@ -414,23 +414,26 @@ def detect_coded_phy_incompatibility(
         from . import discovery
 
         dongles = discovery.list_dongles_fast()
-        # Nordic dongles only — non-Nordic hardware (Adafruit Bluefruit,
-        # CH340 bridges) speaks a different protocol and won't respond
-        # to REQ_VERSION. Filter by VID hint via the USB product string.
-        nordic_paths = [
-            d.serial_path for d in dongles
-            if d.kind == "dongle" and (
-                "nordic" in (d.usb_product or "").lower()
-                or "nrf" in (d.usb_product or "").lower()
-            )
-        ]
-        # Also include DKs running sniffer firmware (SEGGER bridge).
-        nordic_paths += [d.serial_path for d in dongles if d.kind == "dk"]
-        if not nordic_paths:
-            return CodedPhyStatus(severity=None)
-        versions = query_firmware_versions(
-            nordic_paths, timeout_s=timeout_s,
+        # Query every attached sniffer dongle. ``list_dongles_fast``
+        # already filters to USB devices whose product string contains
+        # "sniffer", so the pool is small. Non-Nordic hardware
+        # (Adafruit Bluefruit, CH340 bridges) won't respond to
+        # REQ_VERSION — those queries return None and are ignored.
+        # We deliberately don't pre-filter by USB product name:
+        # descriptor strings vary between firmware builds (e.g.
+        # "nRF Sniffer for BLE", "Nordic Semiconductor nRF Sniffer",
+        # custom rebuilds) and a too-strict filter would silently drop
+        # dongles whose firmware we needed to check — which is exactly
+        # the failure mode we're trying to surface to the user.
+        paths = [d.serial_path for d in dongles]
+        log.debug(
+            "coded-phy compat: probing %d attached dongle(s)",
+            len(paths),
         )
+        if not paths:
+            return CodedPhyStatus(severity=None)
+        versions = query_firmware_versions(paths, timeout_s=timeout_s)
+        log.debug("coded-phy compat: versions=%r", versions)
         return coded_phy_status_for_versions(list(versions.values()))
     except Exception:  # noqa: BLE001 — never block the prefs dialog
         log.debug("coded-phy compat detection failed", exc_info=True)

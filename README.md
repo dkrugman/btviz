@@ -44,17 +44,43 @@ pip install -e .
 
 After install, the `btviz` command is on the venv's PATH.
 
-## Quickstart
+## Live Capture (Requires hardware sniffers)
 
-The fastest way to see something work, without any sniffer hardware, is to
-ingest a pcap/pcapng file you've already captured in Wireshark:
+If not already in the project directory with a venv active:
 
 ```sh
-btviz ingest path/to/capture.pcapng --project home-lab
+cd btviz
+source .venv/bin/activate
+```
+
+then
+
+```sh
+btviz
+```
+
+Each device is a draggable box. **Double-click** a box to expand it
+(showing all known addresses, PDU/channel histograms, RSSI range);
+double-click again to collapse. Positions persist per project.
+
+## Using a Wireshark pcap/pcapng file
+
+Without sniffer hardware you can ingest a pcap/pcapng captured using Wireshark:
+If not already in the project directory with a venv active:
+
+```sh
+cd btviz
+source .venv/bin/activate
+```
+
+then
+
+```sh
+btviz ingest path/to/capture.pcapng --project default
 ```
 
 That command:
-- creates the `home-lab` project if it doesn't exist,
+- creates the `default` project if it doesn't exist,
 - dissects the file via `tshark` (with CRC-failed packets dropped by default
   — see `--keep-bad-crc` for interference analysis),
 - writes one device row per unique advertising address, identity clues from
@@ -63,14 +89,13 @@ That command:
 - prints a summary report.
 
 Then open the project on the canvas:
-
 ```sh
-btviz canvas --project home-lab
+btviz
 ```
 
-Each device is a draggable box. **Double-click** a box to expand it
-(showing all known addresses, PDU/channel histograms, RSSI range);
-double-click again to collapse. Positions persist per project.
+Make sure to switch the Show: filter to all. Otherwise the devices will 
+eventually disappear because btviz treats them as live devicee that have
+gone silent.
 
 ## Subcommands
 
@@ -132,10 +157,3 @@ btviz/
     fixtures/            # checked-in test fixtures (no real keys)
   private/               # gitignored: local pcaps, IRKs/LTKs, scratch DBs
 ```
-
-## Notes
-
-`private/` is in `.gitignore` — that's where I keep test pcaps, real IRKs,
-and anything else that shouldn't ship with the repo. The DB schema does
-support keys (IRKs, LTKs) and there's nothing stopping you from putting
-real values into the default DB; just don't share that file.
